@@ -1,0 +1,580 @@
+<?xml version="1.0" ?>
+<!-- RB10_1300e URDF for ROS2/RViz simulation -->
+<!-- Modified from Rainbow Robotics rbpodo_description package -->
+<robot name="rb10_1300e">
+  <!-- Base link for ROS compatibility -->
+  <link name="base_link"/>
+
+  <joint name="base_fixed" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="link0"/>
+  </joint>
+
+  <link name="link0">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link0.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link0.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.13398 0.00008 0.15197"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <link name="link1">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link1.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link1.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000021 -0.007855 -0.042537"/>
+      <mass value="8.366"/>
+      <inertia ixx="0.027403652" ixy="-5.926e-06" ixz="-1.0119e-05" iyy="0.027770573" iyz="0.003030512" izz="0.026140211"/>
+    </inertial>
+  </link>
+
+  <link name="link2">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link2.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link2.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000013 -0.155462 0.225241"/>
+      <mass value="15.61"/>
+      <inertia ixx="1.140650644" ixy="-1.3042e-05" ixz="-6.7084e-05" iyy="1.134398623" iyz="0.024507884" izz="0.050849068"/>
+    </inertial>
+  </link>
+
+  <link name="link3">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link3.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link3.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000048 -0.013885 0.325013"/>
+      <mass value="5.69"/>
+      <inertia ixx="0.312033029" ixy="9.298e-06" ixz="1.169e-05" iyy="0.311287646" iyz="0.005331552" izz="0.011397824"/>
+    </inertial>
+  </link>
+
+  <link name="link4">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link4.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link4.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000093 -0.113949 0.026461"/>
+      <mass value="2.062"/>
+      <inertia ixx="0.0027111" ixy="-8.022e-06" ixz="1.1208e-05" iyy="0.002715407" iyz="0.000144243" izz="0.002157043"/>
+    </inertial>
+  </link>
+
+  <link name="sensor_link2">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link2_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_link2_black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link2_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="sensor_link2_1">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link2_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_link3_black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link2_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="sensor_link3">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link1_Assembly_Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_link3_black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link1_Assembly_Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="sensor_link3_1">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link1_Assembly_Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_link4_black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/Link1_Assembly_Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="tof_N"/>
+
+  <link name="tof_S"/>
+
+  <link name="tof_E"/>
+
+  <link name="tof_W"/>
+
+  <link name="tof2_N"/>
+
+  <link name="tof2_S"/>
+
+  <link name="tof2_E"/>
+
+  <link name="tof2_W"/>
+
+  <link name="tof2_1_N"/>
+
+  <link name="tof2_1_S"/>
+
+  <link name="tof2_1_E"/>
+
+  <link name="tof2_1_W"/>
+
+  <link name="tof3_1_N"/>
+
+  <link name="tof3_1_S"/>
+
+  <link name="tof3_1_E"/>
+
+  <link name="tof3_1_W"/>
+
+  <link name="link3_5">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="link5">
+    <visual>
+      <origin rpy="0 3.14159 3.14159" xyz="-0.13398 -0.01296 0.07726"/>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/End_effector_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="link5_sensor_black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="0 3.14159 3.14159" xyz="-0.13398 -0.01296 0.07726"/>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/End_effector_Assembly__Simple.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000093 -0.026434 -0.003233"/>
+      <mass value="2.061"/>
+      <inertia ixx="0.002706437" ixy="1.1205e-05" ixz="-8.016e-06" iyy="0.002153592" iyz="0.000141528" izz="0.002712272"/>
+    </inertial>
+  </link>
+
+  <link name="link6">
+    <visual>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link6.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/link6.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000210 -0.092540 -0.000292"/>
+      <mass value="0.406"/>
+      <inertia ixx="0.000345314" ixy="5.73e-07" ixz="6.61e-07" iyy="0.000532873" iyz="-5.4e-08" izz="0.000340021"/>
+    </inertial>
+  </link>
+
+  <link name="link6_1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="tof6_1_F"/>
+
+  <link name="tof6_1_L"/>
+
+  <link name="tof6_1_R"/>
+
+  <link name="tof6_1_U"/>
+
+  <link name="tcp">
+    <visual>
+      <geometry>
+        <sphere radius="0.01"/>
+      </geometry>
+      <material name="red">
+        <color rgba="1 0 0 1"/>
+      </material>
+    </visual>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="tcp_rmp">
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0.04 0"/>
+      <geometry>
+        <sphere radius="0.02"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 -0.04 0"/>
+      <geometry>
+        <sphere radius="0.02"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="tcp_gripper">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="gripper">
+    <visual>
+      <origin rpy="-1.5707963268 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/gripper.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="gripper_gray">
+        <color rgba="0.4 0.4 0.4 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="-1.5707963268 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://rmp_camera/urdf/stl/gripper.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <!-- Joints with names matching RMPflow config -->
+  <joint name="base" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link0"/>
+    <child link="link1"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="shoulder" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.197"/>
+    <parent link="link1"/>
+    <child link="link2"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="elbow" type="revolute">
+    <origin rpy="0 0 0" xyz="0 -0.1875 0.6127"/>
+    <parent link="link2"/>
+    <child link="link3"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="wrist1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.57015"/>
+    <parent link="link3_5"/>
+    <child link="link4"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="sensor_link2_joint" type="fixed">
+    <origin rpy="-1.5708 0 0" xyz="0 -0.1875 0.5262"/>
+    <parent link="link2"/>
+    <child link="sensor_link2"/>
+  </joint>
+
+  <joint name="sensor_link2_1_joint" type="fixed">
+    <origin rpy="-1.5708 0 0" xyz="0 -0.1875 0.3262"/>
+    <parent link="link2"/>
+    <child link="sensor_link2_1"/>
+  </joint>
+
+  <joint name="sensor_link3_joint" type="fixed">
+    <origin rpy="-1.5708 0 0" xyz="0 0 0.505075"/>
+    <parent link="link3_5"/>
+    <child link="sensor_link3"/>
+  </joint>
+
+  <joint name="sensor_link3_1_joint" type="fixed">
+    <origin rpy="-1.5708 0 0" xyz="0 0 0.305075"/>
+    <parent link="link3_5"/>
+    <child link="sensor_link3_1"/>
+  </joint>
+
+  <joint name="link3_5_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0.1484 0"/>
+    <parent link="link3"/>
+    <child link="link3_5"/>
+  </joint>
+
+  <joint name="tof_N_joint" type="fixed">
+    <origin rpy="-1.5708 0 3.14159265359" xyz="-0.0645 0.1 0"/>
+    <parent link="sensor_link3"/>
+    <child link="tof_N"/>
+  </joint>
+
+  <joint name="tof_S_joint" type="fixed">
+    <origin rpy="1.5708 0 0" xyz="0.0645 0.1 0"/>
+    <parent link="sensor_link3"/>
+    <child link="tof_S"/>
+  </joint>
+
+  <joint name="tof_E_joint" type="fixed">
+    <origin rpy="1.5708 -1.5707963268 0" xyz="0 0.1 0.0645"/>
+    <parent link="sensor_link3"/>
+    <child link="tof_E"/>
+  </joint>
+
+  <joint name="tof_W_joint" type="fixed">
+    <origin rpy="1.5708 1.5707963268 0" xyz="0 0.1 -0.0645"/>
+    <parent link="sensor_link3"/>
+    <child link="tof_W"/>
+  </joint>
+
+  <joint name="tof2_N_joint" type="fixed">
+    <origin rpy="-1.5708 0 3.14159265359" xyz="-0.079 0.1 0"/>
+    <parent link="sensor_link2"/>
+    <child link="tof2_N"/>
+  </joint>
+
+  <joint name="tof2_S_joint" type="fixed">
+    <origin rpy="1.5708 0 0" xyz="0.079 0.1 0"/>
+    <parent link="sensor_link2"/>
+    <child link="tof2_S"/>
+  </joint>
+
+  <joint name="tof2_E_joint" type="fixed">
+    <origin rpy="1.5708 -1.5707963268 0" xyz="0 0.1 0.079"/>
+    <parent link="sensor_link2"/>
+    <child link="tof2_E"/>
+  </joint>
+
+  <joint name="tof2_W_joint" type="fixed">
+    <origin rpy="1.5708 1.5707963268 0" xyz="0 0.1 -0.079"/>
+    <parent link="sensor_link2"/>
+    <child link="tof2_W"/>
+  </joint>
+
+  <joint name="tof2_1_N_joint" type="fixed">
+    <origin rpy="-1.5708 0 3.14159265359" xyz="-0.079 0.1 0"/>
+    <parent link="sensor_link2_1"/>
+    <child link="tof2_1_N"/>
+  </joint>
+
+  <joint name="tof2_1_S_joint" type="fixed">
+    <origin rpy="1.5708 0 0" xyz="0.079 0.1 0"/>
+    <parent link="sensor_link2_1"/>
+    <child link="tof2_1_S"/>
+  </joint>
+
+  <joint name="tof2_1_E_joint" type="fixed">
+    <origin rpy="1.5708 -1.5707963268 0" xyz="0 0.1 0.079"/>
+    <parent link="sensor_link2_1"/>
+    <child link="tof2_1_E"/>
+  </joint>
+
+  <joint name="tof2_1_W_joint" type="fixed">
+    <origin rpy="1.5708 1.5707963268 0" xyz="0 0.1 -0.079"/>
+    <parent link="sensor_link2_1"/>
+    <child link="tof2_1_W"/>
+  </joint>
+
+  <joint name="tof3_1_N_joint" type="fixed">
+    <origin rpy="-1.5708 0 3.14159265359" xyz="-0.0645 0.1 0"/>
+    <parent link="sensor_link3_1"/>
+    <child link="tof3_1_N"/>
+  </joint>
+
+  <joint name="tof3_1_S_joint" type="fixed">
+    <origin rpy="1.5708 0 0" xyz="0.0645 0.1 0"/>
+    <parent link="sensor_link3_1"/>
+    <child link="tof3_1_S"/>
+  </joint>
+
+  <joint name="tof3_1_E_joint" type="fixed">
+    <origin rpy="1.5708 -1.5707963268 0" xyz="0 0.1 0.0645"/>
+    <parent link="sensor_link3_1"/>
+    <child link="tof3_1_E"/>
+  </joint>
+
+  <joint name="tof3_1_W_joint" type="fixed">
+    <origin rpy="1.5708 1.5707963268 0" xyz="0 0.1 -0.0645"/>
+    <parent link="sensor_link3_1"/>
+    <child link="tof3_1_W"/>
+  </joint>
+
+  <joint name="wrist2" type="revolute">
+    <origin rpy="0 0 0" xyz="0 -0.11715 0"/>
+    <parent link="link4"/>
+    <child link="link5"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="wrist3" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.11715"/>
+    <parent link="link5"/>
+    <child link="link6"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-3.14159" upper="3.14159" velocity="3.14"/>
+  </joint>
+
+  <joint name="link6_1_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.11715"/>
+    <parent link="link5"/>
+    <child link="link6_1"/>
+  </joint>
+
+  <joint name="tof6_1_F_joint" type="fixed">
+    <origin rpy="0 -1.5707963268 0" xyz="0 0 0.06"/>
+    <parent link="link6_1"/>
+    <child link="tof6_1_F"/>
+  </joint>
+
+  <joint name="tof6_1_L_joint" type="fixed">
+    <origin rpy="0 0 3.14159265359" xyz="-0.06 0 0"/>
+    <parent link="link6_1"/>
+    <child link="tof6_1_L"/>
+  </joint>
+
+  <joint name="tof6_1_R_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.06 0 0"/>
+    <parent link="link6_1"/>
+    <child link="tof6_1_R"/>
+  </joint>
+
+  <joint name="tof6_1_U_joint" type="fixed">
+    <origin rpy="0 0 1.5707963268" xyz="0 0.0667 0"/>
+    <parent link="link6_1"/>
+    <child link="tof6_1_U"/>
+  </joint>
+
+  <joint name="tcp_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 -0.1153 0"/>
+    <parent link="link6"/>
+    <child link="tcp"/>
+  </joint>
+
+  <joint name="tcp_rmp_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="tcp"/>
+    <child link="tcp_rmp"/>
+  </joint>
+
+  <joint name="tcp_gripper_joint" type="fixed">
+    <origin rpy="0 1.5707963268 1.5707963268" xyz="0 -0.285398 0"/>
+    <parent link="tcp"/>
+    <child link="tcp_gripper"/>
+  </joint>
+
+  <joint name="gripper_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="tcp"/>
+    <child link="gripper"/>
+  </joint>
+</robot>

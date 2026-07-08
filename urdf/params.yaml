@@ -1,0 +1,540 @@
+# RB10 RMPflow RViz Parameters
+
+rmpflow_controller:
+  ros__parameters:
+    control_rate: 50.0
+    visualization_rate: 20.0
+    goal_x: 0.6
+    goal_y: -0.4
+    goal_z: 0.6
+    min_goal_z: 0.05
+    initialize_goal_from_first_state: true
+    safety_stop_on_min_z: true
+    workspace_floor_z: 0.0
+    min_link6_z: 0.03
+    min_tcp_z: 0.05
+    initial_q: [1.0660471071181365, -0.3311238656883642, -1.7919295430225781, 0.8574628082122941, -1.557060585581701, 0.15151203236562774]
+    default_q: [1.0660471071181365, -0.3311238656883642, -1.7919295430225781, 0.8574628082122941, -1.557060585581701, 0.15151203236562774]
+    joint_limit_buffers: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+    backend_mode: "simulation"
+    hardware_state_topic: "hardware_joint_states"
+    hardware_command_topic: "hardware_joint_command"
+    joint_state_topic: "joint_states"
+    position_command_topic: "position_controllers/commands"
+    publish_joint_states: true
+    publish_goal_tf: true
+    goal_tf_parent_frame: "base_link"
+    goal_tf_child_frame: "rmp_goal_target"
+    enable_realtime: false
+    realtime_priority: 80
+    lock_memory: false
+    body_goal: [0.45, 0.0, 0.9]
+    orientation_goal: [0.0, 0.0, 1.0]
+    solve_method: "rmp2"
+    rmp_type: "canonical"
+    graph:
+      node_names:
+        - cspace_target
+        - joint_limits
+        - joint_velocity_cap
+        - tcp_position
+        - target
+        - control_points
+        - collision
+        - damping
+        - body_link4
+        - tcp_orientation_x
+        - tcp_orientation_y
+        - tcp_orientation_z
+        - tcp_axis_target_x
+        - tcp_axis_target_y
+        - tcp_axis_target_z
+      cspace_target:
+        parents: [root]
+        parent: root
+        task_map: cspace_target
+        leaf: cspace_target
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      joint_limits:
+        parents: [root]
+        parent: root
+        task_map: joint_limit
+        leaf: joint_limit
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      joint_velocity_cap:
+        parents: [root]
+        parent: root
+        task_map: identity
+        leaf: joint_velocity_cap
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_position:
+        parents: [root]
+        parent: root
+        task_map: tcp_position
+        leaf: none
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      target:
+        parents: [tcp_position]
+        parent: tcp_position
+        task_map: identity
+        leaf: target
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      control_points:
+        parents: [root]
+        parent: root
+        task_map: control_points
+        leaf: none
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      collision:
+        parents: [control_points]
+        parent: control_points
+        task_map: collision_distance
+        leaf: collision
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      damping:
+        parents: [root]
+        parent: root
+        task_map: identity
+        leaf: damping
+        enabled: true
+        target_key: goal
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      body_link4:
+        parents: [root]
+        parent: root
+        task_map: link_position
+        leaf: target
+        enabled: true
+        target_key: body_goal
+        link_name: link4
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_orientation_x:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: orientation_target
+        enabled: true
+        target_key: orientation_goal_x
+        link_name: tcp_rmp
+        axis: "x"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_orientation_y:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: orientation_target
+        enabled: true
+        target_key: orientation_goal_y
+        link_name: tcp_rmp
+        axis: "y"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_orientation_z:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: orientation_target
+        enabled: true
+        target_key: orientation_goal_z
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_axis_target_x:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: axis_target
+        enabled: false
+        target_key: orientation_goal_x
+        link_name: tcp_rmp
+        axis: "x"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_axis_target_y:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: axis_target
+        enabled: false
+        target_key: orientation_goal_y
+        link_name: tcp_rmp
+        axis: "y"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+      tcp_axis_target_z:
+        parents: [root]
+        parent: root
+        task_map: link_orientation_axis
+        leaf: axis_target
+        enabled: false
+        target_key: orientation_goal_z
+        link_name: tcp_rmp
+        axis: "z"
+        handcrafted_leaf: none
+        identity_multiplier: 0.0
+    root_solve_offset: 0.001
+    cspace_target_metric_scalar: 10.0
+    cspace_target_position_gain: 25.0
+    cspace_target_damping_gain: 18.0
+    cspace_target_robust_position_term_thresh: 0.5
+    cspace_target_inertia: 0.0
+    joint_limit_metric_scalar: 0.0
+    joint_limit_metric_length_scale: 0.01
+    joint_limit_metric_exploder_eps: 0.001
+    joint_limit_metric_velocity_gate_length_scale: 0.01
+    joint_limit_accel_damper_gain: 200.0
+    joint_limit_accel_potential_gain: 1.0
+    joint_limit_accel_potential_exploder_eps: 0.01
+    joint_limit_accel_potential_exploder_length_scale: 0.1
+    joint_velocity_cap_max_velocity: 1.75
+    joint_velocity_cap_velocity_damping_region: 0.05
+    joint_velocity_cap_damping_gain: 18.0
+    joint_velocity_cap_metric_weight: 0.0
+    max_joint_accel: 20.0
+    command_guard_max_velocity_rad_s: 1.745329252
+    target_rmp_accel_p_gain: 50.0
+    target_rmp_accel_d_gain: 20.0
+    target_rmp_accel_norm_eps: 0.02
+    target_rmp_metric_alpha_length_scale: 0.2
+    target_rmp_min_metric_alpha: 0.03
+    target_rmp_max_metric_scalar: 1000.0
+    target_rmp_min_metric_scalar: 100.0
+    target_rmp_proximity_metric_boost_scalar: 1.0
+    target_rmp_proximity_metric_boost_length_scale: 1.0
+    orientation_rmp_accel_p_gain: 40.0
+    orientation_rmp_accel_d_gain: 20.0
+    orientation_rmp_metric_scalar: 50.0
+    axis_target_rmp_accel_p_gain: 150.0
+    axis_target_rmp_accel_d_gain: 40.0
+    axis_target_rmp_metric_scalar: 5.0
+    axis_target_rmp_proximity_metric_boost_scalar: 3.0
+    axis_target_rmp_proximity_metric_boost_length_scale: 0.01
+    collision_rmp_margin: 0.0
+    collision_rmp_damping_gain: 12.0
+    collision_rmp_damping_std_dev: 0.12
+    collision_rmp_damping_robustness_eps: 0.01
+    collision_rmp_damping_velocity_gate_length_scale: 0.05
+    collision_rmp_repulsion_gain: 16.0
+    collision_rmp_repulsion_std_dev: 0.25
+    collision_rmp_metric_modulation_radius: 0.25
+    collision_rmp_metric_scalar: 500.0
+    collision_rmp_metric_exploder_std_dev: 0.02
+    collision_rmp_metric_exploder_eps: 0.001
+    damping_rmp_accel_d_gain: 0.5
+    damping_rmp_metric_scalar: 10.0
+    damping_rmp_inertia: 0.0
+    body_obstacles:
+      names:
+        - link1_guard_1
+        - link1_guard_2
+        - link1_guard_3
+        - link2_guard_1
+        - link2_guard_2
+        - link2_guard_3
+        - link2_guard_4
+        - link2_guard_5
+        - link2_guard_6
+        - link2_guard_7
+        - link2_guard_8
+        - link3_guard_1
+        - link3_guard_2
+        - link3_guard_3
+        - link3_guard_4
+        - link3_guard_5
+        - link3_5_guard_1
+        - link3_5_guard_2
+        - link3_5_guard_3
+        - link3_5_guard_4
+        - link4_guard_1
+        - link4_guard_2
+        - link4_guard_3
+        - link4_guard_4
+        - link4_guard_5
+        - link5_guard_1
+        - link5_guard_2
+        - link5_guard_3
+        - link5_guard_4
+        - link6_guard_1
+        - link6_guard_2
+        - link6_guard_3
+        - link6_guard_4
+        - tcp_rmp_guard_1
+        - tcp_rmp_guard_2
+      link1_guard_1:
+        type: "ball"
+        link_name: "link1"
+        center: [0.0, -0.012, 0.085]
+        radius: 0.07
+      link1_guard_2:
+        type: "ball"
+        link_name: "link1"
+        center: [0.0, -0.02, 0.11]
+        radius: 0.085
+      link1_guard_3:
+        type: "ball"
+        link_name: "link1"
+        center: [0.0, -0.025, 0.17]
+        radius: 0.08
+      link2_guard_1:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.05, 0.0]
+        radius: 0.075
+      link2_guard_2:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.12, 0.0]
+        radius: 0.08
+      link2_guard_3:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.0]
+        radius: 0.085
+      link2_guard_4:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.11]
+        radius: 0.08
+      link2_guard_5:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.22]
+        radius: 0.085
+      link2_guard_6:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.33]
+        radius: 0.085
+      link2_guard_7:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.44]
+        radius: 0.08
+      link2_guard_8:
+        type: "ball"
+        link_name: "link2"
+        center: [0.0, -0.1875, 0.55]
+        radius: 0.07
+      link3_guard_1:
+        type: "ball"
+        link_name: "link3"
+        center: [0.0, 0.03, 0.0]
+        radius: 0.07
+      link3_guard_2:
+        type: "ball"
+        link_name: "link3"
+        center: [0.0, 0.06, 0.0]
+        radius: 0.07
+      link3_guard_3:
+        type: "ball"
+        link_name: "link3"
+        center: [0.0, 0.09, 0.0]
+        radius: 0.07
+      link3_guard_4:
+        type: "ball"
+        link_name: "link3"
+        center: [0.0, 0.119, 0.0]
+        radius: 0.065
+      link3_guard_5:
+        type: "ball"
+        link_name: "link3"
+        center: [0.0, 0.141, 0.0]
+        radius: 0.06
+      link3_5_guard_1:
+        type: "ball"
+        link_name: "link3_5"
+        center: [0.0, 0.0, 0.10]
+        radius: 0.065
+      link3_5_guard_2:
+        type: "ball"
+        link_name: "link3_5"
+        center: [0.0, 0.0, 0.21]
+        radius: 0.065
+      link3_5_guard_3:
+        type: "ball"
+        link_name: "link3_5"
+        center: [0.0, 0.0, 0.32]
+        radius: 0.06
+      link3_5_guard_4:
+        type: "ball"
+        link_name: "link3_5"
+        center: [0.0, 0.0, 0.44]
+        radius: 0.055
+      link4_guard_1:
+        type: "ball"
+        link_name: "link4"
+        center: [0.0, -0.02, 0.0]
+        radius: 0.06
+      link4_guard_2:
+        type: "ball"
+        link_name: "link4"
+        center: [0.0, -0.045, 0.0]
+        radius: 0.06
+      link4_guard_3:
+        type: "ball"
+        link_name: "link4"
+        center: [0.0, -0.07, 0.0]
+        radius: 0.05
+      link4_guard_4:
+        type: "ball"
+        link_name: "link4"
+        center: [0.0, -0.095, 0.0]
+        radius: 0.05
+      link4_guard_5:
+        type: "ball"
+        link_name: "link4"
+        center: [0.0, -0.117, 0.0]
+        radius: 0.045
+      link5_guard_1:
+        type: "ball"
+        link_name: "link5"
+        center: [0.0, 0.0, 0.02]
+        radius: 0.06
+      link5_guard_2:
+        type: "ball"
+        link_name: "link5"
+        center: [0.0, 0.0, 0.05]
+        radius: 0.06
+      link5_guard_3:
+        type: "ball"
+        link_name: "link5"
+        center: [0.0, 0.0, 0.08]
+        radius: 0.055
+      link5_guard_4:
+        type: "ball"
+        link_name: "link5"
+        center: [0.0, 0.0, 0.11]
+        radius: 0.05
+      link6_guard_1:
+        type: "ball"
+        link_name: "link6"
+        center: [0.0, -0.025, 0.0]
+        radius: 0.05
+      link6_guard_2:
+        type: "ball"
+        link_name: "link6"
+        center: [0.0, -0.055, 0.0]
+        radius: 0.045
+      link6_guard_3:
+        type: "ball"
+        link_name: "link6"
+        center: [0.0, -0.085, 0.0]
+        radius: 0.045
+      link6_guard_4:
+        type: "ball"
+        link_name: "link6"
+        center: [0.0, -0.11, 0.0]
+        radius: 0.04
+      tcp_rmp_guard_1:
+        type: "ball"
+        link_name: "tcp_rmp"
+        center: [0.0, 0.04, 0.0]
+        radius: 0.02
+      tcp_rmp_guard_2:
+        type: "ball"
+        link_name: "tcp_rmp"
+        center: [0.0, -0.04, 0.0]
+        radius: 0.02
+
+interactive_goal:
+  ros__parameters:
+    initial_x: 0.6
+    initial_y: -0.4
+    initial_z: 0.6
+    initial_q: [1.0660471071181365, -0.3311238656883642, -1.7919295430225781, 0.8574628082122941, -1.557060585581701, 0.15151203236562774]
+    initialize_from_joint_state: true
+    joint_state_topic: "joint_states"
+
+obstacle_manager:
+  ros__parameters:
+    num_obstacles: 1
+    default_radius: 0.06
+    default_positions: [-0.015865802764892578, -0.414907306432724, 0.4573509991168976]
+
+proximity_obstacle_bridge:
+  ros__parameters:
+    fixed_frame: "base_link"
+    obstacle_topic: "obstacles"
+    publish_rate: 30.0  
+    obstacle_radius: 0.08
+    valid_margin: 0.001
+    range_scale: 0.001
+    trigger_distance: 0.15
+    trigger_distances:
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.15
+    range_topics:
+      - "proximity_distance1"
+      - "proximity_distance2"
+      - "proximity_distance3"
+      - "proximity_distance4"
+      - "proximity_distance9"
+      - "proximity_distance10"
+      - "proximity_distance11"
+      - "proximity_distance12"
+    sensor_frames:
+      - "tof_E"
+      - "tof_S"
+      - "tof_W"
+      - "tof_N"
+      - "tof6_1_L"
+      - "tof6_1_F"
+      - "tof6_1_R"
+      - "tof6_1_U"
+    obstacle_radii:
+      - 0.08
+      - 0.08
+      - 0.08
+      - 0.08
+      - 0.04
+      - 0.04
+      - 0.04
+      - 0.04
