@@ -54,13 +54,14 @@ class EsdfObstacleSphereNode(Node):
         self.declare_parameter("active_range_m", 1.0)
         self.declare_parameter("danger_clearance_m", 0.05)
         self.declare_parameter("cluster_radius_m", 0.14)
-        self.declare_parameter("min_cluster_points", 1)
+        self.declare_parameter("min_cluster_points", 3)
         self.declare_parameter("min_sphere_radius_m", 0.04)
         self.declare_parameter("max_sphere_radius_m", 0.14)
         self.declare_parameter("sphere_padding_m", 0.02)
         self.declare_parameter("max_obstacle_spheres", 5)
         self.declare_parameter("smoothing_alpha", 0.6)
         self.declare_parameter("smoothing_match_distance_m", 0.18)
+        self.declare_parameter("min_persistent_frames", 3)
         self.declare_parameter("max_rate_hz", 10.0)
 
         self.sample_topic = self.get_parameter("sample_topic").value
@@ -79,12 +80,14 @@ class EsdfObstacleSphereNode(Node):
         self.smoothing_match_distance_m = float(
             self.get_parameter("smoothing_match_distance_m").value
         )
+        self.min_persistent_frames = int(self.get_parameter("min_persistent_frames").value)
         self.max_rate_hz = float(self.get_parameter("max_rate_hz").value)
 
         self.last_process_time = 0.0
         self.last_log_time = 0.0
         self.previous_marker_count = 0
         self.previous_spheres = []
+        self.cluster_tracks = []
 
         sample_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -104,7 +107,9 @@ class EsdfObstacleSphereNode(Node):
             "ESDF obstacle sphere node started: "
             f"{self.sample_topic} -> {self.obstacle_cloud_topic}, "
             f"markers={self.obstacle_marker_topic}, active_range={self.active_range_m:.2f} m, "
-            f"max_spheres={self.max_obstacle_spheres}"
+            f"max_spheres={self.max_obstacle_spheres}, "
+            f"min_cluster_points={self.min_cluster_points}, "
+            f"min_persistent_frames={self.min_persistent_frames}"
         )
 
     def sample_callback(self, msg):
@@ -123,13 +128,15 @@ class EsdfObstacleSphereNode(Node):
         candidates = self.read_candidates(msg)
         clusters = self.cluster_candidates(candidates)
         clusters = self.smooth_clusters(clusters)
+        raw_cluster_count = len(clusters)
+        clusters = self.filter_persistent_clusters(clusters)
         self.publish_results(msg.header, clusters)
 
         min_clearance = min((item["clearance"] for item in candidates), default=float("nan"))
         self.log_throttled(
             "ESDF obstacle spheres: "
-            f"candidates={len(candidates)}, spheres={len(clusters)}, "
-            f"min_clearance={min_clearance:.3f} m"
+            f"candidates={len(candidates)}, raw_clusters={raw_cluster_count}, "
+            f"spheres={len(clusters)}, min_clearance={min_clearance:.3f} m"
         )
 
     def read_candidates(self, msg):
@@ -381,6 +388,46 @@ class EsdfObstacleSphereNode(Node):
         copied["center"] = np.asarray(cluster["center"], dtype=np.float64).copy()
         copied["normal"] = np.asarray(cluster["normal"], dtype=np.float64).copy()
         return copied
+
+    def filter_persistent_clusters(self, clusters):
+        if self.min_persistent_frames <= 1:
+            self.cluster_tracks = [
+                {"center": np.asarray(cluster["center"], dtype=np.float64).copy(), "age": 1}
+                for cluster in clusters
+            ]
+            return clusters
+        if not clusters:
+            self.cluster_tracks = []
+            return []
+
+        previous_tracks = self.cluster_tracks
+        matched_previous = set()
+        new_tracks = []
+        persistent_clusters = []
+
+        for cluster in clusters:
+            center = np.asarray(cluster["center"], dtype=np.float64)
+            best_index = None
+            best_distance = self.smoothing_match_distance_m
+            for index, track in enumerate(previous_tracks):
+                if index in matched_previous:
+                    continue
+                distance = float(np.linalg.norm(center - track["center"]))
+                if distance <= best_distance:
+                    best_index = index
+                    best_distance = distance
+
+            age = 1
+            if best_index is not None:
+                matched_previous.add(best_index)
+                age = int(previous_tracks[best_index]["age"]) + 1
+
+            new_tracks.append({"center": center.copy(), "age": age})
+            if age >= self.min_persistent_frames:
+                persistent_clusters.append(cluster)
+
+        self.cluster_tracks = new_tracks
+        return persistent_clusters
 
     def risk_score(self, clearance):
         if clearance <= self.danger_clearance_m:

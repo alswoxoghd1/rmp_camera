@@ -123,6 +123,14 @@ def generate_launch_description():
     )
     publish_obstacle_body_debug_clouds = LaunchConfiguration("publish_obstacle_body_debug_clouds")
     camera_serial_number = LaunchConfiguration("camera_serial_number")
+    realsense_decimation_filter_enabled = LaunchConfiguration(
+        "realsense_decimation_filter_enabled"
+    )
+    realsense_spatial_filter_enabled = LaunchConfiguration("realsense_spatial_filter_enabled")
+    realsense_temporal_filter_enabled = LaunchConfiguration("realsense_temporal_filter_enabled")
+    realsense_hole_filling_filter_enabled = LaunchConfiguration(
+        "realsense_hole_filling_filter_enabled"
+    )
     publish_static_tf = LaunchConfiguration("publish_static_tf")
     publish_odom_tf = LaunchConfiguration("publish_odom_tf")
     publish_robot_base_tf = LaunchConfiguration("publish_robot_base_tf")
@@ -279,6 +287,9 @@ def generate_launch_description():
     esdf_obstacle_smoothing_match_distance_m = LaunchConfiguration(
         "esdf_obstacle_smoothing_match_distance_m"
     )
+    esdf_obstacle_min_persistent_frames = LaunchConfiguration(
+        "esdf_obstacle_min_persistent_frames"
+    )
     esdf_surface_min_distance_m = LaunchConfiguration("esdf_surface_min_distance_m")
     esdf_surface_max_distance_m = LaunchConfiguration("esdf_surface_max_distance_m")
     esdf_surface_max_robot_clearance_m = LaunchConfiguration(
@@ -334,6 +345,15 @@ def generate_launch_description():
             "run_standalone": "False",
             "num_cameras": "1",
             "camera_serial_numbers": camera_serial_number,
+            # Passed through so they land on the realsense2_camera node if the
+            # included launch file forwards unknown launch arguments to it;
+            # harmless no-ops otherwise. Verify exact arg names against the
+            # realsense2_camera version actually installed before relying on
+            # them (see DeclareLaunchArgument descriptions below).
+            "decimation_filter.enable": realsense_decimation_filter_enabled,
+            "spatial_filter.enable": realsense_spatial_filter_enabled,
+            "temporal_filter.enable": realsense_temporal_filter_enabled,
+            "hole_filling_filter.enable": realsense_hole_filling_filter_enabled,
         }.items(),
         condition=IfCondition(run_realsense_for_source),
     )
@@ -747,6 +767,7 @@ def generate_launch_description():
                 "max_obstacle_spheres": esdf_obstacle_max_spheres,
                 "smoothing_alpha": esdf_obstacle_smoothing_alpha,
                 "smoothing_match_distance_m": esdf_obstacle_smoothing_match_distance_m,
+                "min_persistent_frames": esdf_obstacle_min_persistent_frames,
                 "max_rate_hz": esdf_collision_rate_hz,
                 "use_sim_time": ParameterValue(effective_use_sim_time, value_type=bool),
             }
@@ -902,6 +923,34 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("publish_obstacle_body_debug_clouds", default_value="False"),
             DeclareLaunchArgument("camera_serial_number", default_value="117322070340"),
+            DeclareLaunchArgument(
+                "realsense_decimation_filter_enabled",
+                default_value="True",
+                description="Enable the RealSense driver-level decimation filter "
+                "(depth post-processing, reduces noisy/floating points before nvblox "
+                "integration). Argument name assumes realsense2_camera's "
+                "'decimation_filter.enable' convention (realsense-ros >= 4.51); verify "
+                "against the installed realsense2_camera version and adjust the parameter "
+                "name passed into realsense_launch below if it differs.",
+            ),
+            DeclareLaunchArgument(
+                "realsense_spatial_filter_enabled",
+                default_value="True",
+                description="Enable the RealSense driver-level spatial (edge-preserving) "
+                "filter. See realsense_decimation_filter_enabled for the naming caveat.",
+            ),
+            DeclareLaunchArgument(
+                "realsense_temporal_filter_enabled",
+                default_value="True",
+                description="Enable the RealSense driver-level temporal filter. See "
+                "realsense_decimation_filter_enabled for the naming caveat.",
+            ),
+            DeclareLaunchArgument(
+                "realsense_hole_filling_filter_enabled",
+                default_value="True",
+                description="Enable the RealSense driver-level hole-filling filter. See "
+                "realsense_decimation_filter_enabled for the naming caveat.",
+            ),
             DeclareLaunchArgument("publish_static_tf", default_value="True"),
             DeclareLaunchArgument("publish_odom_tf", default_value="True"),
             DeclareLaunchArgument("publish_robot_base_tf", default_value="False"),
@@ -1074,7 +1123,7 @@ def generate_launch_description():
             DeclareLaunchArgument("esdf_obstacle_active_range_m", default_value="1.0"),
             DeclareLaunchArgument("esdf_obstacle_danger_clearance_m", default_value="0.05"),
             DeclareLaunchArgument("esdf_obstacle_cluster_radius_m", default_value="0.14"),
-            DeclareLaunchArgument("esdf_obstacle_min_cluster_points", default_value="1"),
+            DeclareLaunchArgument("esdf_obstacle_min_cluster_points", default_value="3"),
             DeclareLaunchArgument("esdf_obstacle_min_sphere_radius_m", default_value="0.04"),
             DeclareLaunchArgument("esdf_obstacle_max_sphere_radius_m", default_value="0.14"),
             DeclareLaunchArgument("esdf_obstacle_sphere_padding_m", default_value="0.02"),
@@ -1083,6 +1132,13 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "esdf_obstacle_smoothing_match_distance_m",
                 default_value="0.18",
+            ),
+            DeclareLaunchArgument(
+                "esdf_obstacle_min_persistent_frames",
+                default_value="3",
+                description="Consecutive frames an ESDF obstacle cluster must be seen in "
+                "(matched within esdf_obstacle_smoothing_match_distance_m) before it is "
+                "published as an obstacle sphere. Set to 1 to disable persistence gating.",
             ),
             DeclareLaunchArgument("esdf_surface_min_distance_m", default_value="-0.02"),
             DeclareLaunchArgument("esdf_surface_max_distance_m", default_value="0.12"),

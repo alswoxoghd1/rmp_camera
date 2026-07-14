@@ -17,7 +17,15 @@
 
     static_mapper:
       esdf_integrator_max_distance_m: 2.0
-      esdf_integrator_min_weight: 0.1
+      # Raised from 0.1 -> 0.3: filters out voxels that only accumulated weight from a
+      # single noisy/transient depth observation (a common source of false obstacle
+      # spheres in empty space). The D435 is static here and continuously re-observes
+      # the same workspace every depth frame, so a real obstacle surface accumulates
+      # weight every frame and crosses 0.3 within a few frames (well under a second) of
+      # first being seen -- clearance for genuine obstacles is unaffected once the map
+      # has warmed up. Only the map's initial warm-up latency after start (or after an
+      # obstacle first appears) increases slightly.
+      esdf_integrator_min_weight: 0.3
       esdf_slice_height: 0.5
       esdf_slice_min_height: 0.35
       esdf_slice_max_height: 0.75
