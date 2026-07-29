@@ -1,0 +1,263 @@
+"""ROS-free unit tests for dense signed-ESDF medial spheres."""
+
+import numpy as np
+
+from rmp_camera.esdf_medial_sphere_core import (
+    Sphere,
+    add_spheres_until_coverage,
+    calculate_component_coverage,
+    connected_components_18,
+    create_initial_spheres,
+    extract_inside_mask,
+    find_local_minimum_candidates,
+    generate_medial_spheres,
+    group_or_reduce_plateaus,
+    make_neighbor_offsets_18,
+    remove_redundant_spheres,
+)
+
+
+def signed_box_esdf(
+    shape,
+    box_min_m,
+    box_max_m,
+    voxel_size_m=1.0,
+    origin_m=(0.0, 0.0, 0.0),
+):
+    """Return an axis-aligned box's Euclidean signed distance at voxel centres."""
+
+    indices = np.indices(shape, dtype=np.float64).transpose(1, 2, 3, 0)
+    points = np.asarray(origin_m) + (indices + 0.5) * voxel_size_m
+    box_min = np.asarray(box_min_m, dtype=np.float64)
+    box_max = np.asarray(box_max_m, dtype=np.float64)
+    center = 0.5 * (box_min + box_max)
+    half_extent = 0.5 * (box_max - box_min)
+    q = np.abs(points - center) - half_extent
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=-1)
+    inside = np.minimum(np.max(q, axis=-1), 0.0)
+    return outside + inside
+
+
+def make_sphere(index, radius, component_id=0, voxel_size_m=1.0):
+    center = (np.asarray(index, dtype=np.float64) + 0.5) * voxel_size_m
+    return Sphere(center, radius, radius, component_id, tuple(index))
+
+
+def sphere_signature(result):
+    return [
+        (
+            sphere.component_id,
+            sphere.source_index,
+            round(sphere.raw_radius, 12),
+            tuple(np.round(sphere.center, 12)),
+        )
+        for sphere in result.spheres
+    ]
+
+
+def test_neighbor_offsets_are_exactly_the_18_face_and_edge_neighbors():
+    offsets = make_neighbor_offsets_18()
+    assert len(offsets) == 18
+    assert len(set(offsets)) == 18
+    assert all(0 < sum(abs(value) for value in offset) <= 2 for offset in offsets)
+
+
+def test_face_touching_voxels_share_component():
+    mask = np.zeros((2, 1, 1), dtype=bool)
+    mask[0, 0, 0] = mask[1, 0, 0] = True
+    assert [len(component) for component in connected_components_18(mask)] == [2]
+
+
+def test_edge_touching_voxels_share_component():
+    mask = np.zeros((2, 2, 1), dtype=bool)
+    mask[0, 0, 0] = mask[1, 1, 0] = True
+    assert [len(component) for component in connected_components_18(mask)] == [2]
+
+
+def test_corner_only_touching_voxels_are_separate_components():
+    mask = np.zeros((2, 2, 2), dtype=bool)
+    mask[0, 0, 0] = mask[1, 1, 1] = True
+    assert [len(component) for component in connected_components_18(mask)] == [1, 1]
+
+
+def test_two_separated_cubes_are_two_components():
+    mask = np.zeros((7, 3, 3), dtype=bool)
+    mask[0:2, 0:2, 0:2] = True
+    mask[5:7, 0:2, 0:2] = True
+    assert [len(component) for component in connected_components_18(mask)] == [8, 8]
+
+
+def test_unobserved_sentinel_is_not_inside():
+    grid = np.array([[[-1000.0, -0.2]]])
+    mask = extract_inside_mask(grid, -1000.0, 0.005)
+    assert mask.tolist() == [[[False, True]]]
+
+
+def test_positive_esdf_is_not_inside():
+    grid = np.array([[[-0.2, 0.0, 0.2]]])
+    mask = extract_inside_mask(grid, -1000.0, 0.005)
+    assert mask.tolist() == [[[True, False, False]]]
+
+
+def test_signed_cube_has_a_local_minimum_near_its_center():
+    grid = signed_box_esdf((9, 9, 9), (1.0, 1.0, 1.0), (8.0, 8.0, 8.0))
+    component = connected_components_18(extract_inside_mask(grid, -1000.0, 0.0))[0]
+    minima = find_local_minimum_candidates(grid, component)
+    assert any(np.all(index == np.array([4, 4, 4])) for index in minima)
+
+
+def test_long_plateau_keeps_multiple_stably_spaced_centers():
+    grid = signed_box_esdf((11, 5, 5), (1.0, 1.0, 1.0), (10.0, 4.0, 4.0))
+    component = connected_components_18(extract_inside_mask(grid, -1000.0, 0.0))[0]
+    minima = find_local_minimum_candidates(grid, component)
+    reduced_a = group_or_reduce_plateaus(grid, minima, 1.0, 1e-9, 2.0)
+    reduced_b = group_or_reduce_plateaus(grid, minima, 1.0, 1e-9, 2.0)
+    assert len(reduced_a) >= 3
+    assert np.array_equal(reduced_a, reduced_b)
+    pair_distances = np.linalg.norm(
+        reduced_a[:, None, :] - reduced_a[None, :, :], axis=2
+    )
+    pair_distances += np.eye(len(reduced_a)) * 1e9
+    assert np.min(pair_distances) >= 2.0
+
+
+def test_initial_sphere_radius_is_negative_esdf_at_center():
+    grid = np.ones((3, 3, 3), dtype=np.float64)
+    grid[1, 1, 1] = -0.375
+    spheres = create_initial_spheres(
+        grid, np.array([[1, 1, 1]]), (0.0, 0.0, 0.0), 0.1, 0.01, 0.02, 7
+    )
+    assert len(spheres) == 1
+    assert spheres[0].raw_radius == 0.375
+    assert spheres[0].output_radius == 0.395
+
+
+def test_spheres_are_added_until_target_coverage():
+    grid = np.full((5, 1, 1), -0.51)
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    initial = create_initial_spheres(
+        grid, np.array([[0, 0, 0]]), (0.0, 0.0, 0.0), 1.0, 0.1, 0.0, 0
+    )
+    spheres, coverage, reason, _ = add_spheres_until_coverage(
+        grid,
+        component,
+        initial,
+        (0.0, 0.0, 0.0),
+        1.0,
+        0.95,
+        0.0,
+        0.1,
+        0.1,
+        0.0,
+        10,
+        10,
+        0,
+    )
+    assert len(spheres) == 5
+    assert coverage >= 0.95
+    assert reason == "target_coverage"
+
+
+def test_max_spheres_terminates_without_reaching_target():
+    grid = np.full((5, 1, 1), -0.51)
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    spheres, coverage, reason, _ = add_spheres_until_coverage(
+        grid,
+        component,
+        [],
+        (0.0, 0.0, 0.0),
+        1.0,
+        0.95,
+        0.0,
+        0.1,
+        0.1,
+        0.0,
+        2,
+        100,
+        0,
+    )
+    assert len(spheres) == 2
+    assert coverage < 0.95
+    assert reason == "max_spheres_per_component"
+
+
+def test_no_inside_voxels_returns_no_spheres():
+    result = generate_medial_spheres(
+        np.ones((4, 4, 4)), (0.0, 0.0, 0.0), 0.1, min_component_voxels=1
+    )
+    assert not result.components
+    assert not result.spheres
+
+
+def test_small_component_is_removed():
+    grid = np.ones((5, 5, 5))
+    grid[2, 2, 2] = -0.1
+    result = generate_medial_spheres(
+        grid, (0.0, 0.0, 0.0), 0.1, min_component_voxels=2
+    )
+    assert result.removed_small_components == 1
+    assert not result.components
+
+
+def test_redundant_sphere_is_removed_when_coverage_stays_at_target():
+    component = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+    large = make_sphere((1, 0, 0), 2.0)
+    small = make_sphere((1, 0, 0), 0.5)
+    spheres, coverage = remove_redundant_spheres(
+        component, [large, small], (0.0, 0.0, 0.0), 1.0, 0.95, 0.0, 0.0
+    )
+    assert spheres == [large]
+    assert coverage == 1.0
+
+
+def test_redundant_sphere_is_kept_if_removal_loses_target_coverage():
+    component = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+    left = make_sphere((0, 0, 0), 1.0)
+    right = make_sphere((2, 0, 0), 0.1)
+    spheres, coverage = remove_redundant_spheres(
+        component, [left, right], (0.0, 0.0, 0.0), 1.0, 0.95, 0.0, 2.0
+    )
+    assert len(spheres) == 2
+    assert coverage == 1.0
+
+
+def test_total_sphere_limit_uses_deterministic_coverage_ranking():
+    grid = np.full((9, 1, 1), -0.51)
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        minimum_center_spacing_m=0.1,
+        min_raw_sphere_radius_m=0.1,
+        coverage_tolerance_m=0.0,
+        target_coverage=1.0,
+        max_spheres_per_component=20,
+        max_iterations_per_component=20,
+        max_total_spheres=3,
+    )
+    assert result.total_limit_applied
+    assert len(result.spheres) == 3
+    assert result.coverage_lost_component_ids == [0]
+    assert result.components[0].termination_reason == "max_total_spheres"
+    assert result.components[0].coverage == 3.0 / 9.0
+
+
+def test_repeated_generation_has_identical_sphere_order_and_values():
+    grid = signed_box_esdf((12, 7, 7), (1.0, 1.0, 1.0), (11.0, 6.0, 6.0))
+    kwargs = dict(
+        origin_m=(0.0, 0.0, 0.0),
+        voxel_size_m=1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        minimum_center_spacing_m=2.0,
+        min_raw_sphere_radius_m=0.1,
+        coverage_tolerance_m=0.01,
+    )
+    first = generate_medial_spheres(grid, **kwargs)
+    second = generate_medial_spheres(grid, **kwargs)
+    assert sphere_signature(first) == sphere_signature(second)
+    assert [component.coverage for component in first.components] == [
+        component.coverage for component in second.components
+    ]

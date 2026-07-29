@@ -78,6 +78,7 @@ def generate_launch_description():
     run_obstacle_body_spheres = LaunchConfiguration("run_obstacle_body_spheres")
     run_esdf_collision_query = LaunchConfiguration("run_esdf_collision_query")
     run_esdf_obstacle_spheres = LaunchConfiguration("run_esdf_obstacle_spheres")
+    run_esdf_medial_spheres = LaunchConfiguration("run_esdf_medial_spheres")
     run_esdf_slice_obstacle_spheres = LaunchConfiguration(
         "run_esdf_slice_obstacle_spheres"
     )
@@ -775,6 +776,22 @@ def generate_launch_description():
         condition=IfCondition(run_esdf_obstacle_spheres_with_publish),
     )
 
+    esdf_medial_spheres = Node(
+        package="rmp_camera",
+        executable="esdf_medial_sphere_node",
+        name="esdf_medial_sphere_node",
+        output="screen",
+        parameters=[
+            {
+                "service_name": esdf_collision_service_name,
+                "target_frame": global_frame,
+                "target_coverage": 0.95,
+                "use_sim_time": ParameterValue(effective_use_sim_time, value_type=bool),
+            }
+        ],
+        condition=IfCondition(run_esdf_medial_spheres),
+    )
+
     esdf_slice_obstacle_spheres = Node(
         package="rmp_camera",
         executable="nvblox_esdf_slice_obstacle_sphere_node",
@@ -916,6 +933,14 @@ def generate_launch_description():
             DeclareLaunchArgument("run_obstacle_body_spheres", default_value="True"),
             DeclareLaunchArgument("run_esdf_collision_query", default_value="False"),
             DeclareLaunchArgument("run_esdf_obstacle_spheres", default_value="False"),
+            DeclareLaunchArgument(
+                "run_esdf_medial_spheres",
+                default_value="False",
+                description=(
+                    "Query the static dense signed ESDF and publish component-wise "
+                    "medial spheres on separate debug topics."
+                ),
+            ),
             DeclareLaunchArgument("run_esdf_slice_obstacle_spheres", default_value="False"),
             DeclareLaunchArgument(
                 "esdf_slice_obstacle_self_filter_robot_enabled",
@@ -1173,6 +1198,7 @@ def generate_launch_description():
             obstacle_body_spheres,
             esdf_collision_query,
             esdf_obstacle_spheres,
+            esdf_medial_spheres,
             esdf_slice_obstacle_spheres,
             rviz_launch,
         ]
