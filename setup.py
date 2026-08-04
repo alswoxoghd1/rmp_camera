@@ -29,6 +29,7 @@ setup(
             "esdf_query_debug_node = rmp_camera.esdf_query_debug_node:main",
             "esdf_collision_query_node = rmp_camera.esdf_collision_query_node:main",
             "esdf_obstacle_sphere_node = rmp_camera.esdf_obstacle_sphere_node:main",
+            "esdf_medial_sphere_node = rmp_camera.esdf_medial_sphere_node:main",
             "nvblox_esdf_slice_obstacle_sphere_node = rmp_camera.nvblox_esdf_slice_obstacle_sphere_node:main",
             "joint_state_normalizer_node = rmp_camera.joint_state_normalizer_node:main",
             "rb10_measured_joint_state_node = rmp_camera.rb10_measured_joint_state_node:main",
