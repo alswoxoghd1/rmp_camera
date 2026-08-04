@@ -40,3 +40,78 @@ Core algorithm tests do not require ROS:
 ```bash
 python3 -m pytest -q test/test_esdf_medial_sphere_core.py
 ```
+
+## One-Nvblox dynamic sphere fusion experiment
+
+`d435_nvblox_dynamic_spheres.launch.py` starts one D435 include and one
+`nvblox::NvbloxNode` with `mapping_type=dynamic`. Nvblox's `MultiMapper`
+maintains the static background and dynamic foreground in that node. The
+existing dense static-ESDF medial sphere node is unchanged. A new NumPy-only
+adapter voxelizes `/nvblox_node/dynamic_points`, constructs adaptive/fallback
+spheres, tracks them through short occlusions, and fuses their PointCloud2
+output with the latest static sphere cloud.
+
+All experiment values are in one file:
+
+```text
+config/d435_nvblox_dynamic_experiment.yaml
+```
+
+Build and locate the installed copy:
+
+```bash
+cd ~/rmp_camera_dynamic_ws
+source /opt/ros/$ROS_DISTRO/setup.bash
+colcon build --symlink-install --packages-select rmp_camera \
+  --event-handlers console_direct+
+source install/setup.bash
+ros2 pkg prefix --share rmp_camera
+```
+
+Run with the installed default YAML:
+
+```bash
+ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py
+```
+
+Or pass an edited copy explicitly:
+
+```bash
+ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py \
+  experiment_config:=/absolute/path/d435_nvblox_dynamic_experiment.yaml
+```
+
+Inspect launch arguments and native/derived topics:
+
+```bash
+ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py --show-args
+ros2 topic info /nvblox_node/dynamic_points --verbose
+ros2 topic echo /rmp_camera/esdf_medial_sphere_cloud --once
+ros2 topic echo /rmp_camera/dynamic_obstacle_sphere_cloud --once
+ros2 topic echo /rmp_camera/combined_obstacle_sphere_cloud --once
+```
+
+Important outputs:
+
+- static inside voxels: `/rmp_camera/esdf_medial_inside_voxels`
+- static medial spheres: `/rmp_camera/esdf_medial_sphere_markers`
+- native dynamic points: `/nvblox_node/dynamic_points`
+- dynamic voxels/spheres: `/rmp_camera/dynamic_obstacle_voxels` and
+  `/rmp_camera/dynamic_obstacle_sphere_markers`
+- source-colored fusion: `/rmp_camera/combined_obstacle_sphere_markers`
+
+The fusion node does not exact-sync different-rate inputs. Static output is
+kept without a normal TTL and requires consecutive empty confirmations to
+clear. Dynamic output has both a short occlusion hold and an absolute ghost
+limit; after a moving object stops, its stale dynamic sphere remains until an
+overlapping static sphere takes over. All overlap decisions use actual 3D
+center distance and output radii.
+
+Run all ROS-independent core tests with:
+
+```bash
+python3 -m pytest -q \
+  test/test_esdf_medial_sphere_core.py \
+  test/test_dynamic_obstacle_sphere_core.py \
+  test/test_obstacle_sphere_fusion_core.py
+```

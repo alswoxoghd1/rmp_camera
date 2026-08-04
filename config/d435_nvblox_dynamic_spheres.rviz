@@ -1,0 +1,243 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.55
+    Tree Height: 780
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Alpha: 0.45
+      Cell Size: 0.5
+      Color: 160; 160; 164
+      Enabled: true
+      Name: Grid
+      Plane: XY
+      Plane Cell Count: 20
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.35
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Value: true
+    - Class: rviz_common/Group
+      Enabled: true
+      Name: Static reconstruction
+      Displays:
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Static TSDF mesh markers
+          Namespaces: {}
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /nvblox_node/tsdf_layer_marker
+          Value: true
+        - Class: rviz_default_plugins/PointCloud2
+          Alpha: 0.60
+          Autocompute Intensity Bounds: true
+          Axis: Z
+          Channel Name: esdf_distance
+          Color: 80; 210; 255
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: Static ESDF inside voxels
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.025
+          Style: Points
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/esdf_medial_inside_voxels
+          Use Fixed Frame: true
+          Value: true
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Static medial spheres
+          Namespaces: {}
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/esdf_medial_sphere_markers
+          Value: true
+    - Class: rviz_common/Group
+      Enabled: true
+      Name: Dynamic reconstruction
+      Displays:
+        - Class: rviz_default_plugins/PointCloud2
+          Alpha: 0.80
+          Autocompute Intensity Bounds: true
+          Axis: Z
+          Channel Name: intensity
+          Color: 255; 140; 20
+          Color Transformer: FlatColor
+          Decay Time: 0.25
+          Enabled: true
+          Name: Native Nvblox dynamic points
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 4
+          Size (m): 0.025
+          Style: Points
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /nvblox_node/dynamic_points
+          Use Fixed Frame: true
+          Value: true
+        - Class: rviz_default_plugins/PointCloud2
+          Alpha: 0.70
+          Autocompute Intensity Bounds: true
+          Axis: Z
+          Channel Name: intensity
+          Color: 255; 180; 35
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: Dynamic voxels
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 4
+          Size (m): 0.04
+          Style: Boxes
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/dynamic_obstacle_voxels
+          Use Fixed Frame: true
+          Value: true
+        - Class: rviz_default_plugins/PointCloud2
+          Alpha: 0.75
+          Autocompute Intensity Bounds: true
+          Axis: Z
+          Channel Name: intensity
+          Color: 255; 0; 255
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: false
+          Name: Dynamic uncovered voxels
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 5
+          Size (m): 0.035
+          Style: Points
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/dynamic_uncovered_voxels
+          Use Fixed Frame: true
+          Value: false
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Dynamic spheres
+          Namespaces:
+            dynamic_obstacle_spheres: true
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/dynamic_obstacle_sphere_markers
+          Value: true
+    - Class: rviz_common/Group
+      Enabled: true
+      Name: Fusion
+      Displays:
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Combined static dynamic spheres
+          Namespaces:
+            combined_static: true
+            combined_dynamic: true
+          Topic:
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /rmp_camera/combined_obstacle_sphere_markers
+          Value: true
+    - Class: rviz_default_plugins/Camera
+      Enabled: true
+      Far Plane Distance: 10
+      Image Rendering: background and overlay
+      Name: D435 color image
+      Overlay Alpha: 0.35
+      Queue Size: 2
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera0/camera/color/image_raw
+      Transport Hint: raw
+      Value: true
+      Zoom Factor: 1
+  Enabled: true
+  Global Options:
+    Background Color: 34; 36; 40
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 5.0
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.8
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.55
+      Target Frame: base_link
+      Value: Orbit (rviz)
+      Yaw: 0.85
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Hide Left Dock: false
+  Hide Right Dock: true
+  Width: 1440
+  X: 60
+  Y: 30

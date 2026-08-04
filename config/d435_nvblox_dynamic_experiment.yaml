@@ -1,0 +1,200 @@
+# D435 + one Nvblox MultiMapper + static/dynamic sphere fusion experiment.
+# Edit this file only; the launch reads /experiment and all nodes read their section.
+#
+# Tuning guide:
+# - Smaller voxel sizes improve detail but increase GPU memory and CPU sphere work.
+# - Larger min_duration_since_occupied_for_freespace_ms reduces false dynamics but delays detection.
+# - Larger dynamic_target_coverage increases sphere count and processing time.
+# - Larger dynamic_sphere_ttl_sec survives occlusion but retains ghosts longer.
+# - Larger static_empty_confirmation_frames resists transient clears but delays real removal.
+# WARNING: nvblox voxel_size and dynamic_voxel_size_m are intentionally adjacent in
+# their sections but cannot be linked by ROS YAML. Keep both at the same value.
+
+/experiment:
+  ros__parameters:
+    global_frame: "base_link"             # TF frame used by every sphere output.
+    camera_frame: "camera0_link"          # D435 root frame under global_frame.
+    camera_serial_number: ""               # RealSense serial; empty selects the only camera.
+    static_tf_x_m: 1.403303227             # Calibrated base->camera X [m].
+    static_tf_y_m: -1.733655308            # Calibrated base->camera Y [m].
+    static_tf_z_m: 0.912738743             # Calibrated base->camera Z [m].
+    static_tf_roll_rad: -0.108681179       # Calibrated roll [rad].
+    static_tf_pitch_rad: 0.233046210       # Calibrated pitch [rad].
+    static_tf_yaw_rad: 1.782183343         # Calibrated yaw [rad].
+    realsense_decimation_filter_enabled: false  # Downsample depth; faster but loses small objects.
+    realsense_spatial_filter_enabled: true      # Smooth spatial depth noise; may soften edges.
+    realsense_temporal_filter_enabled: true     # Smooth time noise; may trail moving objects.
+    realsense_hole_filling_filter_enabled: false # Fill gaps; can bridge separate objects.
+    rviz_config: "d435_nvblox_dynamic_spheres.rviz" # File in this package's config directory.
+    source: "camera"                       # camera or bag.
+    bag_path: ""                           # rosbag path when source=bag.
+    bag_rate: 1.0                          # Bag playback multiplier [unitless].
+    use_sim_time: false                    # Must be true for bag /clock.
+
+/nvblox_node:
+  ros__parameters:
+    voxel_size: 0.05                       # Nvblox voxel edge [m]; keep equal to dynamic voxel size.
+    mapping_type: "dynamic"                # One MultiMapper: static background + dynamic foreground.
+    esdf_mode: "3d"                        # Required by the existing dense 3D static ESDF service.
+    global_frame: "base_link"
+    pose_frame: "base_link"
+    map_clearing_frame_id: "base_link"
+    esdf_slice_bounds_visualization_attachment_frame_id: "base_link"
+    workspace_height_bounds_visualization_attachment_frame_id: "base_link"
+    use_tf_transforms: true
+    use_depth: true
+    use_color: true
+    use_lidar: false
+    input_qos: "SENSOR_DATA"
+    tick_period_ms: 10                     # Nvblox scheduler tick [ms].
+    integrate_depth_rate_hz: 30.0          # Depth integration frequency [Hz].
+    integrate_color_rate_hz: 5.0           # Color integration frequency [Hz].
+    update_esdf_rate_hz: 10.0              # Static+dynamic internal ESDF update [Hz].
+    publish_layer_rate_hz: 5.0             # Mesh/layer publication [Hz].
+    publish_debug_vis_rate_hz: 10.0        # Other debug [Hz]; dynamic_points follows depth integration.
+    decay_tsdf_rate_hz: 5.0                # Static TSDF decay [Hz].
+    decay_dynamic_occupancy_rate_hz: 10.0  # Dynamic occupancy decay [Hz].
+    map_clearing_radius_m: 6.0             # Retained radius around map-clearing frame [m].
+
+    multi_mapper:
+      connected_mask_component_size_threshold: 40 # Dynamic image component floor [pixels].
+      remove_small_connected_components: true     # Reject small segmentation speckle.
+
+    static_mapper:
+      projective_integrator_max_integration_distance_m: 5.0 # Depth integration range [m].
+      projective_integrator_truncation_distance_vox: 4.0    # TSDF truncation [voxels].
+      projective_integrator_weighting_mode: "constant"      # Official dynamics specialization.
+      projective_integrator_max_weight: 5.0                  # TSDF observation weight cap.
+      projective_tsdf_integrator_invalid_depth_decay_factor: 0.8 # Free-space invalid-depth decay.
+      esdf_integrator_min_weight: 0.3             # Observed TSDF weight needed by ESDF.
+      esdf_integrator_max_distance_m: 2.0         # ESDF truncation distance [m].
+      unobserved_esdf_policy: "ignore"            # Never treat unobserved as free.
+      max_tsdf_distance_for_occupancy_m: 0.15     # TSDF band used by freespace logic [m].
+      max_unobserved_to_keep_consecutive_occupancy_ms: 200 # Occupancy continuity window [ms].
+      min_duration_since_occupied_for_freespace_ms: 250    # Dynamic confidence delay [ms].
+      min_consecutive_occupancy_duration_for_reset_ms: 2000 # Static reset evidence [ms].
+      check_neighborhood: true                    # Use neighboring voxels for freespace evidence.
+      initialize_to_high_confidence_freespace: false # Conservative startup; fewer false dynamics.
+      tsdf_decay_factor: 0.95                     # Static decay multiplier per decay tick.
+      tsdf_decayed_weight_threshold: 0.001        # Deallocation threshold [weight].
+      decay_integrator_deallocate_decayed_blocks: true # Release fully decayed GPU blocks.
+      workspace_bounds_type: "bounding_box"       # Bound integration to the lab experiment box.
+      workspace_bounds_min_corner_x_m: -3.0
+      workspace_bounds_min_corner_y_m: -3.0
+      workspace_bounds_min_height_m: -0.2
+      workspace_bounds_max_corner_x_m: 3.0
+      workspace_bounds_max_corner_y_m: 3.0
+      workspace_bounds_max_height_m: 2.5
+
+    dynamic_mapper:
+      projective_integrator_max_integration_distance_m: 5.0 # Foreground depth range [m].
+      projective_integrator_truncation_distance_vox: 4.0    # Occupancy projective band [voxels].
+      free_region_occupancy_probability: 0.2       # Free-space inverse sensor probability.
+      occupied_region_occupancy_probability: 0.9   # Hit probability; higher is more persistent.
+      unobserved_region_occupancy_probability: 0.35 # Unknown ray probability.
+      occupied_region_half_width_m: 0.15           # Occupied band half-width [m].
+      esdf_integrator_min_weight: 2.0               # Occupancy weight needed by dynamic ESDF.
+      esdf_integrator_max_distance_m: 2.0           # Internal dynamic ESDF max [m].
+      free_region_decay_probability: 0.55           # Dynamic free voxels decay toward unknown.
+      occupied_region_decay_probability: 0.30       # Dynamic hits decay; lower clears faster.
+
+/esdf_medial_sphere_node:
+  ros__parameters:
+    service_name: "/nvblox_node/get_esdf_and_gradient"
+    target_frame: "base_link"
+    update_rate_hz: 1.0                    # Dense static service queries [Hz].
+    update_esdf: true                      # Ask service to update ESDF before response.
+    visualize_esdf: false                 # Avoid service debug publication overhead.
+    aabb_min_x_m: -1.5
+    aabb_min_y_m: -1.5
+    aabb_min_z_m: 0.0
+    aabb_size_x_m: 3.0
+    aabb_size_y_m: 3.0
+    aabb_size_z_m: 2.0
+    unobserved_distance_value: -1000.0     # Nvblox unobserved sentinel [m].
+    inside_epsilon_m: 0.005                # Negative-distance noise rejection [m].
+    target_coverage: 0.95                  # Required component voxel coverage [0..1].
+    coverage_tolerance_m: 0.01             # Coverage discretization tolerance [m].
+    plateau_epsilon_m: 0.001               # ESDF minimum plateau tolerance [m].
+    minimum_center_spacing_m: 0.05         # Static center separation [m].
+    min_component_voxels: 8                # Static connected-component floor [voxels].
+    min_raw_sphere_radius_m: 0.01           # Static raw radius floor [m].
+    safety_margin_m: 0.02                  # Added to static output radius only [m].
+    redundancy_tolerance_m: 0.001          # Removal containment slack [m].
+    max_spheres_per_component: 128
+    max_iterations_per_component: 256
+    max_total_spheres: 256
+    max_grid_voxels: 8000000               # Dense response memory guard [voxels].
+    marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
+    sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
+    inside_voxel_cloud_topic: "/rmp_camera/esdf_medial_inside_voxels"
+    uncovered_voxel_cloud_topic: "/rmp_camera/esdf_medial_uncovered_voxels"
+    publish_debug_clouds: true
+
+/dynamic_obstacle_sphere_node:
+  ros__parameters:
+    input_dynamic_points_topic: "/nvblox_node/dynamic_points"
+    target_frame: "base_link"
+    marker_topic: "/rmp_camera/dynamic_obstacle_sphere_markers"
+    sphere_cloud_topic: "/rmp_camera/dynamic_obstacle_sphere_cloud"
+    dynamic_voxel_cloud_topic: "/rmp_camera/dynamic_obstacle_voxels"
+    uncovered_voxel_cloud_topic: "/rmp_camera/dynamic_uncovered_voxels"
+    min_x_m: -3.0                         # Dynamic crop minimum X [m].
+    max_x_m: 3.0                          # Dynamic crop maximum X [m].
+    min_y_m: -3.0
+    max_y_m: 3.0
+    min_z_m: -0.2
+    max_z_m: 2.5
+    max_range_from_base_m: 5.0             # Radial XY crop [m]; <=0 disables.
+    dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
+    dynamic_min_component_voxels: 6        # Noise component floor [voxels].
+    dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
+    dynamic_max_components: 32             # Component processing cap.
+    dynamic_max_input_points: 250000       # Input truncation cap [points].
+    dynamic_connectivity: 18               # 6 face, 18 face+edge, or 26 incl. corner.
+    dynamic_dilation_voxels: 0             # Positive values expand dynamic objects [voxels].
+    dynamic_closing_iterations: 1          # Fill one-voxel cracks; large values merge objects.
+    dynamic_minimum_center_spacing_m: 0.08 # Adaptive sphere center separation [m].
+    dynamic_min_raw_radius_m: 0.025         # Smallest accepted raw radius [m].
+    dynamic_max_raw_radius_m: 0.45          # Prevent one sphere swallowing nearby space [m].
+    dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
+    dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
+    dynamic_fixed_radius_m: 0.10            # Thin/oversized fallback radius [m].
+    dynamic_target_coverage: 0.95           # Voxel-center coverage goal [0..1].
+    dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
+    dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
+    dynamic_redundancy_tolerance_m: 0.01    # Redundancy removal slack [m].
+    dynamic_max_spheres_per_component: 96
+    dynamic_max_iterations_per_component: 256
+    dynamic_max_total_spheres: 384
+    dynamic_processing_budget_ms: 35.0      # Per-update soft CPU budget [ms].
+    dynamic_max_local_grid_voxels: 1200000  # Dense-equivalent volume guard [voxels].
+    dynamic_tracking_enabled: true
+    dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
+    dynamic_smoothing_alpha: 0.55           # 1=new measurement, 0=old track.
+    dynamic_sphere_ttl_sec: 0.8             # Occlusion retention [s].
+    dynamic_max_missed_updates: 8           # Occlusion update-count cap.
+    dynamic_update_rate_hz: 10.0            # CPU generation/tracking rate [Hz].
+    publish_debug_clouds: true
+
+/obstacle_sphere_fusion_node:
+  ros__parameters:
+    static_sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
+    dynamic_sphere_cloud_topic: "/rmp_camera/dynamic_obstacle_sphere_cloud"
+    combined_sphere_cloud_topic: "/rmp_camera/combined_obstacle_sphere_cloud"
+    combined_marker_topic: "/rmp_camera/combined_obstacle_sphere_markers"
+    target_frame: "base_link"
+    fusion_rate_hz: 10.0                   # Latest-cache fusion output [Hz].
+    fusion_overlap_tolerance_m: 0.01       # Real 3D sphere overlap slack [m].
+    fusion_dynamic_priority: true          # Fresh dynamic suppresses overlapping static.
+    fusion_hysteresis_sec: 0.5             # Static expiry only if explicitly enabled [s].
+    fusion_max_total_spheres: 512
+    static_cache_expire_enabled: false      # Keep static until confirmed empty/free-space update.
+    static_empty_confirmation_frames: 3    # Consecutive empty messages before static clear.
+    dynamic_handover_grace_sec: 0.5        # Fresh dynamic priority window [s].
+    keep_dynamic_until_static_overlap: true # Prevent stopped-object handover gaps.
+    dynamic_absolute_max_ttl_sec: 3.0      # Hard ghost limit even without static overlap [s].
+    static_marker_color: [0.15, 0.55, 1.0] # RGB [0..1].
+    dynamic_marker_color: [1.0, 0.12, 0.04] # RGB [0..1].
+    marker_alpha: 0.65                     # Marker opacity [0..1].
+    marker_lifetime_s: 0.0                 # 0 uses explicit DELETE and infinite lifetime [s].

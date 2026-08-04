@@ -1,0 +1,488 @@
+"""ROS-independent dynamic point to obstacle-sphere algorithms.
+
+The implementation intentionally depends only on NumPy.  Sparse voxel sets are
+used for morphology and connectivity so an accidentally large workspace does
+not allocate a correspondingly large dense array.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from time import monotonic
+from typing import Iterable, Sequence
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class DynamicSphereParameters:
+    voxel_size_m: float = 0.05
+    min_component_voxels: int = 6
+    max_component_voxels: int = 120000
+    max_components: int = 32
+    max_input_points: int = 250000
+    connectivity: int = 18
+    dilation_voxels: int = 0
+    closing_iterations: int = 1
+    minimum_center_spacing_m: float = 0.08
+    min_raw_radius_m: float = 0.025
+    max_raw_radius_m: float = 0.45
+    min_useful_adaptive_radius_m: float = 0.075
+    enable_fixed_radius_fallback: bool = True
+    fixed_radius_m: float = 0.10
+    target_coverage: float = 0.95
+    coverage_tolerance_m: float = 0.02
+    safety_margin_m: float = 0.015
+    redundancy_tolerance_m: float = 0.01
+    max_spheres_per_component: int = 96
+    max_iterations_per_component: int = 256
+    max_total_spheres: int = 384
+    processing_budget_ms: float = 35.0
+    max_local_grid_voxels: int = 1200000
+    min_x_m: float = -3.0
+    max_x_m: float = 3.0
+    min_y_m: float = -3.0
+    max_y_m: float = 3.0
+    min_z_m: float = -0.2
+    max_z_m: float = 2.5
+    max_range_from_base_m: float = 5.0
+
+    def validate(self) -> None:
+        if self.voxel_size_m <= 0.0:
+            raise ValueError("voxel_size_m must be positive")
+        if self.connectivity not in (6, 18, 26):
+            raise ValueError("connectivity must be 6, 18, or 26")
+        if not 0.0 <= self.target_coverage <= 1.0:
+            raise ValueError("target_coverage must be in [0, 1]")
+        if self.max_input_points <= 0 or self.max_total_spheres <= 0:
+            raise ValueError("point and sphere limits must be positive")
+        if self.min_raw_radius_m < 0.0 or self.max_raw_radius_m < self.min_raw_radius_m:
+            raise ValueError("invalid raw-radius limits")
+        if self.max_x_m <= self.min_x_m or self.max_y_m <= self.min_y_m:
+            raise ValueError("invalid XY workspace")
+        if self.max_z_m <= self.min_z_m:
+            raise ValueError("invalid Z workspace")
+
+
+@dataclass(frozen=True)
+class DynamicSphere:
+    x: float
+    y: float
+    z: float
+    raw_radius: float
+    output_radius: float
+    component_id: int = -1
+    component_coverage: float = 0.0
+    track_id: int = -1
+    age: int = 1
+    confidence: float = 0.0
+
+    @property
+    def center(self) -> np.ndarray:
+        return np.asarray((self.x, self.y, self.z), dtype=np.float64)
+
+
+@dataclass
+class DynamicComponentResult:
+    component_id: int
+    voxel_centers: np.ndarray
+    spheres: list[DynamicSphere]
+    coverage: float
+    uncovered_voxels: np.ndarray
+    termination_reason: str
+
+
+@dataclass
+class DynamicSphereResult:
+    components: list[DynamicComponentResult] = field(default_factory=list)
+    spheres: list[DynamicSphere] = field(default_factory=list)
+    voxel_centers: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float64))
+    uncovered_voxels: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float64))
+    elapsed_ms: float = 0.0
+    termination_reason: str = "empty_input"
+
+
+def neighbor_offsets(connectivity: int) -> tuple[tuple[int, int, int], ...]:
+    if connectivity not in (6, 18, 26):
+        raise ValueError("connectivity must be 6, 18, or 26")
+    offsets = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == dy == dz == 0:
+                    continue
+                nonzero = int(dx != 0) + int(dy != 0) + int(dz != 0)
+                if connectivity == 6 and nonzero == 1:
+                    offsets.append((dx, dy, dz))
+                elif connectivity == 18 and nonzero <= 2:
+                    offsets.append((dx, dy, dz))
+                elif connectivity == 26:
+                    offsets.append((dx, dy, dz))
+    return tuple(offsets)
+
+
+def _as_points(points: np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
+    array = np.asarray(points, dtype=np.float64)
+    if array.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if array.ndim != 2 or array.shape[1] < 3:
+        raise ValueError("points must have shape (N, >=3)")
+    return array[:, :3]
+
+
+def filter_and_voxelize(
+    points: np.ndarray | Sequence[Sequence[float]], params: DynamicSphereParameters,
+) -> np.ndarray:
+    """Return sorted unique integer voxel indices in the configured workspace."""
+    params.validate()
+    xyz = _as_points(points)
+    if xyz.size == 0:
+        return np.empty((0, 3), dtype=np.int64)
+    xyz = xyz[:params.max_input_points]
+    finite = np.isfinite(xyz).all(axis=1)
+    lo = np.asarray((params.min_x_m, params.min_y_m, params.min_z_m))
+    hi = np.asarray((params.max_x_m, params.max_y_m, params.max_z_m))
+    keep = finite & (xyz >= lo).all(axis=1) & (xyz <= hi).all(axis=1)
+    if params.max_range_from_base_m > 0.0:
+        keep &= np.linalg.norm(xyz[:, :2], axis=1) <= params.max_range_from_base_m
+    xyz = xyz[keep]
+    if xyz.size == 0:
+        return np.empty((0, 3), dtype=np.int64)
+    indices = np.floor((xyz - lo) / params.voxel_size_m).astype(np.int64)
+    indices = np.unique(indices, axis=0)
+    order = np.lexsort((indices[:, 2], indices[:, 1], indices[:, 0]))
+    return indices[order]
+
+
+def connected_components(indices: np.ndarray, connectivity: int = 18) -> list[np.ndarray]:
+    """Deterministic sparse connected components."""
+    if len(indices) == 0:
+        return []
+    remaining = {tuple(int(v) for v in row) for row in indices}
+    offsets = neighbor_offsets(connectivity)
+    components: list[np.ndarray] = []
+    while remaining:
+        seed = min(remaining)
+        remaining.remove(seed)
+        queue = [seed]
+        component = []
+        cursor = 0
+        while cursor < len(queue):
+            voxel = queue[cursor]
+            cursor += 1
+            component.append(voxel)
+            for offset in offsets:
+                candidate = (
+                    voxel[0] + offset[0], voxel[1] + offset[1], voxel[2] + offset[2])
+                if candidate in remaining:
+                    remaining.remove(candidate)
+                    queue.append(candidate)
+        components.append(np.asarray(sorted(component), dtype=np.int64))
+    components.sort(key=lambda c: (-len(c), tuple(c[0])))
+    return components
+
+
+def _dilate(voxels: set[tuple[int, int, int]], offsets, iterations: int):
+    result = set(voxels)
+    for _ in range(max(0, iterations)):
+        expanded = set(result)
+        for voxel in result:
+            expanded.update(
+                (voxel[0] + d[0], voxel[1] + d[1], voxel[2] + d[2]) for d in offsets)
+        result = expanded
+    return result
+
+
+def _erode(voxels: set[tuple[int, int, int]], offsets, iterations: int):
+    result = set(voxels)
+    for _ in range(max(0, iterations)):
+        result = {
+            voxel for voxel in result
+            if all((voxel[0] + d[0], voxel[1] + d[1], voxel[2] + d[2]) in result
+                   for d in offsets)
+        }
+        if not result:
+            break
+    return result
+
+
+def apply_morphology(indices: np.ndarray, params: DynamicSphereParameters) -> np.ndarray:
+    if len(indices) == 0:
+        return indices.copy()
+    offsets = neighbor_offsets(params.connectivity)
+    voxels = {tuple(int(v) for v in row) for row in indices}
+    if params.closing_iterations > 0:
+        closed = _dilate(voxels, offsets, params.closing_iterations)
+        eroded = _erode(closed, offsets, params.closing_iterations)
+        if eroded:
+            voxels = eroded
+    voxels = _dilate(voxels, offsets, params.dilation_voxels)
+    return np.asarray(sorted(voxels), dtype=np.int64)
+
+
+def voxel_centers(indices: np.ndarray, params: DynamicSphereParameters) -> np.ndarray:
+    origin = np.asarray((params.min_x_m, params.min_y_m, params.min_z_m))
+    return origin + (indices.astype(np.float64) + 0.5) * params.voxel_size_m
+
+
+def _boundary_depths(indices: np.ndarray, connectivity: int) -> np.ndarray:
+    """Return integer erosion depth (one at the boundary) for each voxel."""
+    offsets = neighbor_offsets(connectivity)
+    remaining = {tuple(int(v) for v in row) for row in indices}
+    depths: dict[tuple[int, int, int], int] = {}
+    depth = 1
+    while remaining:
+        boundary = {
+            voxel for voxel in remaining
+            if any((voxel[0] + d[0], voxel[1] + d[1], voxel[2] + d[2]) not in remaining
+                   for d in offsets)
+        }
+        if not boundary:
+            boundary = set(remaining)
+        for voxel in boundary:
+            depths[voxel] = depth
+        remaining.difference_update(boundary)
+        depth += 1
+    return np.asarray([depths[tuple(int(v) for v in row)] for row in indices], dtype=np.float64)
+
+
+def _covered_mask(points: np.ndarray, spheres: Sequence[DynamicSphere], tolerance: float) -> np.ndarray:
+    covered = np.zeros(len(points), dtype=bool)
+    for sphere in spheres:
+        delta = points - sphere.center
+        covered |= np.einsum("ij,ij->i", delta, delta) <= (
+            sphere.raw_radius + tolerance) ** 2
+    return covered
+
+
+def _fixed_radius_cover(
+    centers: np.ndarray, params: DynamicSphereParameters, component_id: int,
+    limit: int,
+) -> tuple[list[DynamicSphere], np.ndarray]:
+    spheres: list[DynamicSphere] = []
+    uncovered = np.ones(len(centers), dtype=bool)
+    radius = min(params.max_raw_radius_m, max(params.min_raw_radius_m, params.fixed_radius_m))
+    for idx in range(len(centers)):
+        if not uncovered[idx] or len(spheres) >= limit:
+            continue
+        center = centers[idx]
+        sphere = DynamicSphere(
+            float(center[0]), float(center[1]), float(center[2]), radius,
+            radius + params.safety_margin_m, component_id)
+        spheres.append(sphere)
+        delta = centers - center
+        uncovered &= np.einsum("ij,ij->i", delta, delta) > (
+            radius + params.coverage_tolerance_m) ** 2
+        if 1.0 - float(np.count_nonzero(uncovered)) / max(1, len(centers)) >= params.target_coverage:
+            break
+    return spheres, uncovered
+
+
+def _remove_redundant(
+    centers: np.ndarray, spheres: list[DynamicSphere], params: DynamicSphereParameters,
+) -> list[DynamicSphere]:
+    kept = list(spheres)
+    for index in range(len(kept) - 1, -1, -1):
+        trial = kept[:index] + kept[index + 1:]
+        if not trial:
+            continue
+        coverage = float(np.mean(_covered_mask(
+            centers, trial, params.coverage_tolerance_m + params.redundancy_tolerance_m)))
+        if coverage + 1e-12 >= params.target_coverage:
+            kept = trial
+    return kept
+
+
+def _component_spheres(
+    indices: np.ndarray, params: DynamicSphereParameters, component_id: int,
+    deadline: float,
+) -> DynamicComponentResult:
+    centers = voxel_centers(indices, params)
+    local_extent = np.ptp(indices, axis=0) + 1 if len(indices) else np.ones(3, dtype=int)
+    local_volume = int(np.prod(local_extent, dtype=np.int64))
+    oversized = len(indices) > params.max_component_voxels or (
+        local_volume > params.max_local_grid_voxels)
+    budget_exceeded = monotonic() >= deadline
+    if oversized or budget_exceeded:
+        reason = "oversized_component_fallback" if oversized else "processing_budget_fallback"
+        if params.enable_fixed_radius_fallback:
+            spheres, uncovered = _fixed_radius_cover(
+                centers, params, component_id, params.max_spheres_per_component)
+        else:
+            spheres, uncovered = [], np.ones(len(centers), dtype=bool)
+    else:
+        depths = _boundary_depths(indices, params.connectivity)
+        radii = np.clip(
+            depths * params.voxel_size_m,
+            params.min_raw_radius_m, params.max_raw_radius_m)
+        order = sorted(
+            range(len(centers)),
+            key=lambda i: (-float(radii[i]),) + tuple(float(v) for v in centers[i]))
+        spheres = []
+        uncovered = np.ones(len(centers), dtype=bool)
+        reason = "target_coverage"
+        iterations = 0
+        for idx in order:
+            if monotonic() >= deadline:
+                reason = "processing_budget"
+                break
+            if iterations >= params.max_iterations_per_component:
+                reason = "iteration_limit"
+                break
+            if len(spheres) >= params.max_spheres_per_component:
+                reason = "sphere_limit"
+                break
+            iterations += 1
+            if not uncovered[idx]:
+                continue
+            radius = float(radii[idx])
+            if radius < params.min_useful_adaptive_radius_m:
+                continue
+            center = centers[idx]
+            if spheres and min(np.linalg.norm(center - s.center) for s in spheres) < (
+                    params.minimum_center_spacing_m):
+                continue
+            spheres.append(DynamicSphere(
+                float(center[0]), float(center[1]), float(center[2]), radius,
+                radius + params.safety_margin_m, component_id))
+            uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+            if float(np.mean(~uncovered)) + 1e-12 >= params.target_coverage:
+                break
+        if (not spheres or float(np.mean(~uncovered)) < params.target_coverage) and (
+                params.enable_fixed_radius_fallback):
+            remaining_limit = max(0, params.max_spheres_per_component - len(spheres))
+            fixed, _ = _fixed_radius_cover(
+                centers[uncovered], params, component_id, remaining_limit)
+            spheres.extend(fixed)
+            reason = "thin_component_fallback" if not oversized else reason
+            uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+        spheres = _remove_redundant(centers, spheres, params)
+        uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+    coverage = float(np.mean(~uncovered)) if len(uncovered) else 1.0
+    confidence = min(1.0, coverage * min(1.0, len(centers) / max(1, params.min_component_voxels * 2)))
+    spheres = [replace(s, component_coverage=coverage, confidence=confidence) for s in spheres]
+    return DynamicComponentResult(
+        component_id, centers, spheres, coverage, centers[uncovered], reason)
+
+
+def generate_dynamic_spheres(
+    points: np.ndarray | Sequence[Sequence[float]], params: DynamicSphereParameters,
+) -> DynamicSphereResult:
+    """Generate bounded, deterministic obstacle spheres from dynamic XYZ points."""
+    start = monotonic()
+    indices = filter_and_voxelize(points, params)
+    if len(indices) == 0:
+        return DynamicSphereResult(elapsed_ms=(monotonic() - start) * 1000.0)
+    raw_components = connected_components(indices, params.connectivity)
+    raw_components = [c for c in raw_components if len(c) >= params.min_component_voxels]
+    raw_components = raw_components[:params.max_components]
+    if not raw_components:
+        return DynamicSphereResult(
+            elapsed_ms=(monotonic() - start) * 1000.0, termination_reason="noise_removed")
+    budget_sec = max(0.0, params.processing_budget_ms) / 1000.0
+    deadline = start + budget_sec
+    component_results = []
+    all_spheres: list[DynamicSphere] = []
+    all_voxels = []
+    all_uncovered = []
+    for component_id, component in enumerate(raw_components):
+        morphed = apply_morphology(component, params)
+        result = _component_spheres(morphed, params, component_id, deadline)
+        remaining = params.max_total_spheres - len(all_spheres)
+        result.spheres = result.spheres[:max(0, remaining)]
+        result.uncovered_voxels = result.voxel_centers[
+            ~_covered_mask(result.voxel_centers, result.spheres, params.coverage_tolerance_m)]
+        result.coverage = 1.0 - len(result.uncovered_voxels) / max(1, len(result.voxel_centers))
+        result.spheres = [replace(s, component_coverage=result.coverage) for s in result.spheres]
+        component_results.append(result)
+        all_spheres.extend(result.spheres)
+        all_voxels.append(result.voxel_centers)
+        all_uncovered.append(result.uncovered_voxels)
+        if len(all_spheres) >= params.max_total_spheres:
+            break
+    elapsed = (monotonic() - start) * 1000.0
+    return DynamicSphereResult(
+        components=component_results,
+        spheres=all_spheres,
+        voxel_centers=np.vstack(all_voxels) if all_voxels else np.empty((0, 3)),
+        uncovered_voxels=np.vstack(all_uncovered) if all_uncovered else np.empty((0, 3)),
+        elapsed_ms=elapsed,
+        termination_reason="complete" if component_results else "noise_removed")
+
+
+@dataclass
+class _Track:
+    track_id: int
+    sphere: DynamicSphere
+    first_seen: float
+    last_seen: float
+    missed_updates: int = 0
+
+
+class DynamicSphereTracker:
+    """Greedy one-to-one center-distance tracker with bounded occlusion hold."""
+
+    def __init__(
+        self, association_distance_m: float, smoothing_alpha: float,
+        ttl_sec: float, max_missed_updates: int,
+    ) -> None:
+        self.association_distance_m = float(association_distance_m)
+        self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self.ttl_sec = float(ttl_sec)
+        self.max_missed_updates = int(max_missed_updates)
+        self._next_id = 0
+        self._tracks: dict[int, _Track] = {}
+
+    def update(self, detections: Iterable[DynamicSphere], timestamp_sec: float) -> list[DynamicSphere]:
+        detections = list(detections)
+        now = float(timestamp_sec)
+        self._expire(now)
+        pairs = []
+        for track_id, track in self._tracks.items():
+            for detection_index, detection in enumerate(detections):
+                distance = float(np.linalg.norm(track.sphere.center - detection.center))
+                if distance <= self.association_distance_m:
+                    pairs.append((distance, track_id, detection_index))
+        matched_tracks: set[int] = set()
+        matched_detections: set[int] = set()
+        for _, track_id, detection_index in sorted(pairs):
+            if track_id in matched_tracks or detection_index in matched_detections:
+                continue
+            track = self._tracks[track_id]
+            detection = detections[detection_index]
+            alpha = self.smoothing_alpha
+            center = alpha * detection.center + (1.0 - alpha) * track.sphere.center
+            raw = alpha * detection.raw_radius + (1.0 - alpha) * track.sphere.raw_radius
+            output = alpha * detection.output_radius + (1.0 - alpha) * track.sphere.output_radius
+            age = track.sphere.age + 1
+            track.sphere = replace(
+                detection, x=float(center[0]), y=float(center[1]), z=float(center[2]),
+                raw_radius=float(raw), output_radius=float(output), track_id=track_id,
+                age=age, confidence=min(1.0, detection.confidence + 0.05 * age))
+            track.last_seen = now
+            track.missed_updates = 0
+            matched_tracks.add(track_id)
+            matched_detections.add(detection_index)
+        for index, detection in enumerate(detections):
+            if index in matched_detections:
+                continue
+            track_id = self._next_id
+            self._next_id += 1
+            sphere = replace(detection, track_id=track_id, age=1)
+            self._tracks[track_id] = _Track(track_id, sphere, now, now)
+            matched_tracks.add(track_id)
+        for track_id, track in self._tracks.items():
+            if track_id not in matched_tracks:
+                track.missed_updates += 1
+        self._expire(now)
+        return [self._tracks[key].sphere for key in sorted(self._tracks)]
+
+    def _expire(self, now: float) -> None:
+        expired = [
+            track_id for track_id, track in self._tracks.items()
+            if now - track.last_seen > self.ttl_sec or
+            track.missed_updates > self.max_missed_updates
+        ]
+        for track_id in expired:
+            del self._tracks[track_id]
