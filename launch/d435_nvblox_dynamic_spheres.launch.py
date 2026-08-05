@@ -19,7 +19,6 @@ from launch.actions import (
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def package_file(package_name, relative_path):
@@ -30,10 +29,6 @@ def _as_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _bool_text(value):
-    return "true" if _as_bool(value) else "false"
 
 
 def _experiment_section(config_path):
@@ -88,7 +83,7 @@ def _launch_setup(context):
     rviz_choice = str(experiment["rviz_config"])
     rviz_config = rviz_choice if Path(rviz_choice).is_absolute() else package_file(
         "rmp_camera", f"config/{rviz_choice}")
-    effective = {"use_sim_time": ParameterValue(_bool_text(use_sim_time), value_type=bool)}
+    effective = {"use_sim_time": use_sim_time}
 
     actions = []
     input_actions = []
