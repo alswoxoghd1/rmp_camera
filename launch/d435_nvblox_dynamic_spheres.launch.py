@@ -1,8 +1,8 @@
 """D435 dynamic Nvblox experiment with static/dynamic sphere fusion.
 
 All numeric experiment settings come from one YAML.  This launch starts one
-RealSense include and one Nvblox component only; none of the robot-arm/RMPflow
-pipeline is part of this experiment.
+RealSense camera, its emitter splitter, and one Nvblox component only; none of
+the robot-arm/RMPflow pipeline is part of this experiment.
 """
 
 from pathlib import Path
@@ -13,12 +13,9 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
-    IncludeLaunchDescription,
     OpaqueFunction,
     SetEnvironmentVariable,
 )
-from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
@@ -86,6 +83,8 @@ def _launch_setup(context):
     dynamics_config = package_file(
         "nvblox_examples_bringup",
         "config/nvblox/specializations/nvblox_dynamics.yaml")
+    realsense_emitter_config = package_file(
+        "nvblox_examples_bringup", "config/sensors/realsense_emitter_flashing.yaml")
     rviz_choice = str(experiment["rviz_config"])
     rviz_config = rviz_choice if Path(rviz_choice).is_absolute() else package_file(
         "rmp_camera", f"config/{rviz_choice}")
@@ -102,23 +101,46 @@ def _launch_setup(context):
                  str(experiment.get("bag_rate", 1.0))], output="screen"))
 
     if run_realsense:
-        input_actions.append(IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(package_file(
-                "nvblox_examples_bringup", "launch/sensors/realsense.launch.py")),
-            launch_arguments={
-                "container_name": container_name,
-                "run_standalone": "False",
-                "num_cameras": "1",
-                "camera_serial_numbers": str(experiment["camera_serial_number"]),
-                "decimation_filter.enable": _bool_text(
+        camera_parameters = [
+            realsense_emitter_config,
+            {"camera_name": "camera0"},
+            {
+                "decimation_filter.enable": _as_bool(
                     experiment.get("realsense_decimation_filter_enabled", False)),
-                "spatial_filter.enable": _bool_text(
+                "spatial_filter.enable": _as_bool(
                     experiment.get("realsense_spatial_filter_enabled", True)),
-                "temporal_filter.enable": _bool_text(
+                "temporal_filter.enable": _as_bool(
                     experiment.get("realsense_temporal_filter_enabled", True)),
-                "hole_filling_filter.enable": _bool_text(
+                "hole_filling_filter.enable": _as_bool(
                     experiment.get("realsense_hole_filling_filter_enabled", False)),
-            }.items()))
+            },
+        ]
+        camera_serial = str(experiment["camera_serial_number"]).strip()
+        if camera_serial:
+            camera_parameters.append({"serial_no": camera_serial})
+        input_actions.append(LoadComposableNodes(
+            target_container=container_name,
+            composable_node_descriptions=[
+                ComposableNode(
+                    namespace="camera0", package="realsense2_camera",
+                    plugin="realsense2_camera::RealSenseNodeFactory",
+                    parameters=camera_parameters),
+                ComposableNode(
+                    namespace="camera0", name="realsense_splitter_node",
+                    package="realsense_splitter",
+                    plugin="nvblox::RealsenseSplitterNode",
+                    parameters=[{"input_qos": "SENSOR_DATA", "output_qos": "SENSOR_DATA"}],
+                    remappings=[
+                        ("input/infra_1", "/camera0/camera/infra1/image_rect_raw"),
+                        ("input/infra_1_metadata", "/camera0/camera/infra1/metadata"),
+                        ("input/infra_2", "/camera0/camera/infra2/image_rect_raw"),
+                        ("input/infra_2_metadata", "/camera0/camera/infra2/metadata"),
+                        ("input/depth", "/camera0/camera/depth/image_rect_raw"),
+                        ("input/depth_metadata", "/camera0/camera/depth/metadata"),
+                        ("input/pointcloud", "/camera0/camera/depth/color/points"),
+                        ("input/pointcloud_metadata", "/camera0/camera/depth/metadata"),
+                    ]),
+            ]))
 
     actions.extend([
         Node(
@@ -146,7 +168,7 @@ def _launch_setup(context):
                 name="nvblox_node", package="nvblox_ros", plugin="nvblox::NvbloxNode",
                 remappings=[
                     ("camera_0/depth/image", "/camera0/realsense_splitter_node/output/depth"),
-                    ("camera_0/depth/camera_info", "/camera0/depth/camera_info"),
+                    ("camera_0/depth/camera_info", "/camera0/camera/depth/camera_info"),
                     ("camera_0/color/image", "/camera0/camera/color/image_raw"),
                     ("camera_0/color/camera_info", "/camera0/camera/color/camera_info")],
                 # Last file wins: base -> RealSense -> dynamics -> experiment.

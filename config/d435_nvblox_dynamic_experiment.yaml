@@ -14,7 +14,7 @@
   ros__parameters:
     global_frame: "base_link"             # TF frame used by every sphere output.
     camera_frame: "camera0_link"          # D435 root frame under global_frame.
-    camera_serial_number: ""               # RealSense serial; empty selects the only camera.
+    camera_serial_number: "117322070340"   # RealSense D435i selected for this experiment.
     static_tf_x_m: 1.403303227             # Calibrated base->camera X [m].
     static_tf_y_m: -1.733655308            # Calibrated base->camera Y [m].
     static_tf_z_m: 0.912738743             # Calibrated base->camera Z [m].
