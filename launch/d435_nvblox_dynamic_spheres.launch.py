@@ -10,10 +10,16 @@ from pathlib import Path
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
@@ -174,9 +180,25 @@ def _launch_setup(context):
 
 
 def generate_launch_description():
+    # Match the runtime dependency paths already used by the existing static
+    # launch.  Prepending preserves any system paths supplied by the user.
+    rosdeps_nv_lib = str(
+        Path.home() / ".local/opt/rosdeps_nv/root/usr/lib/x86_64-linux-gnu")
+    cuda12_runtime_lib = str(
+        Path.home() / ".local/lib/python3.10/site-packages/nvidia/cuda_runtime/lib")
     default_config = package_file(
         "rmp_camera", "config/d435_nvblox_dynamic_experiment.yaml")
     return LaunchDescription([
+        SetEnvironmentVariable(
+            name="LD_LIBRARY_PATH",
+            value=[
+                cuda12_runtime_lib,
+                ":",
+                rosdeps_nv_lib,
+                ":",
+                EnvironmentVariable("LD_LIBRARY_PATH", default_value=""),
+            ],
+        ),
         DeclareLaunchArgument(
             "experiment_config", default_value=default_config,
             description="Single YAML controlling camera, Nvblox, sphere, and fusion settings"),
