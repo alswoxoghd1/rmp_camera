@@ -160,6 +160,9 @@
     dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
     dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
     dynamic_fixed_radius_m: 0.10            # Thin/oversized fallback radius [m].
+    dynamic_enable_greedy_set_cover: true   # Select a smaller sphere subset while preserving target coverage.
+    dynamic_enable_single_sphere_replacement: true # Replace compact components with one sphere.
+    dynamic_single_sphere_max_radius_m: 0.18 # Limit free-space consumed by a replacement sphere [m].
     dynamic_target_coverage: 0.95	           # Voxel-center coverage goal [0..1].
     dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
     dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
