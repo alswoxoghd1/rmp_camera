@@ -57,11 +57,11 @@
     map_clearing_radius_m: 6.0             # Retained radius around map-clearing frame [m].
 
     multi_mapper:
-      connected_mask_component_size_threshold: 40 # Dynamic image component floor [pixels].
+      connected_mask_component_size_threshold: 500 # Dynamic image component floor [pixels].
       remove_small_connected_components: true     # Reject small segmentation speckle.
 
     static_mapper:
-      projective_integrator_max_integration_distance_m: 5.0 # Depth integration range [m].
+      projective_integrator_max_integration_distance_m: 2.2 # Depth integration range [m].
       projective_integrator_truncation_distance_vox: 4.0    # TSDF truncation [voxels].
       projective_integrator_weighting_mode: "constant"      # Official dynamics specialization.
       projective_integrator_max_weight: 5.0                  # TSDF observation weight cap.
@@ -70,8 +70,8 @@
       esdf_integrator_max_distance_m: 2.0         # ESDF truncation distance [m].
       unobserved_esdf_policy: "ignore"            # Never treat unobserved as free.
       max_tsdf_distance_for_occupancy_m: 0.15     # TSDF band used by freespace logic [m].
-      max_unobserved_to_keep_consecutive_occupancy_ms: 200 # Occupancy continuity window [ms].
-      min_duration_since_occupied_for_freespace_ms: 250    # Dynamic confidence delay [ms].
+      max_unobserved_to_keep_consecutive_occupancy_ms: 400 # Occupancy continuity window [ms].
+      min_duration_since_occupied_for_freespace_ms: 1000    # Dynamic confidence delay [ms].
       min_consecutive_occupancy_duration_for_reset_ms: 2000 # Static reset evidence [ms].
       check_neighborhood: true                    # Use neighboring voxels for freespace evidence.
       initialize_to_high_confidence_freespace: false # Conservative startup; fewer false dynamics.
@@ -87,7 +87,7 @@
       workspace_bounds_max_height_m: 2.5
 
     dynamic_mapper:
-      projective_integrator_max_integration_distance_m: 5.0 # Foreground depth range [m].
+      projective_integrator_max_integration_distance_m: 2.2 # Foreground depth range [m].
       projective_integrator_truncation_distance_vox: 4.0    # Occupancy projective band [voxels].
       free_region_occupancy_probability: 0.2       # Free-space inverse sensor probability.
       occupied_region_occupancy_probability: 0.9   # Hit probability; higher is more persistent.
@@ -139,13 +139,13 @@
     sphere_cloud_topic: "/rmp_camera/dynamic_obstacle_sphere_cloud"
     dynamic_voxel_cloud_topic: "/rmp_camera/dynamic_obstacle_voxels"
     uncovered_voxel_cloud_topic: "/rmp_camera/dynamic_uncovered_voxels"
-    min_x_m: -3.0                         # Dynamic crop minimum X [m].
-    max_x_m: 3.0                          # Dynamic crop maximum X [m].
-    min_y_m: -3.0
-    max_y_m: 3.0
+    min_x_m: -1.5                         # Dynamic crop minimum X [m].
+    max_x_m: 1.5                          # Dynamic crop maximum X [m].
+    min_y_m: -1.5
+    max_y_m: 1.5
     min_z_m: -0.2
     max_z_m: 2.5
-    max_range_from_base_m: 5.0             # Radial XY crop [m]; <=0 disables.
+    max_range_from_base_m: 2.0             # Radial XY crop [m]; <=0 disables.
     dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
     dynamic_min_component_voxels: 6        # Noise component floor [voxels].
     dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
@@ -160,7 +160,7 @@
     dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
     dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
     dynamic_fixed_radius_m: 0.10            # Thin/oversized fallback radius [m].
-    dynamic_target_coverage: 0.95           # Voxel-center coverage goal [0..1].
+    dynamic_target_coverage: 0.95	           # Voxel-center coverage goal [0..1].
     dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
     dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
     dynamic_redundancy_tolerance_m: 0.01    # Redundancy removal slack [m].
@@ -171,10 +171,10 @@
     dynamic_max_local_grid_voxels: 1200000  # Dense-equivalent volume guard [voxels].
     dynamic_tracking_enabled: true
     dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
-    dynamic_smoothing_alpha: 0.55           # 1=new measurement, 0=old track.
-    dynamic_sphere_ttl_sec: 0.8             # Occlusion retention [s].
-    dynamic_max_missed_updates: 8           # Occlusion update-count cap.
-    dynamic_update_rate_hz: 10.0            # CPU generation/tracking rate [Hz].
+    dynamic_smoothing_alpha: 0.70           # 1=new measurement, 0=old track.
+    dynamic_sphere_ttl_sec: 0.5             # Occlusion retention [s].
+    dynamic_max_missed_updates: 5           # Occlusion update-count cap.
+    dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
     publish_debug_clouds: true
 
 /obstacle_sphere_fusion_node:
@@ -184,7 +184,7 @@
     combined_sphere_cloud_topic: "/rmp_camera/combined_obstacle_sphere_cloud"
     combined_marker_topic: "/rmp_camera/combined_obstacle_sphere_markers"
     target_frame: "base_link"
-    fusion_rate_hz: 10.0                   # Latest-cache fusion output [Hz].
+    fusion_rate_hz: 15.0                   # Latest-cache fusion output [Hz].
     fusion_overlap_tolerance_m: 0.01       # Real 3D sphere overlap slack [m].
     fusion_dynamic_priority: true          # Fresh dynamic suppresses overlapping static.
     fusion_hysteresis_sec: 0.5             # Static expiry only if explicitly enabled [s].
