@@ -124,6 +124,14 @@
     max_spheres_per_component: 128
     max_iterations_per_component: 256
     max_total_spheres: 256
+    enable_single_sphere_replacement: true # Use one ESDF-valid sphere for compact components.
+    enable_greedy_set_cover: true          # Select a shell-aware candidate subset.
+    enable_general_coverage_pruning: true  # Remove candidates with no required unique coverage.
+    enable_surface_shell_guard: true       # Preserve thin obstacle surface features.
+    surface_shell_thickness_m: 0.10        # Inner ESDF shell thickness [m].
+    target_shell_coverage: 0.98            # Desired surface-shell coverage [0..1].
+    shell_coverage_loss_tolerance: 0.005   # Allowed loss from baseline shell coverage.
+    max_optimization_matrix_elements: 20000000 # Per-component boolean matrix guard.
     max_grid_voxels: 8000000               # Dense response memory guard [voxels].
     marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
     sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
