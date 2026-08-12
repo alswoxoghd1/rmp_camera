@@ -4,6 +4,7 @@ import numpy as np
 
 from rmp_camera.esdf_medial_sphere_core import (
     Sphere,
+    agglomerative_merge_static_spheres,
     add_spheres_until_coverage,
     calculate_component_coverage,
     calculate_mask_coverage,
@@ -13,6 +14,7 @@ from rmp_camera.esdf_medial_sphere_core import (
     find_local_minimum_candidates,
     general_coverage_pruning,
     generate_medial_spheres,
+    merged_sphere_passes_esdf_guard,
     greedy_set_cover_spheres,
     group_or_reduce_plateaus,
     make_surface_shell_mask,
@@ -500,3 +502,171 @@ def test_static_optimization_parameter_validation():
         else:
             raise AssertionError(
                 f"invalid optimization parameters accepted: {kwargs}")
+
+
+def merge_sphere(center, radius, source_index, component_id=0, safety=0.02):
+    return Sphere(
+        np.asarray(center, dtype=np.float64),
+        radius,
+        radius + safety,
+        component_id,
+        source_index,
+    )
+
+
+def static_merge(
+    grid, component, spheres, *, guard=False, max_radius=0.35,
+    growth=1.5, gap=0.05,
+):
+    return agglomerative_merge_static_spheres(
+        grid,
+        component,
+        spheres,
+        (0.0, 0.0, 0.0),
+        0.05,
+        0.0,
+        0.02,
+        merge_max_radius_m=max_radius,
+        merge_max_radius_growth_ratio=growth,
+        merge_max_gap_m=gap,
+        merge_enable_esdf_guard=guard,
+        merge_max_free_space_distance_m=0.08,
+        merge_surface_sample_count=64,
+        merge_min_observed_surface_fraction=0.70,
+    )
+
+
+def test_static_agglomerative_merge_reduces_compact_set_and_preserves_coverage():
+    grid = np.full((20, 20, 20), -0.1)
+    component = np.asarray([(4, 4, 4), (5, 4, 4), (6, 4, 4)])
+    spheres = [
+        merge_sphere((0.225, 0.225, 0.225), 0.10, (4, 4, 4)),
+        merge_sphere((0.305, 0.225, 0.225), 0.10, (6, 4, 4)),
+    ]
+    before, _ = calculate_component_coverage(
+        component, spheres, (0.0, 0.0, 0.0), 0.05, 0.0)
+    merged = static_merge(grid, component, spheres)
+    after, _ = calculate_component_coverage(
+        component, merged, (0.0, 0.0, 0.0), 0.05, 0.0)
+    assert len(merged) == 1
+    assert merged[0].is_merged
+    assert after + 1e-12 >= before
+    assert np.isclose(
+        merged[0].output_radius, merged[0].raw_radius + 0.02)
+
+
+def test_static_elongated_set_does_not_collapse_into_one_giant_sphere():
+    grid = np.full((30, 10, 10), -0.1)
+    component = np.asarray([(x, 2, 2) for x in range(3, 14)])
+    spheres = [
+        merge_sphere((0.175 + 0.08 * index, 0.125, 0.125), 0.08,
+                     (3 + 2 * index, 2, 2))
+        for index in range(6)
+    ]
+    merged = static_merge(
+        grid, component, spheres, max_radius=0.20, growth=1.5, gap=0.02)
+    assert 1 < len(merged) < len(spheres)
+    assert max(sphere.raw_radius for sphere in merged) <= 0.20 + 1e-12
+
+
+def test_static_same_component_large_gap_is_not_merged():
+    grid = np.full((30, 10, 10), -0.1)
+    component = np.asarray([(x, 2, 2) for x in range(3, 14)])
+    spheres = [
+        merge_sphere((0.2, 0.125, 0.125), 0.05, (3, 2, 2)),
+        merge_sphere((0.6, 0.125, 0.125), 0.05, (11, 2, 2)),
+    ]
+    assert len(static_merge(
+        grid, component, spheres, max_radius=1.0, growth=10.0, gap=0.05
+    )) == 2
+
+
+def test_static_esdf_guard_rejects_free_space_merge_but_off_allows_it():
+    grid = np.full((20, 20, 20), 0.20)
+    component = np.asarray([(8, 8, 8), (9, 8, 8), (10, 8, 8)])
+    spheres = [
+        merge_sphere((0.425, 0.425, 0.425), 0.10, (8, 8, 8)),
+        merge_sphere((0.505, 0.425, 0.425), 0.10, (10, 8, 8)),
+    ]
+    without_guard = static_merge(grid, component, spheres, guard=False)
+    with_guard = static_merge(grid, component, spheres, guard=True)
+    assert len(without_guard) == 1
+    assert len(with_guard) == 2
+
+
+def test_static_merge_is_deterministic_for_reversed_sphere_order():
+    grid = np.full((20, 20, 20), -0.1)
+    component = np.asarray([(x, 4, 4) for x in range(4, 11)])
+    spheres = [
+        merge_sphere((0.225 + 0.08 * index, 0.225, 0.225), 0.10,
+                     (4 + 2 * index, 4, 4))
+        for index in range(4)
+    ]
+
+    def result_signature(values):
+        return [(
+            tuple(np.round(sphere.center, 12)),
+            round(sphere.raw_radius, 12),
+            sphere.component_id,
+        ) for sphere in values]
+
+    assert result_signature(static_merge(grid, component, spheres)) == (
+        result_signature(static_merge(grid, component, spheres[::-1])))
+
+
+def test_static_feature_off_preserves_pre_merge_geometry():
+    grid = signed_box_esdf(
+        (12, 7, 7), (1.0, 1.0, 1.0), (11.0, 6.0, 6.0))
+    common = dict(
+        origin_m=(0.0, 0.0, 0.0),
+        voxel_size_m=1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        minimum_center_spacing_m=1.0,
+    )
+    disabled = generate_medial_spheres(
+        grid, **common, enable_agglomerative_merge=False)
+    blocked = generate_medial_spheres(
+        grid,
+        **common,
+        enable_agglomerative_merge=True,
+        merge_max_radius_m=0.01,
+    )
+    assert sphere_signature(disabled) == sphere_signature(blocked)
+    assert disabled.components[0].pre_merge_sphere_count == len(disabled.spheres)
+
+
+def test_static_merge_parameter_validation():
+    grid = np.full((1, 1, 1), -0.1)
+    invalid_kwargs = [
+        {"merge_max_radius_m": 0.0},
+        {"merge_max_radius_growth_ratio": 0.9},
+        {"merge_max_gap_m": -0.1},
+        {"merge_max_free_space_distance_m": -0.1},
+        {"merge_surface_sample_count": 0},
+        {"merge_min_observed_surface_fraction": 1.1},
+    ]
+    for kwargs in invalid_kwargs:
+        try:
+            generate_medial_spheres(
+                grid, (0.0, 0.0, 0.0), 1.0,
+                min_component_voxels=1, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid merge parameters accepted: {kwargs}")
+
+
+def test_static_esdf_guard_rejects_unobserved_surface_samples():
+    grid = np.full((20, 20, 20), -1000.0)
+    assert not merged_sphere_passes_esdf_guard(
+        grid,
+        (0.5, 0.5, 0.5),
+        0.1,
+        (0.0, 0.0, 0.0),
+        0.05,
+        -1000.0,
+        0.08,
+        64,
+        0.70,
+    )

@@ -13,6 +13,12 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from rmp_camera.sphere_merge_core import (
+    PairMergeCandidate,
+    select_best_merge_pair,
+    validate_merge_limits,
+)
+
 
 @dataclass(frozen=True)
 class DynamicSphereParameters:
@@ -42,6 +48,13 @@ class DynamicSphereParameters:
     max_total_spheres: int = 384
     processing_budget_ms: float = 35.0
     max_local_grid_voxels: int = 1200000
+    dynamic_enable_agglomerative_merge: bool = True
+    dynamic_merge_max_radius_m: float = 0.30
+    dynamic_merge_max_radius_growth_ratio: float = 1.50
+    dynamic_merge_max_gap_m: float = 0.08
+    dynamic_merge_enable_empty_space_guard: bool = False
+    dynamic_merge_max_empty_fraction: float = 0.70
+    dynamic_merge_max_validation_voxels: int = 50000
     min_x_m: float = -3.0
     max_x_m: float = 3.0
     min_y_m: float = -3.0
@@ -67,6 +80,18 @@ class DynamicSphereParameters:
             raise ValueError(
                 "single_sphere_max_radius_m must be at least "
                 "min_raw_radius_m")
+        validate_merge_limits(
+            self.dynamic_merge_max_radius_m,
+            self.dynamic_merge_max_radius_growth_ratio,
+            self.dynamic_merge_max_gap_m,
+        )
+        if not np.isfinite(self.dynamic_merge_max_empty_fraction):
+            raise ValueError(
+                "dynamic merge empty fraction must be finite")
+        if not 0.0 <= self.dynamic_merge_max_empty_fraction <= 1.0:
+            raise ValueError("dynamic merge empty fraction must be in [0, 1]")
+        if self.dynamic_merge_max_validation_voxels <= 0:
+            raise ValueError("dynamic merge validation voxel cap must be positive")
         if self.max_x_m <= self.min_x_m or self.max_y_m <= self.min_y_m:
             raise ValueError("invalid XY workspace")
         if self.max_z_m <= self.min_z_m:
@@ -99,6 +124,7 @@ class DynamicComponentResult:
     coverage: float
     uncovered_voxels: np.ndarray
     termination_reason: str
+    pre_merge_sphere_count: int = 0
 
 
 @dataclass
@@ -522,6 +548,148 @@ def _optimize_component_spheres(
         deadline)
 
 
+def dynamic_merge_empty_fraction(
+    centers: np.ndarray,
+    merge_center: Sequence[float],
+    merge_radius: float,
+    params: DynamicSphereParameters,
+    deadline: float | None = None,
+) -> float | None:
+    """Estimate the unoccupied voxel fraction inside a proposed merge sphere.
+
+    ``None`` means that the validation deadline or voxel cap was reached, so a
+    conservative caller must reject the merge.
+    """
+
+    center = np.asarray(merge_center, dtype=np.float64)
+    workspace_min = np.asarray(
+        (params.min_x_m, params.min_y_m, params.min_z_m), dtype=np.float64)
+    lower = np.ceil(
+        (center - merge_radius - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    upper = np.floor(
+        (center + merge_radius - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    counts = np.maximum(0, upper - lower + 1)
+    bounding_count = int(np.prod(counts, dtype=np.int64))
+    if (
+        bounding_count <= 0
+        or bounding_count > params.dynamic_merge_max_validation_voxels
+        or (deadline is not None and monotonic() >= deadline)
+    ):
+        return None
+    ranges = [
+        np.arange(lower[axis], upper[axis] + 1, dtype=np.int64)
+        for axis in range(3)
+    ]
+    lattice = np.stack(
+        np.meshgrid(*ranges, indexing="ij"), axis=-1).reshape((-1, 3))
+    lattice_centers = workspace_min + (
+        lattice.astype(np.float64) + 0.5) * params.voxel_size_m
+    inside = np.sum((lattice_centers - center) ** 2, axis=1) <= (
+        merge_radius * merge_radius + 1e-12)
+    validation_indices = lattice[inside]
+    if len(validation_indices) == 0:
+        return None
+    if deadline is not None and monotonic() >= deadline:
+        return None
+    occupied_indices = np.rint(
+        (np.asarray(centers) - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    occupied = {
+        tuple(int(value) for value in index) for index in occupied_indices
+    }
+    occupied_count = sum(
+        tuple(int(value) for value in index) in occupied
+        for index in validation_indices
+    )
+    return 1.0 - occupied_count / len(validation_indices)
+
+
+def agglomerative_merge_dynamic_spheres(
+    centers: np.ndarray,
+    spheres: Sequence[DynamicSphere],
+    params: DynamicSphereParameters,
+    deadline: float,
+) -> list[DynamicSphere]:
+    """Merge same-component pairs conservatively within the shared deadline."""
+
+    active = list(spheres)
+    while len(active) >= 2 and monotonic() < deadline:
+        baseline_covered = _covered_mask(
+            centers, active, params.coverage_tolerance_m)
+
+        def validator(candidate: PairMergeCandidate) -> bool:
+            if monotonic() >= deadline:
+                return False
+            first = active[candidate.first_index]
+            merged = DynamicSphere(
+                float(candidate.center[0]),
+                float(candidate.center[1]),
+                float(candidate.center[2]),
+                candidate.radius,
+                candidate.radius + params.safety_margin_m,
+                first.component_id,
+            )
+            trial = [
+                sphere for index, sphere in enumerate(active)
+                if index not in (candidate.first_index, candidate.second_index)
+            ] + [merged]
+            covered = _covered_mask(
+                centers, trial, params.coverage_tolerance_m)
+            if np.count_nonzero(covered) < np.count_nonzero(baseline_covered):
+                return False
+            if params.dynamic_merge_enable_empty_space_guard:
+                empty_fraction = dynamic_merge_empty_fraction(
+                    centers,
+                    candidate.center,
+                    candidate.radius,
+                    params,
+                    deadline,
+                )
+                if (
+                    empty_fraction is None
+                    or empty_fraction
+                    > params.dynamic_merge_max_empty_fraction + 1e-12
+                ):
+                    return False
+            return True
+
+        candidate = select_best_merge_pair(
+            np.asarray([sphere.center for sphere in active]),
+            np.asarray([sphere.raw_radius for sphere in active]),
+            np.asarray([sphere.component_id for sphere in active]),
+            params.dynamic_merge_max_radius_m,
+            params.dynamic_merge_max_radius_growth_ratio,
+            params.dynamic_merge_max_gap_m,
+            validator,
+            deadline,
+        )
+        if candidate is None or monotonic() >= deadline:
+            break
+        first = active[candidate.first_index]
+        merged = DynamicSphere(
+            float(candidate.center[0]),
+            float(candidate.center[1]),
+            float(candidate.center[2]),
+            candidate.radius,
+            candidate.radius + params.safety_margin_m,
+            first.component_id,
+        )
+        active = [
+            sphere for index, sphere in enumerate(active)
+            if index not in (candidate.first_index, candidate.second_index)
+        ] + [merged]
+        active.sort(key=lambda sphere: (
+            sphere.component_id,
+            sphere.x,
+            sphere.y,
+            sphere.z,
+            sphere.raw_radius,
+        ))
+    return active
+
+
 def _component_spheres(
     indices: np.ndarray, params: DynamicSphereParameters, component_id: int,
     deadline: float,
@@ -588,12 +756,17 @@ def _component_spheres(
     if not budget_exceeded:
         spheres = _optimize_component_spheres(
             centers, spheres, params, component_id, deadline)
+    pre_merge_sphere_count = len(spheres)
+    if params.dynamic_enable_agglomerative_merge and len(spheres) >= 2:
+        spheres = agglomerative_merge_dynamic_spheres(
+            centers, spheres, params, deadline)
     uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
     coverage = float(np.mean(~uncovered)) if len(uncovered) else 1.0
     confidence = min(1.0, coverage * min(1.0, len(centers) / max(1, params.min_component_voxels * 2)))
     spheres = [replace(s, component_coverage=coverage, confidence=confidence) for s in spheres]
     return DynamicComponentResult(
-        component_id, centers, spheres, coverage, centers[uncovered], reason)
+        component_id, centers, spheres, coverage, centers[uncovered], reason,
+        pre_merge_sphere_count)
 
 
 def generate_dynamic_spheres(

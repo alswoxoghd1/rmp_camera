@@ -135,7 +135,13 @@ class EsdfMedialSphereNode(Node):
             f"target_coverage={self.target_coverage:.3f}, "
             f"single={self.enable_single_sphere_replacement}, "
             f"greedy={self.enable_greedy_set_cover}, "
-            f"pruning={self.enable_general_coverage_pruning}"
+            f"pruning={self.enable_general_coverage_pruning}, "
+            f"merge={self.enable_agglomerative_merge}, "
+            f"merge_radius<={self.merge_max_radius_m:.3f} m, "
+            f"merge_growth<={self.merge_max_radius_growth_ratio:.3f}, "
+            f"merge_gap<={self.merge_max_gap_m:.3f} m, "
+            f"merge_esdf_guard={self.merge_enable_esdf_guard}, "
+            f"merge_samples={self.merge_surface_sample_count}"
         )
 
     def _declare_parameters(self):
@@ -171,6 +177,14 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("target_shell_coverage", 0.98)
         self.declare_parameter("shell_coverage_loss_tolerance", 0.005)
         self.declare_parameter("max_optimization_matrix_elements", 20000000)
+        self.declare_parameter("enable_agglomerative_merge", True)
+        self.declare_parameter("merge_max_radius_m", 0.35)
+        self.declare_parameter("merge_max_radius_growth_ratio", 1.45)
+        self.declare_parameter("merge_max_gap_m", 0.05)
+        self.declare_parameter("merge_enable_esdf_guard", True)
+        self.declare_parameter("merge_max_free_space_distance_m", 0.08)
+        self.declare_parameter("merge_surface_sample_count", 64)
+        self.declare_parameter("merge_min_observed_surface_fraction", 0.70)
         self.declare_parameter("max_grid_voxels", 8000000)
         self.declare_parameter(
             "marker_topic", "/rmp_camera/esdf_medial_sphere_markers"
@@ -211,6 +225,11 @@ class EsdfMedialSphereNode(Node):
             "surface_shell_thickness_m",
             "target_shell_coverage",
             "shell_coverage_loss_tolerance",
+            "merge_max_radius_m",
+            "merge_max_radius_growth_ratio",
+            "merge_max_gap_m",
+            "merge_max_free_space_distance_m",
+            "merge_min_observed_surface_fraction",
         ):
             setattr(self, name, float(self.get_parameter(name).value))
         for name in (
@@ -219,6 +238,7 @@ class EsdfMedialSphereNode(Node):
             "max_iterations_per_component",
             "max_total_spheres",
             "max_optimization_matrix_elements",
+            "merge_surface_sample_count",
             "max_grid_voxels",
         ):
             setattr(self, name, int(self.get_parameter(name).value))
@@ -252,6 +272,12 @@ class EsdfMedialSphereNode(Node):
         self.enable_surface_shell_guard = self._as_bool(
             self.get_parameter("enable_surface_shell_guard").value
         )
+        self.enable_agglomerative_merge = self._as_bool(
+            self.get_parameter("enable_agglomerative_merge").value
+        )
+        self.merge_enable_esdf_guard = self._as_bool(
+            self.get_parameter("merge_enable_esdf_guard").value
+        )
         self.publish_debug_clouds = self._as_bool(
             self.get_parameter("publish_debug_clouds").value
         )
@@ -269,6 +295,27 @@ class EsdfMedialSphereNode(Node):
             raise ValueError(
                 "max_optimization_matrix_elements must be positive"
             )
+        if not np.isfinite((
+            self.merge_max_radius_m,
+            self.merge_max_radius_growth_ratio,
+            self.merge_max_gap_m,
+            self.merge_max_free_space_distance_m,
+            self.merge_min_observed_surface_fraction,
+        )).all():
+            raise ValueError("merge parameters must be finite")
+        if self.merge_max_radius_m <= 0.0:
+            raise ValueError("merge_max_radius_m must be positive")
+        if self.merge_max_radius_growth_ratio < 1.0:
+            raise ValueError("merge_max_radius_growth_ratio must be at least 1")
+        if self.merge_max_gap_m < 0.0:
+            raise ValueError("merge_max_gap_m must be non-negative")
+        if self.merge_max_free_space_distance_m < 0.0:
+            raise ValueError("merge_max_free_space_distance_m must be non-negative")
+        if self.merge_surface_sample_count <= 0:
+            raise ValueError("merge_surface_sample_count must be positive")
+        if not 0.0 <= self.merge_min_observed_surface_fraction <= 1.0:
+            raise ValueError(
+                "merge_min_observed_surface_fraction must be in [0, 1]")
 
     def tick(self):
         if self.pending:
@@ -358,6 +405,14 @@ class EsdfMedialSphereNode(Node):
                 target_shell_coverage=self.target_shell_coverage,
                 shell_coverage_loss_tolerance=self.shell_coverage_loss_tolerance,
                 max_optimization_matrix_elements=self.max_optimization_matrix_elements,
+                enable_agglomerative_merge=self.enable_agglomerative_merge,
+                merge_max_radius_m=self.merge_max_radius_m,
+                merge_max_radius_growth_ratio=self.merge_max_radius_growth_ratio,
+                merge_max_gap_m=self.merge_max_gap_m,
+                merge_enable_esdf_guard=self.merge_enable_esdf_guard,
+                merge_max_free_space_distance_m=self.merge_max_free_space_distance_m,
+                merge_surface_sample_count=self.merge_surface_sample_count,
+                merge_min_observed_surface_fraction=self.merge_min_observed_surface_fraction,
             )
         except Exception as exc:
             self._warn_throttled(f"ESDF medial sphere processing failed: {exc}")
@@ -404,7 +459,8 @@ class EsdfMedialSphereNode(Node):
             f"observed={observed_count}, inside={inside_count}, "
             f"components={len(result.components)}, "
             f"removed_small={result.removed_small_components}, "
-            f"spheres={len(result.spheres)}, coverage=[{coverage_text}], "
+            f"pre_merge_spheres={sum(c.pre_merge_sphere_count for c in result.components)}, "
+            f"post_merge_spheres={len(result.spheres)}, coverage=[{coverage_text}], "
             f"processing={processing_elapsed_s * 1000.0:.1f} ms, "
             f"service={service_elapsed_s * 1000.0:.1f} ms"
         )

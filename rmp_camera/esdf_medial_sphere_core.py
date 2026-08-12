@@ -10,6 +10,12 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
+from rmp_camera.sphere_merge_core import (
+    PairMergeCandidate,
+    select_best_merge_pair,
+    validate_merge_limits,
+)
+
 
 Index3 = Tuple[int, int, int]
 
@@ -23,6 +29,7 @@ class Sphere:
     output_radius: float
     component_id: int
     source_index: Index3
+    is_merged: bool = False
 
 
 @dataclass
@@ -37,6 +44,7 @@ class ComponentResult:
     uncovered_indices: np.ndarray = field(
         default_factory=lambda: np.empty((0, 3), dtype=np.int64)
     )
+    pre_merge_sphere_count: int = 0
 
 
 @dataclass
@@ -881,6 +889,238 @@ def optimize_component_spheres(
     )
 
 
+def fibonacci_sphere_surface_points(
+    center_m: Sequence[float], radius_m: float, sample_count: int,
+) -> np.ndarray:
+    """Return deterministic, near-uniform samples on a sphere surface."""
+
+    if sample_count <= 0:
+        raise ValueError("merge surface sample count must be positive")
+    center = _as_origin(center_m)
+    sample = np.arange(sample_count, dtype=np.float64) + 0.5
+    y = 1.0 - 2.0 * sample / sample_count
+    radial = np.sqrt(np.maximum(0.0, 1.0 - y * y))
+    angle = np.pi * (3.0 - np.sqrt(5.0)) * sample
+    directions = np.column_stack(
+        (radial * np.cos(angle), y, radial * np.sin(angle)))
+    return center + float(radius_m) * directions
+
+
+def _trilinear_observed_esdf_samples(
+    esdf_grid: np.ndarray,
+    points_m: np.ndarray,
+    origin_m: np.ndarray,
+    voxel_size_m: float,
+    unobserved_distance_value: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample centre-valued ESDF data and mark outside/unobserved samples."""
+
+    values = np.asarray(esdf_grid, dtype=np.float64)
+    points = np.asarray(points_m, dtype=np.float64)
+    observed = np.zeros(len(points), dtype=bool)
+    samples = np.full(len(points), np.nan, dtype=np.float64)
+    coordinates = (points - origin_m) / voxel_size_m - 0.5
+    upper = np.asarray(values.shape, dtype=np.float64) - 1.0
+    sentinel_tolerance = max(
+        1e-9, abs(float(unobserved_distance_value)) * 1e-12)
+
+    for sample_index, coordinate in enumerate(coordinates):
+        if np.any(coordinate < -1e-12) or np.any(coordinate > upper + 1e-12):
+            continue
+        coordinate = np.clip(coordinate, 0.0, upper)
+        lower = np.floor(coordinate).astype(np.int64)
+        higher = np.minimum(lower + 1, np.asarray(values.shape) - 1)
+        fractions = coordinate - lower
+        axes = []
+        for axis in range(3):
+            if lower[axis] == higher[axis]:
+                axes.append(((int(lower[axis]), 1.0),))
+            else:
+                axes.append((
+                    (int(lower[axis]), float(1.0 - fractions[axis])),
+                    (int(higher[axis]), float(fractions[axis])),
+                ))
+        weighted_value = 0.0
+        valid = True
+        for x_index, x_weight in axes[0]:
+            for y_index, y_weight in axes[1]:
+                for z_index, z_weight in axes[2]:
+                    weight = x_weight * y_weight * z_weight
+                    if weight <= 0.0:
+                        continue
+                    corner = float(values[x_index, y_index, z_index])
+                    if (
+                        not np.isfinite(corner)
+                        or abs(corner - unobserved_distance_value)
+                        <= sentinel_tolerance
+                    ):
+                        valid = False
+                        break
+                    weighted_value += weight * corner
+                if not valid:
+                    break
+            if not valid:
+                break
+        if valid:
+            observed[sample_index] = True
+            samples[sample_index] = weighted_value
+    return observed, samples
+
+
+def merged_sphere_passes_esdf_guard(
+    esdf_grid: np.ndarray,
+    center_m: Sequence[float],
+    radius_m: float,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    unobserved_distance_value: float,
+    max_free_space_distance_m: float,
+    surface_sample_count: int,
+    min_observed_surface_fraction: float,
+) -> bool:
+    """Reject a merge whose sampled surface enters too much known free space."""
+
+    points = fibonacci_sphere_surface_points(
+        center_m, radius_m, surface_sample_count)
+    observed, samples = _trilinear_observed_esdf_samples(
+        esdf_grid,
+        points,
+        _as_origin(origin_m),
+        voxel_size_m,
+        unobserved_distance_value,
+    )
+    if float(np.mean(observed)) + 1e-12 < min_observed_surface_fraction:
+        return False
+    return bool(
+        np.any(observed)
+        and np.max(samples[observed]) <= max_free_space_distance_m + 1e-12
+    )
+
+
+def agglomerative_merge_static_spheres(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    coverage_tolerance_m: float,
+    safety_margin_m: float,
+    unobserved_distance_value: float = -1000.0,
+    merge_max_radius_m: float = 0.35,
+    merge_max_radius_growth_ratio: float = 1.45,
+    merge_max_gap_m: float = 0.05,
+    merge_enable_esdf_guard: bool = True,
+    merge_max_free_space_distance_m: float = 0.08,
+    merge_surface_sample_count: int = 64,
+    merge_min_observed_surface_fraction: float = 0.70,
+) -> List[Sphere]:
+    """Repeatedly replace the least-cost valid pair with its containing sphere."""
+
+    _validate_static_merge_parameters(
+        merge_max_radius_m, merge_max_radius_growth_ratio, merge_max_gap_m,
+        merge_max_free_space_distance_m, merge_surface_sample_count,
+        merge_min_observed_surface_fraction)
+    active = list(spheres)
+    indices = _as_index_array(component_indices)
+    origin = _as_origin(origin_m)
+
+    while len(active) >= 2:
+        _, baseline_covered = calculate_component_coverage(
+            indices, active, origin, voxel_size_m, coverage_tolerance_m)
+
+        def validator(candidate: PairMergeCandidate) -> bool:
+            first = active[candidate.first_index]
+            second = active[candidate.second_index]
+            merged = Sphere(
+                center=candidate.center,
+                raw_radius=candidate.radius,
+                output_radius=candidate.radius + safety_margin_m,
+                component_id=first.component_id,
+                source_index=min(first.source_index, second.source_index),
+                is_merged=True,
+            )
+            trial = [
+                sphere for index, sphere in enumerate(active)
+                if index not in (candidate.first_index, candidate.second_index)
+            ] + [merged]
+            _, covered = calculate_component_coverage(
+                indices, trial, origin, voxel_size_m, coverage_tolerance_m)
+            if np.count_nonzero(covered) < np.count_nonzero(baseline_covered):
+                return False
+            return (
+                not merge_enable_esdf_guard
+                or merged_sphere_passes_esdf_guard(
+                    esdf_grid,
+                    merged.center,
+                    merged.raw_radius,
+                    origin,
+                    voxel_size_m,
+                    unobserved_distance_value,
+                    merge_max_free_space_distance_m,
+                    merge_surface_sample_count,
+                    merge_min_observed_surface_fraction,
+                )
+            )
+
+        candidate = select_best_merge_pair(
+            np.asarray([sphere.center for sphere in active]),
+            np.asarray([sphere.raw_radius for sphere in active]),
+            np.asarray([sphere.component_id for sphere in active]),
+            merge_max_radius_m,
+            merge_max_radius_growth_ratio,
+            merge_max_gap_m,
+            validator,
+        )
+        if candidate is None:
+            break
+        first = active[candidate.first_index]
+        second = active[candidate.second_index]
+        merged = Sphere(
+            candidate.center,
+            candidate.radius,
+            candidate.radius + safety_margin_m,
+            first.component_id,
+            min(first.source_index, second.source_index),
+            True,
+        )
+        active = [
+            sphere for index, sphere in enumerate(active)
+            if index not in (candidate.first_index, candidate.second_index)
+        ] + [merged]
+        active.sort(key=lambda sphere: (
+            sphere.component_id,
+            float(sphere.center[0]),
+            float(sphere.center[1]),
+            float(sphere.center[2]),
+            sphere.raw_radius,
+            sphere.source_index,
+        ))
+    return active
+
+
+def _validate_static_merge_parameters(
+    merge_max_radius_m: float,
+    merge_max_radius_growth_ratio: float,
+    merge_max_gap_m: float,
+    merge_max_free_space_distance_m: float,
+    merge_surface_sample_count: int,
+    merge_min_observed_surface_fraction: float,
+) -> None:
+    validate_merge_limits(
+        merge_max_radius_m, merge_max_radius_growth_ratio, merge_max_gap_m)
+    if not np.isfinite((
+        merge_max_free_space_distance_m,
+        merge_min_observed_surface_fraction,
+    )).all():
+        raise ValueError("static merge guard parameters must be finite")
+    if merge_max_free_space_distance_m < 0.0:
+        raise ValueError("merge free-space distance must be non-negative")
+    if merge_surface_sample_count <= 0:
+        raise ValueError("merge surface sample count must be positive")
+    if not 0.0 <= merge_min_observed_surface_fraction <= 1.0:
+        raise ValueError("merge observed surface fraction must be in [0, 1]")
+
+
 def _validate_optimization_parameters(
     surface_shell_thickness_m: float,
     target_shell_coverage: float,
@@ -923,6 +1163,14 @@ def generate_medial_spheres(
     target_shell_coverage: float = 0.98,
     shell_coverage_loss_tolerance: float = 0.005,
     max_optimization_matrix_elements: int = 20000000,
+    enable_agglomerative_merge: bool = True,
+    merge_max_radius_m: float = 0.35,
+    merge_max_radius_growth_ratio: float = 1.45,
+    merge_max_gap_m: float = 0.05,
+    merge_enable_esdf_guard: bool = True,
+    merge_max_free_space_distance_m: float = 0.08,
+    merge_surface_sample_count: int = 64,
+    merge_min_observed_surface_fraction: float = 0.70,
 ) -> GenerationResult:
     """Run the complete component-wise signed-ESDF sphere algorithm.
 
@@ -944,6 +1192,14 @@ def generate_medial_spheres(
         target_shell_coverage,
         shell_coverage_loss_tolerance,
         max_optimization_matrix_elements,
+    )
+    _validate_static_merge_parameters(
+        merge_max_radius_m,
+        merge_max_radius_growth_ratio,
+        merge_max_gap_m,
+        merge_max_free_space_distance_m,
+        merge_surface_sample_count,
+        merge_min_observed_surface_fraction,
     )
 
     inside_mask = extract_inside_mask(
@@ -1039,6 +1295,33 @@ def generate_medial_spheres(
                 component_id,
             )
             uncovered = component_indices[~covered]
+        pre_merge_sphere_count = len(spheres)
+        if enable_agglomerative_merge and len(spheres) >= 2:
+            spheres = agglomerative_merge_static_spheres(
+                values,
+                component_indices,
+                spheres,
+                origin,
+                voxel_size_m,
+                coverage_tolerance_m,
+                safety_margin_m,
+                unobserved_distance_value,
+                merge_max_radius_m,
+                merge_max_radius_growth_ratio,
+                merge_max_gap_m,
+                merge_enable_esdf_guard,
+                merge_max_free_space_distance_m,
+                merge_surface_sample_count,
+                merge_min_observed_surface_fraction,
+            )
+            coverage, covered = calculate_component_coverage(
+                component_indices,
+                spheres,
+                origin,
+                voxel_size_m,
+                coverage_tolerance_m,
+            )
+            uncovered = component_indices[~covered]
         results.append(
             ComponentResult(
                 component_id=component_id,
@@ -1047,6 +1330,7 @@ def generate_medial_spheres(
                 coverage=coverage,
                 termination_reason=reason,
                 uncovered_indices=uncovered,
+                pre_merge_sphere_count=pre_merge_sphere_count,
             )
         )
 

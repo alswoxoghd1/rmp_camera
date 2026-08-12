@@ -113,12 +113,12 @@
     aabb_size_z_m: 2.0
     unobserved_distance_value: -1000.0     # Nvblox unobserved sentinel [m].
     inside_epsilon_m: 0.005                # Negative-distance noise rejection [m].
-    target_coverage: 0.95                  # Required component voxel coverage [0..1].
-    coverage_tolerance_m: 0.01             # Coverage discretization tolerance [m].
+    target_coverage: 0.92                  # Required component voxel coverage [0..1].
+    coverage_tolerance_m: 0.02             # Coverage discretization tolerance [m].
     plateau_epsilon_m: 0.001               # ESDF minimum plateau tolerance [m].
-    minimum_center_spacing_m: 0.05         # Static center separation [m].
+    minimum_center_spacing_m: 0.10         # Static center separation [m].
     min_component_voxels: 8                # Static connected-component floor [voxels].
-    min_raw_sphere_radius_m: 0.01           # Static raw radius floor [m].
+    min_raw_sphere_radius_m: 0.04           # Static raw radius floor [m].
     safety_margin_m: 0.02                  # Added to static output radius only [m].
     redundancy_tolerance_m: 0.001          # Removal containment slack [m].
     max_spheres_per_component: 128
@@ -129,9 +129,17 @@
     enable_general_coverage_pruning: true  # Remove candidates with no required unique coverage.
     enable_surface_shell_guard: true       # Preserve thin obstacle surface features.
     surface_shell_thickness_m: 0.10        # Inner ESDF shell thickness [m].
-    target_shell_coverage: 0.98            # Desired surface-shell coverage [0..1].
-    shell_coverage_loss_tolerance: 0.005   # Allowed loss from baseline shell coverage.
+    target_shell_coverage: 0.94            # Desired surface-shell coverage [0..1].
+    shell_coverage_loss_tolerance: 0.02    # Allowed loss from baseline shell coverage.
     max_optimization_matrix_elements: 20000000 # Per-component boolean matrix guard.
+    enable_agglomerative_merge: true       # Merge only conservatively valid same-component pairs.
+    merge_max_radius_m: 0.35               # Hard raw-radius cap for a merged static sphere [m].
+    merge_max_radius_growth_ratio: 1.45    # Merged radius / larger parent radius cap.
+    merge_max_gap_m: 0.05                  # Maximum parent surface gap [m].
+    merge_enable_esdf_guard: true          # Sample merged surface against static ESDF.
+    merge_max_free_space_distance_m: 0.08  # Maximum positive sampled ESDF distance [m].
+    merge_surface_sample_count: 64         # Deterministic Fibonacci surface samples.
+    merge_min_observed_surface_fraction: 0.70 # Required observed sample fraction [0..1].
     max_grid_voxels: 8000000               # Dense response memory guard [voxels].
     marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
     sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
@@ -155,36 +163,43 @@
     max_z_m: 2.5
     max_range_from_base_m: 2.0             # Radial XY crop [m]; <=0 disables.
     dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
-    dynamic_min_component_voxels: 6        # Noise component floor [voxels].
+    dynamic_min_component_voxels: 10       # Noise component floor [voxels].
     dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
     dynamic_max_components: 32             # Component processing cap.
     dynamic_max_input_points: 250000       # Input truncation cap [points].
     dynamic_connectivity: 18               # 6 face, 18 face+edge, or 26 incl. corner.
     dynamic_dilation_voxels: 0             # Positive values expand dynamic objects [voxels].
     dynamic_closing_iterations: 1          # Fill one-voxel cracks; large values merge objects.
-    dynamic_minimum_center_spacing_m: 0.08 # Adaptive sphere center separation [m].
+    dynamic_minimum_center_spacing_m: 0.12 # Adaptive sphere center separation [m].
     dynamic_min_raw_radius_m: 0.025         # Smallest accepted raw radius [m].
     dynamic_max_raw_radius_m: 0.45          # Prevent one sphere swallowing nearby space [m].
     dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
     dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
-    dynamic_fixed_radius_m: 0.10            # Thin/oversized fallback radius [m].
+    dynamic_fixed_radius_m: 0.15            # Thin/oversized fallback radius [m].
     dynamic_enable_greedy_set_cover: true   # Select a smaller sphere subset while preserving target coverage.
     dynamic_enable_single_sphere_replacement: true # Replace compact components with one sphere.
-    dynamic_single_sphere_max_radius_m: 0.18 # Limit free-space consumed by a replacement sphere [m].
-    dynamic_target_coverage: 0.95            # Voxel-center coverage goal [0..1].
+    dynamic_single_sphere_max_radius_m: 0.28 # Limit free-space consumed by a replacement sphere [m].
+    dynamic_target_coverage: 0.92            # Voxel-center coverage goal [0..1].
     dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
     dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
     dynamic_redundancy_tolerance_m: 0.01    # Redundancy removal slack [m].
     dynamic_max_spheres_per_component: 96
     dynamic_max_iterations_per_component: 256
     dynamic_max_total_spheres: 384
-    dynamic_processing_budget_ms: 35.0      # Per-update soft CPU budget [ms].
+    dynamic_processing_budget_ms: 50.0      # Per-update soft CPU budget [ms].
     dynamic_max_local_grid_voxels: 1200000  # Dense-equivalent volume guard [voxels].
+    dynamic_enable_agglomerative_merge: true # Merge only valid same-component pairs.
+    dynamic_merge_max_radius_m: 0.30         # Hard raw-radius cap for a merged dynamic sphere [m].
+    dynamic_merge_max_radius_growth_ratio: 1.50 # Merged radius / larger parent radius cap.
+    dynamic_merge_max_gap_m: 0.08            # Maximum parent surface gap [m].
+    dynamic_merge_enable_empty_space_guard: false # Optional occupancy guard; off by default.
+    dynamic_merge_max_empty_fraction: 0.70   # Maximum unoccupied fraction when guard is enabled.
+    dynamic_merge_max_validation_voxels: 50000 # Bound optional validation work.
     dynamic_tracking_enabled: true
     dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
     dynamic_smoothing_alpha: 0.70           # 1=new measurement, 0=old track.
-    dynamic_sphere_ttl_sec: 0.5             # Occlusion retention [s].
-    dynamic_max_missed_updates: 5           # Occlusion update-count cap.
+    dynamic_sphere_ttl_sec: 0.30            # Occlusion retention [s].
+    dynamic_max_missed_updates: 3           # Occlusion update-count cap.
     dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
     publish_debug_clouds: true
 

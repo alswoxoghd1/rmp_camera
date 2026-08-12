@@ -1,9 +1,12 @@
+from time import monotonic
+
 import numpy as np
 
 from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphere,
     DynamicSphereParameters,
     DynamicSphereTracker,
+    agglomerative_merge_dynamic_spheres,
     _greedy_set_cover,
     _remove_redundant,
     _sphere_coverage_masks,
@@ -332,3 +335,124 @@ def test_tracker_exponential_smoothing():
     result = tracker.update([detection(1.0, 0.5)], 0.1)[0]
     assert np.isclose(result.x, 0.25)
     assert np.isclose(result.raw_radius, 0.2)
+
+
+def merge_dynamic_sphere(x, radius=0.10):
+    return DynamicSphere(x, 0.0, 0.0, radius, radius + 0.01, 0)
+
+
+def run_dynamic_merge(centers, spheres, **overrides):
+    values = dict(
+        dynamic_merge_max_radius_m=0.30,
+        dynamic_merge_max_radius_growth_ratio=1.50,
+        dynamic_merge_max_gap_m=0.08)
+    values.update(overrides)
+    configured = params(**values)
+    return agglomerative_merge_dynamic_spheres(
+        np.asarray(centers, dtype=np.float64), spheres, configured,
+        monotonic() + 1.0)
+
+
+def test_dynamic_agglomerative_merge_reduces_compact_set_and_keeps_coverage():
+    centers = np.asarray(((0.0, 0.0, 0.0), (0.08, 0.0, 0.0),
+                          (0.16, 0.0, 0.0)))
+    spheres = [merge_dynamic_sphere(x) for x in (0.0, 0.08, 0.16)]
+    before = _sphere_coverage_masks(centers, spheres, 0.02).any(axis=0)
+    merged = run_dynamic_merge(centers, spheres)
+    after = _sphere_coverage_masks(centers, merged, 0.02).any(axis=0)
+    assert len(merged) == 1
+    assert np.count_nonzero(after) >= np.count_nonzero(before)
+    assert np.isclose(merged[0].output_radius, merged[0].raw_radius + 0.01)
+
+
+def test_dynamic_elongated_set_does_not_collapse_into_giant_sphere():
+    coordinates = tuple(0.08 * index for index in range(6))
+    centers = np.asarray([(x, 0.0, 0.0) for x in coordinates])
+    spheres = [merge_dynamic_sphere(x, 0.08) for x in coordinates]
+    merged = run_dynamic_merge(
+        centers, spheres, dynamic_merge_max_radius_m=0.20)
+    assert 1 < len(merged) < len(spheres)
+    assert max(s.raw_radius for s in merged) <= 0.20 + 1e-12
+
+
+def test_dynamic_radius_growth_and_gap_guards_reject_pairs():
+    cases = (
+        (((0.0, 0.0, 0.0), (0.08, 0.0, 0.0)),
+         (merge_dynamic_sphere(0.0), merge_dynamic_sphere(0.08)),
+         {"dynamic_merge_max_radius_m": 0.13}),
+        (((0.0, 0.0, 0.0), (0.10, 0.0, 0.0)),
+         (merge_dynamic_sphere(0.0), merge_dynamic_sphere(0.10)),
+         {"dynamic_merge_max_radius_m": 1.0,
+          "dynamic_merge_max_radius_growth_ratio": 1.40}),
+        (((0.0, 0.0, 0.0), (0.20, 0.0, 0.0)),
+         (merge_dynamic_sphere(0.0, 0.05), merge_dynamic_sphere(0.20, 0.05)),
+         {"dynamic_merge_max_radius_m": 1.0,
+          "dynamic_merge_max_radius_growth_ratio": 10.0,
+          "dynamic_merge_max_gap_m": 0.05}),
+    )
+    for centers, spheres, overrides in cases:
+        assert len(run_dynamic_merge(centers, spheres, **overrides)) == 2
+
+
+def test_dynamic_merge_respects_expired_deadline_and_returns_valid_input():
+    centers = np.asarray(((0.0, 0.0, 0.0), (0.08, 0.0, 0.0)))
+    spheres = [merge_dynamic_sphere(0.0), merge_dynamic_sphere(0.08)]
+    assert agglomerative_merge_dynamic_spheres(
+        centers, spheres, params(), monotonic()) == spheres
+
+
+def test_dynamic_optional_empty_space_guard_rejects_sparse_merge():
+    centers = np.asarray(((0.0, 0.0, 0.0), (0.08, 0.0, 0.0)))
+    spheres = [merge_dynamic_sphere(0.0), merge_dynamic_sphere(0.08)]
+    assert len(run_dynamic_merge(centers, spheres)) == 1
+    assert len(run_dynamic_merge(
+        centers, spheres,
+        dynamic_merge_enable_empty_space_guard=True,
+        dynamic_merge_max_empty_fraction=0.10)) == 2
+
+
+def test_dynamic_feature_off_keeps_pre_merge_geometry():
+    common = dict(
+        dynamic_enable_agglomerative_merge=False,
+        min_useful_adaptive_radius_m=0.25,
+        fixed_radius_m=0.09,
+        enable_single_sphere_replacement=False,
+        enable_greedy_set_cover=False,
+        processing_budget_ms=1000.0)
+    disabled = params(**common)
+    common.update(
+        dynamic_enable_agglomerative_merge=True,
+        dynamic_merge_max_radius_m=0.01)
+    blocked = params(**common)
+    points = points_for(box(5, 2, 1), disabled)
+    disabled_result = generate_dynamic_spheres(points, disabled)
+    blocked_result = generate_dynamic_spheres(points, blocked)
+    assert signature(disabled_result) == signature(blocked_result)
+    assert disabled_result.components[0].pre_merge_sphere_count == len(
+        disabled_result.spheres)
+
+
+def test_dynamic_merge_geometry_is_deterministic_for_reversed_order():
+    centers = np.asarray([(x, 0.0, 0.0) for x in (0.0, 0.08, 0.16, 0.24)])
+    spheres = [merge_dynamic_sphere(x) for x in (0.0, 0.08, 0.16, 0.24)]
+    def geometry(values):
+        return [tuple(round(v, 12) for v in (
+            s.x, s.y, s.z, s.raw_radius, s.output_radius)) for s in values]
+    assert geometry(run_dynamic_merge(centers, spheres)) == geometry(
+        run_dynamic_merge(centers, spheres[::-1]))
+
+
+def test_dynamic_merge_parameter_validation():
+    for overrides in (
+        {"dynamic_merge_max_radius_m": 0.0},
+        {"dynamic_merge_max_radius_growth_ratio": 0.9},
+        {"dynamic_merge_max_gap_m": -0.1},
+        {"dynamic_merge_max_empty_fraction": 1.1},
+        {"dynamic_merge_max_validation_voxels": 0},
+    ):
+        try:
+            params(**overrides).validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid merge parameters accepted: {overrides}")
