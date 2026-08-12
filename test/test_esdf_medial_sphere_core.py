@@ -6,14 +6,20 @@ from rmp_camera.esdf_medial_sphere_core import (
     Sphere,
     add_spheres_until_coverage,
     calculate_component_coverage,
+    calculate_mask_coverage,
     connected_components_18,
     create_initial_spheres,
     extract_inside_mask,
     find_local_minimum_candidates,
+    general_coverage_pruning,
     generate_medial_spheres,
+    greedy_set_cover_spheres,
     group_or_reduce_plateaus,
+    make_surface_shell_mask,
     make_neighbor_offsets_18,
+    optimize_component_spheres,
     remove_redundant_spheres,
+    sphere_coverage_masks,
 )
 
 
@@ -261,3 +267,236 @@ def test_repeated_generation_has_identical_sphere_order_and_values():
     assert [component.coverage for component in first.components] == [
         component.coverage for component in second.components
     ]
+
+
+def test_static_single_sphere_replacement_uses_esdf_candidate():
+    grid = np.full((5, 1, 1), -0.6)
+    grid[2, 0, 0] = -2.1
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    candidates = [
+        make_sphere((0, 0, 0), 0.6),
+        make_sphere((2, 0, 0), 2.1),
+        make_sphere((4, 0, 0), 0.6),
+    ]
+    spheres, volume, shell, _, applied = optimize_component_spheres(
+        grid, component, candidates, (0.0, 0.0, 0.0), 1.0, 0.0, 1.0, 0.0,
+        surface_shell_thickness_m=0.6,
+        target_shell_coverage=1.0,
+        shell_coverage_loss_tolerance=0.0,
+    )
+    assert applied
+    assert len(spheres) == 1
+    assert spheres[0].source_index == (2, 0, 0)
+    assert spheres[0].raw_radius == -grid[spheres[0].source_index]
+    assert volume == 1.0
+    assert shell == 1.0
+
+
+def test_static_greedy_set_cover_reduces_overlapping_candidates():
+    grid = np.full((6, 1, 1), -0.51)
+    grid[1, 0, 0] = -1.51
+    grid[2, 0, 0] = -2.51
+    grid[4, 0, 0] = -1.51
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    candidates = [
+        make_sphere((1, 0, 0), 1.51),
+        make_sphere((2, 0, 0), 2.51),
+        make_sphere((4, 0, 0), 1.51),
+    ]
+    masks = sphere_coverage_masks(
+        component, candidates, (0.0, 0.0, 0.0), 1.0, 0.0)
+    selected = greedy_set_cover_spheres(
+        candidates, masks, np.zeros(len(component), dtype=bool),
+        1.0, 0.0, False)
+    assert selected == [1, 2]
+    assert calculate_mask_coverage(np.any(masks[selected], axis=0)) == 1.0
+
+
+def test_elongated_static_component_is_not_forced_to_one_sphere():
+    grid = np.full((10, 1, 1), -1.1)
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    candidates = [
+        make_sphere((1, 0, 0), 1.1),
+        make_sphere((4, 0, 0), 1.1),
+        make_sphere((7, 0, 0), 1.1),
+        make_sphere((9, 0, 0), 1.1),
+    ]
+    spheres, volume, _, _, _ = optimize_component_spheres(
+        grid, component, candidates, (0.0, 0.0, 0.0), 1.0, 0.0, 0.9, 0.0,
+        enable_surface_shell_guard=False)
+    assert len(spheres) > 1
+    assert volume >= 0.9
+
+
+def test_surface_shell_guard_preserves_thin_protrusion_sphere():
+    grid = np.full((20, 1, 1), -1.0)
+    grid[9, 0, 0] = -9.1
+    grid[19, 0, 0] = -0.1
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    candidates = [
+        make_sphere((9, 0, 0), 9.1),
+        make_sphere((19, 0, 0), 0.1),
+    ]
+    without_guard = optimize_component_spheres(
+        grid, component, candidates, (0.0, 0.0, 0.0), 1.0, 0.005, 0.95, 0.0,
+        enable_single_sphere_replacement=False,
+        enable_greedy_set_cover=False,
+        enable_surface_shell_guard=False,
+        surface_shell_thickness_m=0.2,
+    )
+    with_guard = optimize_component_spheres(
+        grid, component, candidates, (0.0, 0.0, 0.0), 1.0, 0.005, 0.95, 0.0,
+        enable_single_sphere_replacement=False,
+        enable_greedy_set_cover=False,
+        enable_surface_shell_guard=True,
+        surface_shell_thickness_m=0.2,
+        target_shell_coverage=1.0,
+        shell_coverage_loss_tolerance=0.0,
+    )
+    assert len(without_guard[0]) == 1
+    assert without_guard[2] == 0.0
+    assert len(with_guard[0]) == 2
+    assert with_guard[2] == 1.0
+
+
+
+def test_empty_surface_shell_disables_guard_without_division_by_zero():
+    grid = np.full((5, 1, 1), -1.0)
+    grid[2, 0, 0] = -3.0
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    shell_mask = make_surface_shell_mask(grid, component, 0.005, 0.1)
+    assert not np.any(shell_mask)
+    sphere = make_sphere((2, 0, 0), 3.0)
+    result = optimize_component_spheres(
+        grid, component, [sphere], (0.0, 0.0, 0.0), 1.0, 0.005, 1.0, 0.0,
+        surface_shell_thickness_m=0.1)
+    assert result[1] == 1.0
+    assert result[2] == 1.0
+
+
+def test_general_pruning_removes_non_contained_coverage_redundancy():
+    spheres = [
+        make_sphere((0, 0, 0), 0.1),
+        make_sphere((2, 0, 0), 0.1),
+        make_sphere((4, 0, 0), 0.1),
+    ]
+    masks = np.asarray([
+        [True, True, True, False, False],
+        [False, False, True, True, True],
+        [True, False, False, False, True],
+    ])
+    selected = general_coverage_pruning(
+        spheres, masks, np.zeros(5, dtype=bool), [0, 1, 2],
+        1.0, 0.0, False)
+    assert selected == [0, 1]
+
+
+def test_all_static_optimization_features_can_be_disabled():
+    grid = signed_box_esdf(
+        (9, 7, 7), (1.0, 1.0, 1.0), (8.0, 6.0, 6.0))
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        enable_single_sphere_replacement=False,
+        enable_greedy_set_cover=False,
+        enable_general_coverage_pruning=False,
+        enable_surface_shell_guard=False,
+    )
+    assert result.spheres
+    assert result.components[0].coverage >= 0.95
+
+
+def test_optimized_static_generation_is_deterministic():
+    grid = signed_box_esdf(
+        (12, 7, 7), (1.0, 1.0, 1.0), (11.0, 6.0, 6.0))
+    kwargs = dict(
+        origin_m=(0.0, 0.0, 0.0),
+        voxel_size_m=1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        minimum_center_spacing_m=1.0,
+    )
+    signatures = [
+        sphere_signature(generate_medial_spheres(grid, **kwargs))
+        for _ in range(3)
+    ]
+    assert signatures[0] == signatures[1] == signatures[2]
+
+
+
+def test_final_static_spheres_keep_exact_safety_margin_and_esdf_radius():
+    grid = signed_box_esdf(
+        (10, 7, 7), (1.0, 1.0, 1.0), (9.0, 6.0, 6.0))
+    safety_margin = 0.037
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        safety_margin_m=safety_margin,
+    )
+    assert result.spheres
+    for sphere in result.spheres:
+        assert sphere.raw_radius == -grid[sphere.source_index]
+        assert np.isclose(
+            sphere.output_radius, sphere.raw_radius + safety_margin)
+
+
+def test_component_coverage_and_uncovered_indices_match_recalculation():
+    grid = signed_box_esdf(
+        (11, 7, 7), (1.0, 1.0, 1.0), (10.0, 6.0, 6.0))
+    result = generate_medial_spheres(
+        grid, (0.0, 0.0, 0.0), 1.0,
+        inside_epsilon_m=0.0, min_component_voxels=1)
+    for component in result.components:
+        coverage, covered = calculate_component_coverage(
+            component.voxel_indices,
+            component.spheres,
+            (0.0, 0.0, 0.0),
+            1.0,
+            0.01,
+        )
+        assert np.isclose(component.coverage, coverage)
+        assert np.array_equal(
+            component.uncovered_indices, component.voxel_indices[~covered])
+
+
+def test_optimization_matrix_limit_falls_back_without_coverage_loss():
+    grid = np.full((7, 1, 1), -0.51)
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        target_coverage=1.0,
+        minimum_center_spacing_m=0.0,
+        max_optimization_matrix_elements=1,
+    )
+    assert result.components[0].coverage == 1.0
+
+
+def test_static_optimization_parameter_validation():
+    invalid_kwargs = [
+        {"surface_shell_thickness_m": -0.1},
+        {"target_shell_coverage": -0.1},
+        {"target_shell_coverage": 1.1},
+        {"shell_coverage_loss_tolerance": -0.1},
+        {"shell_coverage_loss_tolerance": 1.1},
+        {"max_optimization_matrix_elements": 0},
+    ]
+    grid = np.full((1, 1, 1), -0.1)
+    for kwargs in invalid_kwargs:
+        try:
+            generate_medial_spheres(
+                grid, (0.0, 0.0, 0.0), 1.0,
+                min_component_voxels=1, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid optimization parameters accepted: {kwargs}")

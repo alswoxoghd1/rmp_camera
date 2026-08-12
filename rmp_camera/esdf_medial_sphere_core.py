@@ -482,6 +482,422 @@ def remove_redundant_spheres(
     return result, coverage
 
 
+def make_surface_shell_mask(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    inside_epsilon_m: float,
+    surface_shell_thickness_m: float,
+) -> np.ndarray:
+    """Return component-order voxels lying in the configured inner shell."""
+
+    if inside_epsilon_m < 0.0 or surface_shell_thickness_m < 0.0:
+        raise ValueError("inside epsilon and shell thickness must be non-negative")
+    indices = _as_index_array(component_indices)
+    if len(indices) == 0 or surface_shell_thickness_m == 0.0:
+        return np.zeros(len(indices), dtype=bool)
+    values = np.asarray(esdf_grid, dtype=np.float64)
+    distances = values[tuple(indices.T)]
+    return (
+        np.isfinite(distances)
+        & (distances >= -surface_shell_thickness_m)
+        & (distances < -inside_epsilon_m)
+    )
+
+
+def sphere_coverage_masks(
+    component_indices: np.ndarray,
+    spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    coverage_tolerance_m: float,
+    max_matrix_elements: int = 20000000,
+) -> np.ndarray | None:
+    """Build one reusable component-voxel coverage row per candidate sphere."""
+
+    indices = _as_index_array(component_indices)
+    if voxel_size_m <= 0.0 or coverage_tolerance_m < 0.0:
+        raise ValueError("voxel size must be positive and tolerance non-negative")
+    if max_matrix_elements <= 0:
+        raise ValueError("max_matrix_elements must be positive")
+    if len(indices) * len(spheres) > max_matrix_elements:
+        return None
+    points = _as_origin(origin_m) + (
+        indices.astype(np.float64) + 0.5
+    ) * voxel_size_m
+    masks = np.zeros((len(spheres), len(indices)), dtype=bool)
+    for sphere_index, sphere in enumerate(spheres):
+        delta = points - np.asarray(sphere.center, dtype=np.float64)
+        distance_squared = np.einsum("ij,ij->i", delta, delta)
+        masks[sphere_index] = distance_squared <= (
+            sphere.raw_radius + coverage_tolerance_m
+        ) ** 2 + 1e-15
+    return masks
+
+
+def calculate_mask_coverage(
+    covered_mask: np.ndarray,
+    evaluation_mask: np.ndarray | None = None,
+) -> float:
+    """Calculate coverage over all voxels or a same-length evaluation subset."""
+
+    covered = np.asarray(covered_mask, dtype=bool).reshape(-1)
+    if evaluation_mask is None:
+        return 1.0 if len(covered) == 0 else float(np.mean(covered))
+    evaluation = np.asarray(evaluation_mask, dtype=bool).reshape(-1)
+    if len(evaluation) != len(covered):
+        raise ValueError("covered and evaluation masks must have equal length")
+    denominator = int(np.count_nonzero(evaluation))
+    if denominator == 0:
+        return 1.0
+    return float(np.count_nonzero(covered & evaluation)) / float(denominator)
+
+
+def select_best_single_sphere(
+    spheres: Sequence[Sphere],
+    coverage_masks: np.ndarray,
+    shell_mask: np.ndarray,
+    required_volume_coverage: float,
+    required_shell_coverage: float,
+    shell_guard_enabled: bool,
+    valid_candidate_mask: np.ndarray | None = None,
+) -> int | None:
+    """Select the smallest deterministic candidate satisfying both guards."""
+
+    if len(spheres) < 2:
+        return None
+    valid = (
+        np.ones(len(spheres), dtype=bool)
+        if valid_candidate_mask is None
+        else np.asarray(valid_candidate_mask, dtype=bool)
+    )
+    eligible = []
+    for index, sphere in enumerate(spheres):
+        volume_coverage = calculate_mask_coverage(coverage_masks[index])
+        shell_coverage = calculate_mask_coverage(coverage_masks[index], shell_mask)
+        if (
+            valid[index]
+            and volume_coverage + 1e-12 >= required_volume_coverage
+            and (
+                not shell_guard_enabled
+                or shell_coverage + 1e-12 >= required_shell_coverage
+            )
+        ):
+            eligible.append((
+                sphere.raw_radius,
+                -shell_coverage,
+                -volume_coverage,
+                sphere.source_index,
+                index,
+            ))
+    return None if not eligible else min(eligible)[-1]
+
+
+def greedy_set_cover_spheres(
+    spheres: Sequence[Sphere],
+    coverage_masks: np.ndarray,
+    shell_mask: np.ndarray,
+    required_volume_coverage: float,
+    required_shell_coverage: float,
+    shell_guard_enabled: bool,
+    valid_candidate_mask: np.ndarray | None = None,
+) -> List[int] | None:
+    """Select deterministic candidate indices using shell-aware marginal gain."""
+
+    valid = (
+        np.ones(len(spheres), dtype=bool)
+        if valid_candidate_mask is None
+        else np.asarray(valid_candidate_mask, dtype=bool)
+    )
+    available = valid.copy()
+    covered = np.zeros(coverage_masks.shape[1], dtype=bool)
+    selected: List[int] = []
+    while True:
+        volume_coverage = calculate_mask_coverage(covered)
+        shell_coverage = calculate_mask_coverage(covered, shell_mask)
+        volume_met = volume_coverage + 1e-12 >= required_volume_coverage
+        shell_met = (
+            not shell_guard_enabled
+            or shell_coverage + 1e-12 >= required_shell_coverage
+        )
+        if volume_met and shell_met:
+            return selected
+
+        uncovered = ~covered
+        volume_gains = np.count_nonzero(coverage_masks & uncovered, axis=1)
+        shell_gains = np.count_nonzero(
+            coverage_masks & uncovered & shell_mask[None, :], axis=1
+        )
+        choices = np.flatnonzero(available & (volume_gains > 0))
+        if len(choices) == 0:
+            return None
+        shell_is_priority = shell_guard_enabled and not shell_met
+        best = min(
+            (int(index) for index in choices),
+            key=lambda index: (
+                -int(shell_gains[index])
+                if shell_is_priority
+                else -int(volume_gains[index]),
+                -int(volume_gains[index])
+                if shell_is_priority
+                else -int(shell_gains[index]),
+                -spheres[index].raw_radius,
+                spheres[index].source_index,
+                index,
+            ),
+        )
+        selected.append(best)
+        available[best] = False
+        covered |= coverage_masks[best]
+
+
+def general_coverage_pruning(
+    spheres: Sequence[Sphere],
+    coverage_masks: np.ndarray,
+    shell_mask: np.ndarray,
+    selected_indices: Sequence[int],
+    required_volume_coverage: float,
+    required_shell_coverage: float,
+    shell_guard_enabled: bool,
+) -> List[int]:
+    """Remove low-unique-contribution spheres while both guards remain met."""
+
+    active = list(selected_indices)
+    while len(active) > 1:
+        coverage_count = np.count_nonzero(coverage_masks[active], axis=0)
+        unique_volume = {
+            index: int(np.count_nonzero(
+                coverage_masks[index] & (coverage_count == 1)))
+            for index in active
+        }
+        unique_shell = {
+            index: int(np.count_nonzero(
+                coverage_masks[index] & shell_mask & (coverage_count == 1)))
+            for index in active
+        }
+        removal_order = sorted(active, key=lambda index: (
+            unique_shell[index],
+            unique_volume[index],
+            spheres[index].raw_radius,
+            spheres[index].source_index,
+            index,
+        ))
+        removed = False
+        for index in removal_order:
+            trial = [candidate for candidate in active if candidate != index]
+            trial_covered = np.any(coverage_masks[trial], axis=0)
+            volume_coverage = calculate_mask_coverage(trial_covered)
+            shell_coverage = calculate_mask_coverage(trial_covered, shell_mask)
+            if (
+                volume_coverage + 1e-12 >= required_volume_coverage
+                and (
+                    not shell_guard_enabled
+                    or shell_coverage + 1e-12 >= required_shell_coverage
+                )
+            ):
+                active = trial
+                removed = True
+                break
+        if not removed:
+            break
+    return active
+
+
+def _sphere_is_esdf_valid(
+    sphere: Sphere,
+    esdf_grid: np.ndarray,
+    component_index_set: set[Index3],
+    origin_m: np.ndarray,
+    voxel_size_m: float,
+    inside_epsilon_m: float,
+    component_id: int,
+) -> bool:
+    source_index = tuple(int(value) for value in sphere.source_index)
+    if source_index not in component_index_set or sphere.component_id != component_id:
+        return False
+    distance = float(esdf_grid[source_index])
+    expected_center = origin_m + (
+        np.asarray(source_index, dtype=np.float64) + 0.5
+    ) * voxel_size_m
+    return (
+        np.isfinite(distance)
+        and distance < -inside_epsilon_m
+        and sphere.raw_radius == -distance
+        and np.array_equal(np.asarray(sphere.center), expected_center)
+    )
+
+
+def optimize_component_spheres(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    candidate_spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    inside_epsilon_m: float,
+    target_coverage: float,
+    coverage_tolerance_m: float,
+    enable_single_sphere_replacement: bool = True,
+    enable_greedy_set_cover: bool = True,
+    enable_general_coverage_pruning: bool = True,
+    enable_surface_shell_guard: bool = True,
+    surface_shell_thickness_m: float = 0.10,
+    target_shell_coverage: float = 0.98,
+    shell_coverage_loss_tolerance: float = 0.005,
+    max_optimization_matrix_elements: int = 20000000,
+    component_id: int = 0,
+) -> Tuple[List[Sphere], float, float, np.ndarray, bool]:
+    """Optimize one ESDF-valid pool and report volume/shell coverage."""
+
+    _validate_optimization_parameters(
+        surface_shell_thickness_m,
+        target_shell_coverage,
+        shell_coverage_loss_tolerance,
+        max_optimization_matrix_elements,
+    )
+    indices = _as_index_array(component_indices)
+    origin = _as_origin(origin_m)
+    candidates = list(candidate_spheres)
+    shell_mask = make_surface_shell_mask(
+        esdf_grid, indices, inside_epsilon_m, surface_shell_thickness_m
+    )
+    shell_guard_enabled = (
+        enable_surface_shell_guard
+        and surface_shell_thickness_m > 0.0
+        and bool(np.any(shell_mask))
+    )
+    coverage_masks = sphere_coverage_masks(
+        indices,
+        candidates,
+        origin,
+        voxel_size_m,
+        coverage_tolerance_m,
+        max_optimization_matrix_elements,
+    )
+    if coverage_masks is None:
+        baseline_volume, covered = calculate_component_coverage(
+            indices, candidates, origin, voxel_size_m, coverage_tolerance_m
+        )
+        baseline_shell = calculate_mask_coverage(covered, shell_mask)
+        return candidates, baseline_volume, baseline_shell, covered, False
+
+    baseline_covered = (
+        np.any(coverage_masks, axis=0)
+        if len(candidates)
+        else np.zeros(len(indices), dtype=bool)
+    )
+    baseline_volume = calculate_mask_coverage(baseline_covered)
+    baseline_shell = calculate_mask_coverage(baseline_covered, shell_mask)
+    required_shell_coverage = max(
+        0.0,
+        min(target_shell_coverage, baseline_shell)
+        - shell_coverage_loss_tolerance,
+    )
+    component_index_set = {
+        tuple(int(value) for value in index) for index in indices
+    }
+    valid_candidates = np.asarray([
+        _sphere_is_esdf_valid(
+            sphere,
+            esdf_grid,
+            component_index_set,
+            origin,
+            voxel_size_m,
+            inside_epsilon_m,
+            component_id,
+        )
+        for sphere in candidates
+    ], dtype=bool)
+    if baseline_volume + 1e-12 < target_coverage or not np.all(valid_candidates):
+        return (
+            candidates,
+            baseline_volume,
+            baseline_shell,
+            baseline_covered,
+            False,
+        )
+
+    selected = list(range(len(candidates)))
+    if enable_single_sphere_replacement:
+        single = select_best_single_sphere(
+            candidates,
+            coverage_masks,
+            shell_mask,
+            target_coverage,
+            required_shell_coverage,
+            shell_guard_enabled,
+            valid_candidates,
+        )
+        if single is not None:
+            selected = [single]
+    if len(selected) != 1 and enable_greedy_set_cover:
+        greedy = greedy_set_cover_spheres(
+            candidates,
+            coverage_masks,
+            shell_mask,
+            target_coverage,
+            required_shell_coverage,
+            shell_guard_enabled,
+            valid_candidates,
+        )
+        if greedy is not None:
+            selected = greedy
+    if enable_general_coverage_pruning:
+        selected = general_coverage_pruning(
+            candidates,
+            coverage_masks,
+            shell_mask,
+            selected,
+            target_coverage,
+            required_shell_coverage,
+            shell_guard_enabled,
+        )
+
+    final_covered = (
+        np.any(coverage_masks[selected], axis=0)
+        if selected
+        else np.zeros(len(indices), dtype=bool)
+    )
+    final_volume = calculate_mask_coverage(final_covered)
+    final_shell = calculate_mask_coverage(final_covered, shell_mask)
+    if (
+        final_volume + 1e-12 < target_coverage
+        or (
+            shell_guard_enabled
+            and final_shell + 1e-12 < required_shell_coverage
+        )
+    ):
+        return (
+            candidates,
+            baseline_volume,
+            baseline_shell,
+            baseline_covered,
+            False,
+        )
+    return (
+        [candidates[index] for index in selected],
+        final_volume,
+        final_shell,
+        final_covered,
+        True,
+    )
+
+
+def _validate_optimization_parameters(
+    surface_shell_thickness_m: float,
+    target_shell_coverage: float,
+    shell_coverage_loss_tolerance: float,
+    max_optimization_matrix_elements: int,
+) -> None:
+    if surface_shell_thickness_m < 0.0:
+        raise ValueError("surface_shell_thickness_m must be non-negative")
+    if not 0.0 <= target_shell_coverage <= 1.0:
+        raise ValueError("target_shell_coverage must be in [0, 1]")
+    if not 0.0 <= shell_coverage_loss_tolerance <= 1.0:
+        raise ValueError("shell_coverage_loss_tolerance must be in [0, 1]")
+    if max_optimization_matrix_elements <= 0:
+        raise ValueError("max_optimization_matrix_elements must be positive")
+
+
+
 def generate_medial_spheres(
     esdf_grid: np.ndarray,
     origin_m: Sequence[float],
@@ -499,6 +915,14 @@ def generate_medial_spheres(
     max_spheres_per_component: int = 128,
     max_iterations_per_component: int = 256,
     max_total_spheres: int = 256,
+    enable_single_sphere_replacement: bool = True,
+    enable_greedy_set_cover: bool = True,
+    enable_general_coverage_pruning: bool = True,
+    enable_surface_shell_guard: bool = True,
+    surface_shell_thickness_m: float = 0.10,
+    target_shell_coverage: float = 0.98,
+    shell_coverage_loss_tolerance: float = 0.005,
+    max_optimization_matrix_elements: int = 20000000,
 ) -> GenerationResult:
     """Run the complete component-wise signed-ESDF sphere algorithm.
 
@@ -515,6 +939,12 @@ def generate_medial_spheres(
         raise ValueError("esdf_grid must be 3D and voxel_size_m must be positive")
     if min_component_voxels < 1 or max_total_spheres < 0:
         raise ValueError("min_component_voxels must be positive and total cap non-negative")
+    _validate_optimization_parameters(
+        surface_shell_thickness_m,
+        target_shell_coverage,
+        shell_coverage_loss_tolerance,
+        max_optimization_matrix_elements,
+    )
 
     inside_mask = extract_inside_mask(
         values, unobserved_distance_value, inside_epsilon_m
@@ -561,22 +991,54 @@ def generate_medial_spheres(
             max_iterations_per_component,
             component_id,
         )
-        spheres, coverage = remove_redundant_spheres(
-            component_indices,
-            spheres,
-            origin,
-            voxel_size_m,
-            target_coverage,
-            coverage_tolerance_m,
-            redundancy_tolerance_m,
+        candidate_pool = list(spheres)
+        optimization_enabled = (
+            enable_single_sphere_replacement
+            or enable_greedy_set_cover
+            or enable_general_coverage_pruning
         )
-        uncovered = find_uncovered_voxels(
-            component_indices,
-            spheres,
-            origin,
-            voxel_size_m,
-            coverage_tolerance_m,
+        matrix_too_large = (
+            len(candidate_pool) * len(component_indices)
+            > max_optimization_matrix_elements
         )
+        if not optimization_enabled or matrix_too_large:
+            spheres, coverage = remove_redundant_spheres(
+                component_indices,
+                candidate_pool,
+                origin,
+                voxel_size_m,
+                target_coverage,
+                coverage_tolerance_m,
+                redundancy_tolerance_m,
+            )
+            uncovered = find_uncovered_voxels(
+                component_indices,
+                spheres,
+                origin,
+                voxel_size_m,
+                coverage_tolerance_m,
+            )
+        else:
+            spheres, coverage, _, covered, _ = optimize_component_spheres(
+                values,
+                component_indices,
+                candidate_pool,
+                origin,
+                voxel_size_m,
+                inside_epsilon_m,
+                target_coverage,
+                coverage_tolerance_m,
+                enable_single_sphere_replacement,
+                enable_greedy_set_cover,
+                enable_general_coverage_pruning,
+                enable_surface_shell_guard,
+                surface_shell_thickness_m,
+                target_shell_coverage,
+                shell_coverage_loss_tolerance,
+                max_optimization_matrix_elements,
+                component_id,
+            )
+            uncovered = component_indices[~covered]
         results.append(
             ComponentResult(
                 component_id=component_id,

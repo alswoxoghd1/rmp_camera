@@ -98,6 +98,9 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_min_useful_adaptive_radius_m": 0.075,
             "dynamic_enable_fixed_radius_fallback": True,
             "dynamic_fixed_radius_m": 0.10,
+            "dynamic_enable_greedy_set_cover": True,
+            "dynamic_enable_single_sphere_replacement": True,
+            "dynamic_single_sphere_max_radius_m": 0.18,
             "dynamic_target_coverage": 0.95,
             "dynamic_coverage_tolerance_m": 0.02,
             "dynamic_safety_margin_m": 0.015,
@@ -131,6 +134,7 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_minimum_center_spacing_m", "dynamic_min_raw_radius_m",
             "dynamic_max_raw_radius_m", "dynamic_min_useful_adaptive_radius_m",
             "dynamic_fixed_radius_m", "dynamic_target_coverage",
+            "dynamic_single_sphere_max_radius_m",
             "dynamic_coverage_tolerance_m", "dynamic_safety_margin_m",
             "dynamic_redundancy_tolerance_m", "dynamic_processing_budget_ms",
             "dynamic_association_distance_m", "dynamic_smoothing_alpha",
@@ -148,6 +152,10 @@ class DynamicObstacleSphereNode(Node):
             setattr(self, name, int(self.get_parameter(name).value))
         self.dynamic_enable_fixed_radius_fallback = bool(
             self.get_parameter("dynamic_enable_fixed_radius_fallback").value)
+        self.dynamic_enable_greedy_set_cover = bool(
+            self.get_parameter("dynamic_enable_greedy_set_cover").value)
+        self.dynamic_enable_single_sphere_replacement = bool(
+            self.get_parameter("dynamic_enable_single_sphere_replacement").value)
         self.dynamic_tracking_enabled = bool(
             self.get_parameter("dynamic_tracking_enabled").value)
         self.publish_debug_clouds = bool(self.get_parameter("publish_debug_clouds").value)
@@ -168,6 +176,9 @@ class DynamicObstacleSphereNode(Node):
             min_useful_adaptive_radius_m=self.dynamic_min_useful_adaptive_radius_m,
             enable_fixed_radius_fallback=self.dynamic_enable_fixed_radius_fallback,
             fixed_radius_m=self.dynamic_fixed_radius_m,
+            enable_greedy_set_cover=self.dynamic_enable_greedy_set_cover,
+            enable_single_sphere_replacement=self.dynamic_enable_single_sphere_replacement,
+            single_sphere_max_radius_m=self.dynamic_single_sphere_max_radius_m,
             target_coverage=self.dynamic_target_coverage,
             coverage_tolerance_m=self.dynamic_coverage_tolerance_m,
             safety_margin_m=self.dynamic_safety_margin_m,

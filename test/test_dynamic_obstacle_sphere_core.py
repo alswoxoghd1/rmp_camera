@@ -4,7 +4,9 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphere,
     DynamicSphereParameters,
     DynamicSphereTracker,
+    _greedy_set_cover,
     _remove_redundant,
+    _sphere_coverage_masks,
     connected_components,
     generate_dynamic_spheres,
     voxel_centers,
@@ -27,6 +29,9 @@ def params(**overrides):
         min_useful_adaptive_radius_m=0.05,
         enable_fixed_radius_fallback=True,
         fixed_radius_m=0.14,
+        enable_greedy_set_cover=True,
+        enable_single_sphere_replacement=True,
+        single_sphere_max_radius_m=0.18,
         target_coverage=0.9,
         coverage_tolerance_m=0.02,
         safety_margin_m=0.01,
@@ -107,7 +112,9 @@ def test_small_noise_component_is_removed():
 
 def test_thin_shell_uses_fixed_radius_fallback():
     shell = [(x, y, 0) for x in range(5) for y in range(5)]
-    p = params(min_useful_adaptive_radius_m=0.25, fixed_radius_m=0.13)
+    p = params(
+        min_useful_adaptive_radius_m=0.25, fixed_radius_m=0.13,
+        enable_greedy_set_cover=False, enable_single_sphere_replacement=False)
     result = generate_dynamic_spheres(points_for(shell, p), p)
     assert result.spheres
     assert result.components[0].termination_reason == "thin_component_fallback"
@@ -163,6 +170,127 @@ def test_zero_processing_budget_uses_fallback():
     result = generate_dynamic_spheres(points_for(box(3, 3, 3), p), p)
     assert result.components[0].termination_reason == "processing_budget_fallback"
     assert result.spheres
+
+
+def test_greedy_set_cover_removes_duplicate_candidates():
+    centers = np.asarray([[float(x), 0.0, 0.0] for x in range(6)])
+    spheres = [
+        DynamicSphere(1.5, 0.0, 0.0, 1.51, 1.51),
+        DynamicSphere(1.5, 0.0, 0.0, 1.51, 1.51),
+        DynamicSphere(4.5, 0.0, 0.0, 0.51, 0.51),
+    ]
+    masks = _sphere_coverage_masks(centers, spheres, 0.0)
+    selected = _greedy_set_cover(spheres, masks, 1.0)
+    assert selected == [0, 2]
+    assert np.all(np.any(masks[selected], axis=0))
+
+
+def test_compact_thin_component_is_replaced_by_one_sphere():
+    indices = box(4, 2, 1)
+    common = dict(
+        min_useful_adaptive_radius_m=0.25,
+        fixed_radius_m=0.09,
+        target_coverage=0.9,
+        single_sphere_max_radius_m=0.18,
+    )
+    legacy_params = params(
+        **common, enable_greedy_set_cover=False,
+        enable_single_sphere_replacement=False)
+    optimized_params = params(**common)
+    before = generate_dynamic_spheres(points_for(indices, legacy_params), legacy_params)
+    after = generate_dynamic_spheres(points_for(indices, optimized_params), optimized_params)
+
+    assert len(before.spheres) > 1
+    assert len(after.spheres) == 1
+    assert after.components[0].coverage >= optimized_params.target_coverage
+    assert after.spheres[0].raw_radius <= optimized_params.single_sphere_max_radius_m
+
+
+def test_elongated_component_is_not_forced_into_one_sphere():
+    indices = box(10, 1, 1)
+    p = params(
+        min_useful_adaptive_radius_m=0.25,
+        fixed_radius_m=0.09,
+        target_coverage=0.9,
+        single_sphere_max_radius_m=0.18,
+    )
+    result = generate_dynamic_spheres(points_for(indices, p), p)
+    assert len(result.spheres) > 1
+    assert result.components[0].coverage >= p.target_coverage
+
+
+def test_optimization_features_can_be_disabled():
+    indices = box(4, 2, 1)
+    p = params(
+        min_useful_adaptive_radius_m=0.25,
+        fixed_radius_m=0.09,
+        target_coverage=0.9,
+        enable_greedy_set_cover=False,
+        enable_single_sphere_replacement=False,
+    )
+    result = generate_dynamic_spheres(points_for(indices, p), p)
+    assert result.spheres
+    assert len(result.spheres) > 1
+    assert result.components[0].termination_reason == "thin_component_fallback"
+    assert result.components[0].coverage >= p.target_coverage
+
+
+def test_optimized_generation_is_deterministic_for_reversed_input():
+    indices = box(4, 2, 1)
+    p = params(min_useful_adaptive_radius_m=0.25, fixed_radius_m=0.09)
+    points = points_for(indices, p)
+    assert signature(generate_dynamic_spheres(points, p)) == signature(
+        generate_dynamic_spheres(points[::-1], p))
+
+
+def test_output_radius_is_exactly_raw_radius_plus_safety_margin():
+    p = params(safety_margin_m=0.037)
+    result = generate_dynamic_spheres(points_for(box(5, 3, 2), p), p)
+    assert result.spheres
+    assert all(np.isclose(
+        sphere.output_radius, sphere.raw_radius + p.safety_margin_m)
+        for sphere in result.spheres)
+
+
+def test_optimization_preserves_coverage_and_uncovered_count():
+    indices = box(4, 2, 1)
+    common = dict(
+        min_useful_adaptive_radius_m=0.25,
+        fixed_radius_m=0.09,
+        target_coverage=0.9,
+    )
+    legacy_params = params(
+        **common, enable_greedy_set_cover=False,
+        enable_single_sphere_replacement=False)
+    optimized_params = params(**common)
+    before = generate_dynamic_spheres(points_for(indices, legacy_params), legacy_params)
+    after = generate_dynamic_spheres(points_for(indices, optimized_params), optimized_params)
+
+    for result, configured in (
+            (before, legacy_params), (after, optimized_params)):
+        component = result.components[0]
+        assert component.coverage >= configured.target_coverage
+        assert np.isclose(
+            component.coverage,
+            1.0 - len(component.uncovered_voxels) / len(component.voxel_centers))
+
+
+def test_single_sphere_radius_validation():
+    for invalid in (0.0, -0.1):
+        try:
+            params(single_sphere_max_radius_m=invalid).validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-positive single-sphere limit must fail")
+    try:
+        params(
+            min_raw_radius_m=0.2,
+            single_sphere_max_radius_m=0.1).validate()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("single-sphere limit below minimum raw radius must fail")
 
 
 def detection(x, radius=0.1):

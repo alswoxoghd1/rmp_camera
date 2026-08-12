@@ -131,7 +131,11 @@ class EsdfMedialSphereNode(Node):
         self.get_logger().info(
             "Dense ESDF medial sphere node started: "
             f"service={self.service_name}, frame={self.target_frame}, "
-            f"rate={self.update_rate_hz:.2f} Hz, target_coverage={self.target_coverage:.3f}"
+            f"rate={self.update_rate_hz:.2f} Hz, "
+            f"target_coverage={self.target_coverage:.3f}, "
+            f"single={self.enable_single_sphere_replacement}, "
+            f"greedy={self.enable_greedy_set_cover}, "
+            f"pruning={self.enable_general_coverage_pruning}"
         )
 
     def _declare_parameters(self):
@@ -159,6 +163,14 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("max_spheres_per_component", 128)
         self.declare_parameter("max_iterations_per_component", 256)
         self.declare_parameter("max_total_spheres", 256)
+        self.declare_parameter("enable_single_sphere_replacement", True)
+        self.declare_parameter("enable_greedy_set_cover", True)
+        self.declare_parameter("enable_general_coverage_pruning", True)
+        self.declare_parameter("enable_surface_shell_guard", True)
+        self.declare_parameter("surface_shell_thickness_m", 0.10)
+        self.declare_parameter("target_shell_coverage", 0.98)
+        self.declare_parameter("shell_coverage_loss_tolerance", 0.005)
+        self.declare_parameter("max_optimization_matrix_elements", 20000000)
         self.declare_parameter("max_grid_voxels", 8000000)
         self.declare_parameter(
             "marker_topic", "/rmp_camera/esdf_medial_sphere_markers"
@@ -196,6 +208,9 @@ class EsdfMedialSphereNode(Node):
             "min_raw_sphere_radius_m",
             "safety_margin_m",
             "redundancy_tolerance_m",
+            "surface_shell_thickness_m",
+            "target_shell_coverage",
+            "shell_coverage_loss_tolerance",
         ):
             setattr(self, name, float(self.get_parameter(name).value))
         for name in (
@@ -203,6 +218,7 @@ class EsdfMedialSphereNode(Node):
             "max_spheres_per_component",
             "max_iterations_per_component",
             "max_total_spheres",
+            "max_optimization_matrix_elements",
             "max_grid_voxels",
         ):
             setattr(self, name, int(self.get_parameter(name).value))
@@ -224,6 +240,18 @@ class EsdfMedialSphereNode(Node):
         self.visualize_esdf = self._as_bool(
             self.get_parameter("visualize_esdf").value
         )
+        self.enable_single_sphere_replacement = self._as_bool(
+            self.get_parameter("enable_single_sphere_replacement").value
+        )
+        self.enable_greedy_set_cover = self._as_bool(
+            self.get_parameter("enable_greedy_set_cover").value
+        )
+        self.enable_general_coverage_pruning = self._as_bool(
+            self.get_parameter("enable_general_coverage_pruning").value
+        )
+        self.enable_surface_shell_guard = self._as_bool(
+            self.get_parameter("enable_surface_shell_guard").value
+        )
         self.publish_debug_clouds = self._as_bool(
             self.get_parameter("publish_debug_clouds").value
         )
@@ -231,6 +259,16 @@ class EsdfMedialSphereNode(Node):
             raise ValueError("All AABB sizes must be positive")
         if not 0.0 <= self.target_coverage <= 1.0:
             raise ValueError("target_coverage must be in [0, 1]")
+        if self.surface_shell_thickness_m < 0.0:
+            raise ValueError("surface_shell_thickness_m must be non-negative")
+        if not 0.0 <= self.target_shell_coverage <= 1.0:
+            raise ValueError("target_shell_coverage must be in [0, 1]")
+        if not 0.0 <= self.shell_coverage_loss_tolerance <= 1.0:
+            raise ValueError("shell_coverage_loss_tolerance must be in [0, 1]")
+        if self.max_optimization_matrix_elements <= 0:
+            raise ValueError(
+                "max_optimization_matrix_elements must be positive"
+            )
 
     def tick(self):
         if self.pending:
@@ -312,6 +350,14 @@ class EsdfMedialSphereNode(Node):
                 max_spheres_per_component=self.max_spheres_per_component,
                 max_iterations_per_component=self.max_iterations_per_component,
                 max_total_spheres=self.max_total_spheres,
+                enable_single_sphere_replacement=self.enable_single_sphere_replacement,
+                enable_greedy_set_cover=self.enable_greedy_set_cover,
+                enable_general_coverage_pruning=self.enable_general_coverage_pruning,
+                enable_surface_shell_guard=self.enable_surface_shell_guard,
+                surface_shell_thickness_m=self.surface_shell_thickness_m,
+                target_shell_coverage=self.target_shell_coverage,
+                shell_coverage_loss_tolerance=self.shell_coverage_loss_tolerance,
+                max_optimization_matrix_elements=self.max_optimization_matrix_elements,
             )
         except Exception as exc:
             self._warn_throttled(f"ESDF medial sphere processing failed: {exc}")

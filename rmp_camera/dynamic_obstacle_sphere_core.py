@@ -30,6 +30,9 @@ class DynamicSphereParameters:
     min_useful_adaptive_radius_m: float = 0.075
     enable_fixed_radius_fallback: bool = True
     fixed_radius_m: float = 0.10
+    enable_greedy_set_cover: bool = True
+    enable_single_sphere_replacement: bool = True
+    single_sphere_max_radius_m: float = 0.18
     target_coverage: float = 0.95
     coverage_tolerance_m: float = 0.02
     safety_margin_m: float = 0.015
@@ -58,6 +61,12 @@ class DynamicSphereParameters:
             raise ValueError("point and sphere limits must be positive")
         if self.min_raw_radius_m < 0.0 or self.max_raw_radius_m < self.min_raw_radius_m:
             raise ValueError("invalid raw-radius limits")
+        if self.single_sphere_max_radius_m <= 0.0:
+            raise ValueError("single_sphere_max_radius_m must be positive")
+        if self.single_sphere_max_radius_m < self.min_raw_radius_m:
+            raise ValueError(
+                "single_sphere_max_radius_m must be at least "
+                "min_raw_radius_m")
         if self.max_x_m <= self.min_x_m or self.max_y_m <= self.min_y_m:
             raise ValueError("invalid XY workspace")
         if self.max_z_m <= self.min_z_m:
@@ -256,6 +265,146 @@ def _covered_mask(points: np.ndarray, spheres: Sequence[DynamicSphere], toleranc
     return covered
 
 
+def _sphere_coverage_matrices(
+    points: np.ndarray, spheres: Sequence[DynamicSphere], tolerance: float,
+    redundancy_tolerance: float = 0.0, deadline: float | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Build standard and redundancy coverage matrices from each distance once."""
+    standard = np.zeros((len(spheres), len(points)), dtype=bool)
+    redundant = np.zeros_like(standard)
+    for index, sphere in enumerate(spheres):
+        if deadline is not None and monotonic() >= deadline:
+            return None, None
+        delta = points - sphere.center
+        distance_squared = np.einsum("ij,ij->i", delta, delta)
+        standard[index] = distance_squared <= (sphere.raw_radius + tolerance) ** 2
+        redundant[index] = distance_squared <= (
+            sphere.raw_radius + tolerance + redundancy_tolerance) ** 2
+    return standard, redundant
+
+
+def _sphere_coverage_masks(
+    points: np.ndarray, spheres: Sequence[DynamicSphere], tolerance: float,
+) -> np.ndarray:
+    """Return one reusable boolean voxel-coverage row per sphere."""
+    masks, _ = _sphere_coverage_matrices(points, spheres, tolerance)
+    assert masks is not None
+    return masks
+
+
+def _single_sphere_candidates(
+    centers: np.ndarray, spheres: Sequence[DynamicSphere],
+    params: DynamicSphereParameters, component_id: int,
+) -> list[DynamicSphere]:
+    """Create bounded centroid, AABB-center, and largest-sphere-center candidates."""
+    if len(centers) == 0:
+        return []
+
+    candidate_centers = [
+        np.mean(centers, axis=0),
+        0.5 * (np.min(centers, axis=0) + np.max(centers, axis=0)),
+    ]
+    if spheres:
+        largest = min(
+            enumerate(spheres),
+            key=lambda item: (
+                -item[1].raw_radius, item[1].x, item[1].y, item[1].z, item[0]))[1]
+        candidate_centers.append(largest.center)
+
+    # Equal centers arise frequently for symmetric components. Removing them
+    # avoids duplicate matrix rows without introducing a fuzzy spatial test.
+    unique_centers: list[np.ndarray] = []
+    seen: set[tuple[float, float, float]] = set()
+    for center in candidate_centers:
+        key = tuple(float(value) for value in center)
+        if key not in seen:
+            seen.add(key)
+            unique_centers.append(np.asarray(center, dtype=np.float64))
+
+    kth_index = max(0, int(np.ceil(params.target_coverage * len(centers))) - 1)
+    radius_cap = min(params.max_raw_radius_m, params.single_sphere_max_radius_m)
+    candidates = []
+    for center in unique_centers:
+        distances = np.linalg.norm(centers - center, axis=1)
+        required_distance = float(np.sort(distances)[kth_index])
+        raw_radius = max(
+            params.min_raw_radius_m,
+            required_distance - params.coverage_tolerance_m)
+        raw_radius = min(raw_radius, radius_cap)
+        candidates.append(DynamicSphere(
+            float(center[0]), float(center[1]), float(center[2]), raw_radius,
+            raw_radius + params.safety_margin_m, component_id))
+    return candidates
+
+
+def _best_single_sphere(
+    candidates: Sequence[DynamicSphere], coverage_masks: np.ndarray,
+    original_sphere_count: int, params: DynamicSphereParameters,
+) -> DynamicSphere | None:
+    """Return the smallest deterministic one-sphere target-coverage replacement."""
+    if original_sphere_count <= 1 or not candidates:
+        return None
+    coverage = np.mean(coverage_masks, axis=1) if coverage_masks.shape[1] else np.ones(
+        len(candidates), dtype=np.float64)
+    valid = [
+        index for index, sphere in enumerate(candidates)
+        if coverage[index] + 1e-12 >= params.target_coverage
+        and sphere.raw_radius <= params.single_sphere_max_radius_m + 1e-12
+        and sphere.raw_radius <= params.max_raw_radius_m + 1e-12
+    ]
+    if not valid:
+        return None
+    best = min(valid, key=lambda index: (
+        candidates[index].raw_radius,
+        -float(coverage[index]),
+        candidates[index].x,
+        candidates[index].y,
+        candidates[index].z,
+        index,
+    ))
+    return candidates[best]
+
+
+def _greedy_set_cover(
+    spheres: Sequence[DynamicSphere], coverage_masks: np.ndarray,
+    target_coverage: float, deadline: float | None = None,
+) -> list[int] | None:
+    """Select deterministic sphere indices that reach the requested voxel coverage."""
+    if coverage_masks.shape[0] != len(spheres):
+        raise ValueError("coverage matrix row count must match spheres")
+    num_voxels = coverage_masks.shape[1]
+    if num_voxels == 0 or target_coverage <= 0.0:
+        return []
+
+    selected: list[int] = []
+    available = np.ones(len(spheres), dtype=bool)
+    covered = np.zeros(num_voxels, dtype=bool)
+    while float(np.mean(covered)) + 1e-12 < target_coverage:
+        if deadline is not None and monotonic() >= deadline:
+            return None
+        gains = np.count_nonzero(coverage_masks & ~covered, axis=1)
+        choices = np.flatnonzero(available & (gains > 0))
+        if len(choices) == 0:
+            break
+        best = min(
+            (int(index) for index in choices),
+            key=lambda index: (
+                -int(gains[index]),
+                spheres[index].raw_radius,
+                spheres[index].x,
+                spheres[index].y,
+                spheres[index].z,
+                index,
+            ))
+        selected.append(best)
+        available[best] = False
+        covered |= coverage_masks[best]
+
+    if float(np.mean(covered)) + 1e-12 < target_coverage:
+        return None
+    return selected
+
+
 def _fixed_radius_cover(
     centers: np.ndarray, params: DynamicSphereParameters, component_id: int,
     limit: int,
@@ -281,17 +430,96 @@ def _fixed_radius_cover(
 
 def _remove_redundant(
     centers: np.ndarray, spheres: list[DynamicSphere], params: DynamicSphereParameters,
+    coverage_masks: np.ndarray | None = None,
+    redundancy_masks: np.ndarray | None = None,
+    deadline: float | None = None,
 ) -> list[DynamicSphere]:
-    kept = list(spheres)
-    for index in range(len(kept) - 1, -1, -1):
-        trial = kept[:index] + kept[index + 1:]
-        if not trial:
-            continue
-        coverage = float(np.mean(_covered_mask(
-            centers, trial, params.coverage_tolerance_m + params.redundancy_tolerance_m)))
-        if coverage + 1e-12 >= params.target_coverage:
-            kept = trial
-    return kept
+    """Delete low-unique-contribution spheres without reducing target coverage."""
+    if len(spheres) < 2 or len(centers) == 0:
+        return list(spheres)
+    if coverage_masks is None or redundancy_masks is None:
+        coverage_masks, redundancy_masks = _sphere_coverage_matrices(
+            centers, spheres, params.coverage_tolerance_m,
+            params.redundancy_tolerance_m, deadline)
+    if coverage_masks is None or redundancy_masks is None:
+        return list(spheres)
+
+    kept = list(range(len(spheres)))
+    while len(kept) > 1:
+        if deadline is not None and monotonic() >= deadline:
+            break
+        redundancy_counts = np.count_nonzero(redundancy_masks[kept], axis=0)
+        unique_contribution = {
+            index: int(np.count_nonzero(
+                redundancy_masks[index] & (redundancy_counts == 1)))
+            for index in kept
+        }
+        # Retesting after every successful deletion keeps the ordering accurate
+        # while the precomputed matrices avoid repeating distance calculations.
+        removal_order = sorted(kept, key=lambda index: (
+            unique_contribution[index],
+            spheres[index].raw_radius,
+            spheres[index].x,
+            spheres[index].y,
+            spheres[index].z,
+            index,
+        ))
+        removed = False
+        for index in removal_order:
+            trial = [candidate for candidate in kept if candidate != index]
+            if not trial:
+                continue
+            covered = np.any(coverage_masks[trial], axis=0)
+            if float(np.mean(covered)) + 1e-12 >= params.target_coverage:
+                kept = trial
+                removed = True
+                break
+        if not removed:
+            break
+    return [spheres[index] for index in kept]
+
+
+def _optimize_component_spheres(
+    centers: np.ndarray, spheres: list[DynamicSphere],
+    params: DynamicSphereParameters, component_id: int, deadline: float,
+) -> list[DynamicSphere]:
+    """Minimize candidates using one-sphere replacement, set cover, then deletion."""
+    original = list(spheres)
+    if len(original) < 2 or len(centers) == 0 or monotonic() >= deadline:
+        return original
+
+    single_candidates = []
+    if params.enable_single_sphere_replacement:
+        single_candidates = _single_sphere_candidates(
+            centers, original, params, component_id)
+    candidates = original + single_candidates
+    coverage_masks, redundancy_masks = _sphere_coverage_matrices(
+        centers, candidates, params.coverage_tolerance_m,
+        params.redundancy_tolerance_m, deadline)
+    if coverage_masks is None or redundancy_masks is None:
+        return original
+
+    if single_candidates:
+        best_single = _best_single_sphere(
+            single_candidates, coverage_masks[len(original):],
+            len(original), params)
+        if best_single is not None:
+            return [best_single]
+
+    selected_indices = list(range(len(original)))
+    if params.enable_greedy_set_cover:
+        greedy_indices = _greedy_set_cover(
+            candidates, coverage_masks, params.target_coverage, deadline)
+        # Equal/larger alternatives do not further the minimization goal and
+        # would unnecessarily perturb the legacy centers and radii.
+        if greedy_indices is not None and len(greedy_indices) < len(original):
+            selected_indices = greedy_indices
+
+    selected_spheres = [candidates[index] for index in selected_indices]
+    return _remove_redundant(
+        centers, selected_spheres, params,
+        coverage_masks[selected_indices], redundancy_masks[selected_indices],
+        deadline)
 
 
 def _component_spheres(
@@ -357,8 +585,10 @@ def _component_spheres(
             spheres.extend(fixed)
             reason = "thin_component_fallback" if not oversized else reason
             uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
-        spheres = _remove_redundant(centers, spheres, params)
-        uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+    if not budget_exceeded:
+        spheres = _optimize_component_spheres(
+            centers, spheres, params, component_id, deadline)
+    uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
     coverage = float(np.mean(~uncovered)) if len(uncovered) else 1.0
     confidence = min(1.0, coverage * min(1.0, len(centers) / max(1, params.min_component_voxels * 2)))
     spheres = [replace(s, component_coverage=coverage, confidence=confidence) for s in spheres]
