@@ -195,6 +195,13 @@
     dynamic_merge_enable_empty_space_guard: false # Optional occupancy guard; off by default.
     dynamic_merge_max_empty_fraction: 0.70   # Maximum unoccupied fraction when guard is enabled.
     dynamic_merge_max_validation_voxels: 50000 # Bound optional validation work.
+    dynamic_enable_min_k_search: true       # Explore bounded alternative merge sequences.
+    dynamic_min_k_beam_width: 8             # Retained states at each sphere-count level.
+    dynamic_min_k_max_states: 128           # Hard cap on unique child states explored.
+    dynamic_min_k_enable_overlap_constraint: true # Apply overlap threshold to final feasibility.
+    dynamic_max_allowed_overlap_fraction: 0.20 # Max smaller-sphere volume overlap.
+    dynamic_min_k_use_output_overlap: true  # Optimize collision-output rather than raw overlap.
+    dynamic_min_k_prefer_lower_overlap: true # Prefer lower-overlap states at equal K.
     dynamic_tracking_enabled: true
     dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
     dynamic_smoothing_alpha: 0.70           # 1=new measurement, 0=old track.

@@ -7,11 +7,14 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphereParameters,
     DynamicSphereTracker,
     agglomerative_merge_dynamic_spheres,
+    build_dynamic_sphere_search_state,
     _greedy_set_cover,
     _remove_redundant,
     _sphere_coverage_masks,
     connected_components,
+    dynamic_sphere_search_state_rank_key,
     generate_dynamic_spheres,
+    minimum_k_dynamic_sphere_search,
     voxel_centers,
 )
 
@@ -414,6 +417,7 @@ def test_dynamic_optional_empty_space_guard_rejects_sparse_merge():
 def test_dynamic_feature_off_keeps_pre_merge_geometry():
     common = dict(
         dynamic_enable_agglomerative_merge=False,
+        dynamic_enable_min_k_search=False,
         min_useful_adaptive_radius_m=0.25,
         fixed_radius_m=0.09,
         enable_single_sphere_replacement=False,
@@ -456,3 +460,284 @@ def test_dynamic_merge_parameter_validation():
             pass
         else:
             raise AssertionError(f"invalid merge parameters accepted: {overrides}")
+
+
+def run_min_k_search(centers, spheres, **overrides):
+    values = dict(
+        target_coverage=1.0,
+        coverage_tolerance_m=0.0,
+        dynamic_merge_max_radius_m=0.30,
+        dynamic_merge_max_radius_growth_ratio=2.0,
+        dynamic_merge_max_gap_m=0.08,
+        dynamic_min_k_enable_overlap_constraint=False,
+    )
+    values.update(overrides)
+    configured = params(**values)
+    return minimum_k_dynamic_sphere_search(
+        np.asarray(centers, dtype=np.float64),
+        spheres,
+        configured,
+        monotonic() + 1.0,
+    )
+
+
+def test_overlap_aware_state_ranking_prefers_lower_overlap_at_equal_k():
+    configured = params(dynamic_min_k_use_output_overlap=True)
+    high_overlap = build_dynamic_sphere_search_state([
+        DynamicSphere(0.0, 0.0, 0.0, 0.10, 0.11, 0),
+        DynamicSphere(0.08, 0.0, 0.0, 0.10, 0.11, 0),
+    ])
+    low_overlap = build_dynamic_sphere_search_state([
+        DynamicSphere(0.0, 0.0, 0.0, 0.10, 0.11, 0),
+        DynamicSphere(0.22, 0.0, 0.0, 0.10, 0.11, 0),
+    ])
+    assert len(high_overlap.spheres) == len(low_overlap.spheres)
+    coverage_points = np.asarray(((0.0, 0.0, 0.0),))
+    high_coverage = _sphere_coverage_masks(
+        coverage_points, high_overlap.spheres, 0.0).any(axis=0)
+    low_coverage = _sphere_coverage_masks(
+        coverage_points, low_overlap.spheres, 0.0).any(axis=0)
+    assert np.array_equal(high_coverage, low_coverage)
+    assert high_coverage.all()
+
+    assert dynamic_sphere_search_state_rank_key(
+        low_overlap, configured
+    ) < dynamic_sphere_search_state_rank_key(high_overlap, configured)
+
+
+def test_min_k_search_reduces_compact_set_and_preserves_coverage():
+    centers = np.asarray((
+        (0.0, 0.0, 0.0),
+        (0.08, 0.0, 0.0),
+        (0.16, 0.0, 0.0),
+    ))
+    spheres = [merge_dynamic_sphere(x) for x in (0.0, 0.08, 0.16)]
+    before = _sphere_coverage_masks(centers, spheres, 0.0).any(axis=0)
+    result = run_min_k_search(centers, spheres)
+    after = _sphere_coverage_masks(
+        centers, result.spheres, 0.0).any(axis=0)
+    assert len(result.spheres) == 1
+    assert np.count_nonzero(after) >= np.count_nonzero(before)
+    assert result.overlap_constraint_satisfied
+
+
+def test_bounded_search_escapes_greedy_merge_order_trap():
+    coordinates = (
+        0.0,
+        0.1441209636081885,
+        0.2344194989337105,
+        0.3537910818681569,
+    )
+    radii = (
+        0.07167951434830674,
+        0.09462533464404828,
+        0.0821887855824767,
+        0.06762221353458232,
+    )
+    centers = np.asarray([(x, 0.0, 0.0) for x in coordinates])
+    spheres = [
+        DynamicSphere(x, 0.0, 0.0, radius, radius + 0.01, 0)
+        for x, radius in zip(coordinates, radii)
+    ]
+    configured = params(
+        target_coverage=1.0,
+        coverage_tolerance_m=0.0,
+        dynamic_merge_max_radius_m=0.17680082144659784,
+        dynamic_merge_max_radius_growth_ratio=1.6856652026068732,
+        dynamic_merge_max_gap_m=0.058939303977189085,
+        dynamic_min_k_enable_overlap_constraint=False,
+    )
+    greedy = agglomerative_merge_dynamic_spheres(
+        centers, spheres, configured, monotonic() + 1.0)
+    bounded = minimum_k_dynamic_sphere_search(
+        centers, spheres, configured, monotonic() + 1.0)
+    assert len(greedy) == 3
+    assert len(bounded.spheres) == 2
+    assert len(bounded.spheres) < len(greedy)
+
+
+def triangle_spheres(side):
+    coordinates = (
+        (0.0, 0.0, 0.0),
+        (side, 0.0, 0.0),
+        (0.5 * side, np.sqrt(3.0) * 0.5 * side, 0.0),
+    )
+    spheres = [
+        DynamicSphere(x, y, z, 0.10, 0.11, 0)
+        for x, y, z in coordinates
+    ]
+    return np.asarray(coordinates), spheres
+
+
+def test_overlap_constraint_keeps_more_spheres_when_smaller_k_is_unsafe():
+    centers, spheres = triangle_spheres(0.22)
+    common = dict(
+        dynamic_merge_max_radius_m=0.22,
+        dynamic_merge_max_radius_growth_ratio=3.0,
+        dynamic_merge_max_gap_m=0.05,
+        dynamic_min_k_use_output_overlap=False,
+    )
+    unconstrained = run_min_k_search(
+        centers,
+        spheres,
+        **common,
+        dynamic_min_k_enable_overlap_constraint=False,
+    )
+    constrained = run_min_k_search(
+        centers,
+        spheres,
+        **common,
+        dynamic_min_k_enable_overlap_constraint=True,
+        dynamic_max_allowed_overlap_fraction=0.05,
+    )
+    assert len(unconstrained.spheres) == 2
+    assert unconstrained.state.max_raw_overlap_fraction > 0.05
+    assert len(constrained.spheres) == 3
+    assert constrained.state.max_raw_overlap_fraction <= 0.05
+    assert constrained.overlap_constraint_satisfied
+
+
+def test_impossible_overlap_constraint_returns_lowest_violation_fallback():
+    centers, spheres = triangle_spheres(0.18)
+    before = _sphere_coverage_masks(centers, spheres, 0.0).any(axis=0)
+    result = run_min_k_search(
+        centers,
+        spheres,
+        dynamic_merge_max_radius_m=0.20,
+        dynamic_merge_max_radius_growth_ratio=3.0,
+        dynamic_merge_max_gap_m=0.05,
+        dynamic_min_k_use_output_overlap=False,
+        dynamic_min_k_enable_overlap_constraint=True,
+        dynamic_max_allowed_overlap_fraction=0.0,
+    )
+    after = _sphere_coverage_masks(
+        centers, result.spheres, 0.0).any(axis=0)
+    assert result.spheres
+    assert np.count_nonzero(after) >= np.count_nonzero(before)
+    assert not result.overlap_constraint_satisfied
+    assert result.termination_reason == "overlap_constraint_unmet"
+    assert len(result.spheres) == 3
+
+
+def test_min_k_expired_deadline_returns_valid_coverage_fallback():
+    centers = np.asarray((
+        (0.0, 0.0, 0.0),
+        (0.08, 0.0, 0.0),
+        (0.16, 0.0, 0.0),
+    ))
+    spheres = [merge_dynamic_sphere(x) for x in (0.0, 0.08, 0.16)]
+    configured = params(
+        target_coverage=1.0,
+        coverage_tolerance_m=0.0,
+        dynamic_min_k_enable_overlap_constraint=False,
+    )
+    before = _sphere_coverage_masks(centers, spheres, 0.0).any(axis=0)
+    result = minimum_k_dynamic_sphere_search(
+        centers, spheres, configured, monotonic())
+    after = _sphere_coverage_masks(
+        centers, result.spheres, 0.0).any(axis=0)
+    assert result.termination_reason == "deadline"
+    assert result.states_explored == 0
+    assert np.count_nonzero(after) >= np.count_nonzero(before)
+
+
+def test_min_k_max_states_is_a_hard_bound():
+    coordinates = (0.0, 0.08, 0.16, 0.24)
+    centers = np.asarray([(x, 0.0, 0.0) for x in coordinates])
+    spheres = [merge_dynamic_sphere(x) for x in coordinates]
+    result = run_min_k_search(
+        centers,
+        spheres,
+        dynamic_min_k_max_states=1,
+    )
+    assert result.states_explored == 1
+    assert result.termination_reason == "max_states"
+
+
+def test_min_k_search_is_deterministic_for_reversed_sphere_order():
+    coordinates = (0.0, 0.08, 0.16, 0.24)
+    centers = np.asarray([(x, 0.0, 0.0) for x in coordinates])
+    spheres = [merge_dynamic_sphere(x) for x in coordinates]
+    forward = run_min_k_search(centers, spheres)
+    reversed_result = run_min_k_search(centers, spheres[::-1])
+    assert (
+        forward.state.canonical_signature
+        == reversed_result.state.canonical_signature
+    )
+    assert np.isclose(
+        forward.state.max_output_overlap_fraction,
+        reversed_result.state.max_output_overlap_fraction,
+    )
+    assert np.isclose(
+        forward.state.total_output_overlap,
+        reversed_result.state.total_output_overlap,
+    )
+
+
+def test_min_k_elongated_set_respects_existing_radius_guard():
+    coordinates = tuple(0.08 * index for index in range(6))
+    centers = np.asarray([(x, 0.0, 0.0) for x in coordinates])
+    spheres = [merge_dynamic_sphere(x, 0.08) for x in coordinates]
+    result = run_min_k_search(
+        centers,
+        spheres,
+        dynamic_merge_max_radius_m=0.20,
+    )
+    assert 1 < len(result.spheres) < len(spheres)
+    assert max(
+        sphere.raw_radius for sphere in result.spheres
+    ) <= 0.20 + 1e-12
+
+
+def test_min_k_parameter_validation():
+    for overrides in (
+        {"dynamic_min_k_beam_width": 0},
+        {"dynamic_min_k_max_states": 0},
+        {"dynamic_max_allowed_overlap_fraction": -0.01},
+        {"dynamic_max_allowed_overlap_fraction": 1.01},
+    ):
+        try:
+            params(**overrides).validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid min-k parameters accepted: {overrides}")
+
+
+def test_min_k_generation_is_deterministic_for_shuffled_points():
+    configured = params(processing_budget_ms=1000.0)
+    points = points_for(box(6, 4, 2), configured)
+    shuffled = points.copy()
+    np.random.default_rng(2026).shuffle(shuffled)
+    results = (
+        generate_dynamic_spheres(points, configured),
+        generate_dynamic_spheres(points[::-1], configured),
+        generate_dynamic_spheres(shuffled, configured),
+    )
+    assert signature(results[0]) == signature(results[1]) == signature(results[2])
+    metrics = [
+        (
+            result.components[0].max_raw_overlap_fraction,
+            result.components[0].max_output_overlap_fraction,
+            result.components[0].total_raw_overlap,
+            result.components[0].total_output_overlap,
+        )
+        for result in results
+    ]
+    assert np.allclose(metrics[0], metrics[1])
+    assert np.allclose(metrics[0], metrics[2])
+
+
+def test_min_k_search_reuses_optional_empty_space_guard():
+    centers = np.asarray(((0.0, 0.0, 0.0), (0.08, 0.0, 0.0)))
+    spheres = [merge_dynamic_sphere(0.0), merge_dynamic_sphere(0.08)]
+    unguarded = run_min_k_search(centers, spheres)
+    guarded = run_min_k_search(
+        centers,
+        spheres,
+        dynamic_merge_enable_empty_space_guard=True,
+        dynamic_merge_max_empty_fraction=0.10,
+    )
+    assert len(unguarded.spheres) == 1
+    assert len(guarded.spheres) == 2

@@ -76,7 +76,10 @@ class DynamicObstacleSphereNode(Node):
             f"merge_radius<={self.dynamic_merge_max_radius_m:.3f} m, "
             f"merge_growth<={self.dynamic_merge_max_radius_growth_ratio:.3f}, "
             f"merge_gap<={self.dynamic_merge_max_gap_m:.3f} m, "
-            f"empty_guard={self.dynamic_merge_enable_empty_space_guard}")
+            f"empty_guard={self.dynamic_merge_enable_empty_space_guard}, "
+            f"min_k={self.dynamic_enable_min_k_search}, "
+            f"beam={self.dynamic_min_k_beam_width}, "
+            f"max_states={self.dynamic_min_k_max_states}")
 
     def _declare_parameters(self):
         defaults = {
@@ -123,6 +126,13 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_merge_enable_empty_space_guard": False,
             "dynamic_merge_max_empty_fraction": 0.70,
             "dynamic_merge_max_validation_voxels": 50000,
+            "dynamic_enable_min_k_search": True,
+            "dynamic_min_k_beam_width": 8,
+            "dynamic_min_k_max_states": 128,
+            "dynamic_min_k_enable_overlap_constraint": True,
+            "dynamic_max_allowed_overlap_fraction": 0.20,
+            "dynamic_min_k_use_output_overlap": True,
+            "dynamic_min_k_prefer_lower_overlap": True,
             "dynamic_tracking_enabled": True,
             "dynamic_association_distance_m": 0.20,
             "dynamic_smoothing_alpha": 0.55,
@@ -153,7 +163,8 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_association_distance_m", "dynamic_smoothing_alpha",
             "dynamic_sphere_ttl_sec", "dynamic_update_rate_hz",
             "dynamic_merge_max_radius_m", "dynamic_merge_max_radius_growth_ratio",
-            "dynamic_merge_max_gap_m", "dynamic_merge_max_empty_fraction")
+            "dynamic_merge_max_gap_m", "dynamic_merge_max_empty_fraction",
+            "dynamic_max_allowed_overlap_fraction")
         for name in float_names:
             setattr(self, name, float(self.get_parameter(name).value))
         int_names = (
@@ -163,7 +174,8 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_max_spheres_per_component", "dynamic_max_iterations_per_component",
             "dynamic_max_total_spheres", "dynamic_max_local_grid_voxels",
             "dynamic_max_missed_updates",
-            "dynamic_merge_max_validation_voxels")
+            "dynamic_merge_max_validation_voxels",
+            "dynamic_min_k_beam_width", "dynamic_min_k_max_states")
         for name in int_names:
             setattr(self, name, int(self.get_parameter(name).value))
         self.dynamic_enable_fixed_radius_fallback = bool(
@@ -176,6 +188,15 @@ class DynamicObstacleSphereNode(Node):
             self.get_parameter("dynamic_enable_agglomerative_merge").value)
         self.dynamic_merge_enable_empty_space_guard = bool(
             self.get_parameter("dynamic_merge_enable_empty_space_guard").value)
+        self.dynamic_enable_min_k_search = bool(
+            self.get_parameter("dynamic_enable_min_k_search").value)
+        self.dynamic_min_k_enable_overlap_constraint = bool(
+            self.get_parameter(
+                "dynamic_min_k_enable_overlap_constraint").value)
+        self.dynamic_min_k_use_output_overlap = bool(
+            self.get_parameter("dynamic_min_k_use_output_overlap").value)
+        self.dynamic_min_k_prefer_lower_overlap = bool(
+            self.get_parameter("dynamic_min_k_prefer_lower_overlap").value)
         self.dynamic_tracking_enabled = bool(
             self.get_parameter("dynamic_tracking_enabled").value)
         self.publish_debug_clouds = bool(self.get_parameter("publish_debug_clouds").value)
@@ -215,6 +236,15 @@ class DynamicObstacleSphereNode(Node):
             dynamic_merge_enable_empty_space_guard=self.dynamic_merge_enable_empty_space_guard,
             dynamic_merge_max_empty_fraction=self.dynamic_merge_max_empty_fraction,
             dynamic_merge_max_validation_voxels=self.dynamic_merge_max_validation_voxels,
+            dynamic_enable_min_k_search=self.dynamic_enable_min_k_search,
+            dynamic_min_k_beam_width=self.dynamic_min_k_beam_width,
+            dynamic_min_k_max_states=self.dynamic_min_k_max_states,
+            dynamic_max_allowed_overlap_fraction=(
+                self.dynamic_max_allowed_overlap_fraction),
+            dynamic_min_k_use_output_overlap=self.dynamic_min_k_use_output_overlap,
+            dynamic_min_k_enable_overlap_constraint=(
+                self.dynamic_min_k_enable_overlap_constraint),
+            dynamic_min_k_prefer_lower_overlap=self.dynamic_min_k_prefer_lower_overlap,
             min_x_m=self.min_x_m, max_x_m=self.max_x_m,
             min_y_m=self.min_y_m, max_y_m=self.max_y_m,
             min_z_m=self.min_z_m, max_z_m=self.max_z_m,
@@ -269,11 +299,44 @@ class DynamicObstacleSphereNode(Node):
             self._publish_xyz_cloud(self.uncovered_pub, stamp, result.uncovered_voxels)
         coverage = 1.0 - len(result.uncovered_voxels) / max(
             1, len(result.voxel_centers))
+        pre_merge_count = sum(
+            component.pre_merge_sphere_count
+            for component in result.components)
+        agglomerative_count = sum(
+            component.agglomerative_sphere_count
+            for component in result.components)
+        min_k_count = sum(
+            component.min_k_sphere_count
+            for component in result.components)
+        max_raw_overlap = max(
+            (component.max_raw_overlap_fraction
+             for component in result.components),
+            default=0.0)
+        max_output_overlap = max(
+            (component.max_output_overlap_fraction
+             for component in result.components),
+            default=0.0)
+        min_k_states = sum(
+            component.min_k_states_explored
+            for component in result.components)
+        min_k_reason = ",".join(sorted({
+            component.min_k_search_termination
+            for component in result.components
+        })) or "not_needed"
+        overlap_constraint_ok = all(
+            component.overlap_constraint_satisfied
+            for component in result.components)
         self._info_throttled(
             f"dynamic points={len(points)}, voxels={len(result.voxel_centers)}, "
-            f"pre_merge_spheres={sum(c.pre_merge_sphere_count for c in result.components)}, "
+            f"pre_merge_spheres={pre_merge_count}, "
+            f"agglomerative_spheres={agglomerative_count}, "
+            f"min_k_spheres={min_k_count}, "
             f"generated_spheres={len(result.spheres)}, "
             f"tracked_spheres={len(spheres)}, "
+            f"max_raw_overlap={max_raw_overlap:.3f}, "
+            f"max_output_overlap={max_output_overlap:.3f}, "
+            f"min_k_states={min_k_states}, min_k_reason={min_k_reason}, "
+            f"overlap_constraint_ok={overlap_constraint_ok}, "
             f"coverage={coverage:.3f}, uncovered={len(result.uncovered_voxels)}, "
             f"core={result.elapsed_ms:.1f} ms")
 
