@@ -74,6 +74,40 @@ Run with the installed default YAML:
 ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py
 ```
 
+Enable the depth-aware robot self-filter in live-camera mode:
+
+```bash
+ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py \
+  run_robot_self_filter:=true
+```
+
+This starts the measured RB10 joint source by default, builds the configured
+URDF collision spheres at the joint timestamp, renders their nearest camera-Z
+surface, and removes a depth pixel only when its measured depth matches that
+surface. Measurements clearly in front of the robot are preserved. Disable
+`run_rb10_joint_state_source` when an external node already publishes
+`/rmp_camera/joint_states_urdf`.
+
+Self-filter debug outputs:
+
+- predicted robot surface: `/rmp_camera/robot_predicted_depth/image_rect_raw`
+- removed measured points: `/rmp_camera/robot_depth_mask_removed_points`
+- filtered Nvblox input: `/rmp_camera/robot_surface_filtered_depth/image_rect_raw`
+
+Record a repeatable live input bag for self-filter/Nvblox regression tests:
+
+```bash
+ros2 launch rmp_camera record_nvblox_validation_bag.launch.py
+```
+
+The command starts the live D435/RB10 pipeline by default and records splitter
+depth, camera calibration, measured/normalized joints, robot collision markers,
+and TF under `~/bags/nvblox_validation`. Stop it with `Ctrl+C`.
+Use `start_pipeline:=false` when the live pipeline is already running.
+
+Bag self-filtering requires time-aligned joint states or recorded collision
+sphere markers. A depth-only bag cannot reconstruct a moving robot pose.
+
 Or pass an edited copy explicitly:
 
 ```bash

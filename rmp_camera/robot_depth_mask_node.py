@@ -11,6 +11,10 @@ from sensor_msgs_py import point_cloud2
 import tf2_ros
 from visualization_msgs.msg import MarkerArray
 
+from rmp_camera.robot_depth_filter_core import (
+    predict_sphere_surface_depth,
+    surface_depth_removal_mask,
+)
 from rmp_camera.vision_geometry import marker_spheres, transform_to_matrix
 
 
@@ -20,11 +24,23 @@ class RobotDepthMaskNode(Node):
 
         self.declare_parameter("input_depth_topic", "/camera0/camera/depth/image_rect_raw")
         self.declare_parameter("camera_info_topic", "/camera0/camera/depth/camera_info")
-        self.declare_parameter("robot_sphere_marker_topic", "/rmp_camera/robot_collision_sphere_markers")
-        self.declare_parameter("output_depth_topic", "/rmp_camera/robot_masked_depth/image_rect_raw")
-        self.declare_parameter("removed_points_topic", "/rmp_camera/robot_depth_mask_removed_points")
+        self.declare_parameter(
+            "robot_sphere_marker_topic",
+            "/rmp_camera/robot_collision_sphere_markers",
+        )
+        self.declare_parameter(
+            "output_depth_topic", "/rmp_camera/robot_masked_depth/image_rect_raw")
+        self.declare_parameter(
+            "predicted_depth_topic", "/rmp_camera/robot_predicted_depth/image_rect_raw")
+        self.declare_parameter(
+            "removed_points_topic", "/rmp_camera/robot_depth_mask_removed_points")
         self.declare_parameter("publish_removed_points", True)
+        self.declare_parameter("publish_predicted_depth", True)
+        self.declare_parameter("filter_mode", "volume")
         self.declare_parameter("robot_margin_m", 0.05)
+        self.declare_parameter("surface_front_tolerance_m", 0.02)
+        self.declare_parameter("surface_back_tolerance_m", 0.03)
+        self.declare_parameter("mask_shadow_behind_robot", False)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 5.0)
         self.declare_parameter("max_rate_hz", 15.0)
@@ -39,9 +55,22 @@ class RobotDepthMaskNode(Node):
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         self.robot_sphere_marker_topic = self.get_parameter("robot_sphere_marker_topic").value
         self.output_depth_topic = self.get_parameter("output_depth_topic").value
+        self.predicted_depth_topic = self.get_parameter("predicted_depth_topic").value
         self.removed_points_topic = self.get_parameter("removed_points_topic").value
         self.publish_removed_points = bool(self.get_parameter("publish_removed_points").value)
+        self.publish_predicted_depth = bool(
+            self.get_parameter("publish_predicted_depth").value)
+        self.filter_mode = str(self.get_parameter("filter_mode").value).strip().lower()
+        if self.filter_mode not in ("volume", "surface_depth"):
+            raise ValueError(
+                "filter_mode must be either 'volume' or 'surface_depth'")
         self.robot_margin_m = float(self.get_parameter("robot_margin_m").value)
+        self.surface_front_tolerance_m = float(
+            self.get_parameter("surface_front_tolerance_m").value)
+        self.surface_back_tolerance_m = float(
+            self.get_parameter("surface_back_tolerance_m").value)
+        self.mask_shadow_behind_robot = bool(
+            self.get_parameter("mask_shadow_behind_robot").value)
         self.min_depth_m = float(self.get_parameter("min_depth_m").value)
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
         self.max_rate_hz = float(self.get_parameter("max_rate_hz").value)
@@ -96,6 +125,8 @@ class RobotDepthMaskNode(Node):
             sensor_qos,
         )
         self.depth_pub = self.create_publisher(Image, self.output_depth_topic, sensor_qos)
+        self.predicted_depth_pub = self.create_publisher(
+            Image, self.predicted_depth_topic, sensor_qos)
         self.removed_points_pub = self.create_publisher(
             PointCloud2,
             self.removed_points_topic,
@@ -105,7 +136,10 @@ class RobotDepthMaskNode(Node):
         self.get_logger().info(
             "Robot depth mask started: "
             f"{self.input_depth_topic} -> {self.output_depth_topic}, "
-            f"camera_info={self.camera_info_topic}, robot_margin={self.robot_margin_m:.3f} m, "
+            f"mode={self.filter_mode}, camera_info={self.camera_info_topic}, "
+            f"robot_margin={self.robot_margin_m:.3f} m, "
+            f"surface_band=[-{self.surface_front_tolerance_m:.3f}, "
+            f"+{self.surface_back_tolerance_m:.3f}] m, "
             f"removed_points={self.removed_points_topic if self.publish_removed_points else 'off'}"
         )
 
@@ -134,7 +168,8 @@ class RobotDepthMaskNode(Node):
         robot_markers = self.select_robot_markers(msg.header.stamp)
         if robot_markers is None or not robot_markers.markers:
             self.log_throttled(
-                "Waiting for robot collision sphere markers; publishing unmasked depth.",
+                "Waiting for robot collision sphere markers; "
+                + self.unavailable_depth_action(),
                 warn=True,
             )
             self.publish_passthrough_if_allowed(msg)
@@ -169,14 +204,18 @@ class RobotDepthMaskNode(Node):
 
         fx, fy, cx, cy = self.camera_intrinsics(self.latest_camera_info)
         if fx <= 0.0 or fy <= 0.0:
-            self.log_throttled("Invalid camera intrinsics; publishing unmasked depth.", warn=True)
+            self.log_throttled(
+                "Invalid camera intrinsics; " + self.unavailable_depth_action(),
+                warn=True,
+            )
             self.publish_passthrough_if_allowed(msg)
             return
 
         centers_base, radii, _ = marker_spheres(robot_markers)
         if len(centers_base) == 0:
             self.log_throttled(
-                "Robot marker array has no sphere markers; publishing unmasked depth.",
+                "Robot marker array has no sphere markers; "
+                + self.unavailable_depth_action(),
                 warn=True,
             )
             self.publish_passthrough_if_allowed(msg)
@@ -188,18 +227,43 @@ class RobotDepthMaskNode(Node):
             @ np.c_[centers_base, np.ones(len(centers_base), dtype=np.float64)].T
         ).T[:, :3]
         expanded_radii = radii + self.robot_margin_m
-
-        masked_depth, removed_mask = self.mask_depth(
-            depth_array,
-            centers_depth,
-            expanded_radii,
-            fx,
-            fy,
-            cx,
-            cy,
-            depth_scale_m,
-            invalid_value,
-        )
+        predicted_depth = None
+        if self.filter_mode == "surface_depth":
+            predicted_depth = predict_sphere_surface_depth(
+                depth_array.shape,
+                centers_depth,
+                expanded_radii,
+                fx,
+                fy,
+                cx,
+                cy,
+                min_depth_m=self.min_depth_m,
+                max_depth_m=self.max_depth_m,
+            )
+            measured_depth_m = depth_array.astype(np.float32) * depth_scale_m
+            removed_mask = surface_depth_removal_mask(
+                measured_depth_m,
+                predicted_depth,
+                self.surface_front_tolerance_m,
+                self.surface_back_tolerance_m,
+                min_depth_m=self.min_depth_m,
+                max_depth_m=self.max_depth_m,
+                mask_shadow_behind_robot=self.mask_shadow_behind_robot,
+            )
+            masked_depth = depth_array.copy()
+            masked_depth[removed_mask] = invalid_value
+        else:
+            masked_depth, removed_mask = self.mask_depth(
+                depth_array,
+                centers_depth,
+                expanded_radii,
+                fx,
+                fy,
+                cx,
+                cy,
+                depth_scale_m,
+                invalid_value,
+            )
         removed_pixels = int(np.count_nonzero(removed_mask))
         full_array[:, : msg.width] = masked_depth
 
@@ -212,6 +276,8 @@ class RobotDepthMaskNode(Node):
         output.step = msg.step
         output.data = full_array.tobytes()
         self.depth_pub.publish(output)
+        if self.publish_predicted_depth and predicted_depth is not None:
+            self.publish_robot_predicted_depth(msg.header, predicted_depth)
         if self.publish_removed_points:
             self.publish_removed_pointcloud(
                 msg.header,
@@ -233,6 +299,11 @@ class RobotDepthMaskNode(Node):
     def publish_passthrough_if_allowed(self, msg):
         if self.passthrough_on_missing_robot:
             self.depth_pub.publish(msg)
+
+    def unavailable_depth_action(self):
+        if self.passthrough_on_missing_robot:
+            return "publishing unmasked depth."
+        return "dropping depth frame."
 
     def depth_image_to_array(self, msg):
         dtype, scale_m, invalid_value = self.encoding_info(msg.encoding, msg.is_bigendian)
@@ -301,12 +372,20 @@ class RobotDepthMaskNode(Node):
             key=lambda item: abs(item[0] - target_ns),
         )
         delta_ns = abs(best_stamp_ns - target_ns)
-        if self.robot_marker_max_stamp_delta_ns > 0 and delta_ns > self.robot_marker_max_stamp_delta_ns:
+        if (
+            self.robot_marker_max_stamp_delta_ns > 0
+            and delta_ns > self.robot_marker_max_stamp_delta_ns
+        ):
             delta_s = delta_ns / 1e9
+            action = (
+                "Using latest marker fallback."
+                if self.fallback_to_latest_marker_on_time_miss
+                else "Skipping frame."
+            )
             self.log_throttled(
                 "No close time-synchronized robot markers for depth mask: "
                 f"delta={delta_s:.3f}s. "
-                f"{'Using latest marker fallback.' if self.fallback_to_latest_marker_on_time_miss else 'Skipping frame.'}",
+                + action,
                 warn=True,
             )
             if self.fallback_to_latest_marker_on_time_miss:
@@ -396,6 +475,20 @@ class RobotDepthMaskNode(Node):
             removed_mask_total[v_min:v_max, u_min:u_max] |= inside
 
         return masked, removed_mask_total
+
+    def publish_robot_predicted_depth(self, header, predicted_depth):
+        """Publish the rendered robot front surface as a 32FC1 depth image."""
+        visualization = np.asarray(predicted_depth, dtype=np.float32).copy()
+        visualization[~np.isfinite(visualization)] = 0.0
+        output = Image()
+        output.header = header
+        output.height = int(visualization.shape[0])
+        output.width = int(visualization.shape[1])
+        output.encoding = "32FC1"
+        output.is_bigendian = False
+        output.step = output.width * np.dtype(np.float32).itemsize
+        output.data = visualization.tobytes()
+        self.predicted_depth_pub.publish(output)
 
     def publish_removed_pointcloud(
         self,

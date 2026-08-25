@@ -281,3 +281,31 @@
     dynamic_marker_color: [1.0, 0.12, 0.04] # RGB [0..1].
     marker_alpha: 0.65                     # Marker opacity [0..1].
     marker_lifetime_s: 0.0                 # 0 uses explicit DELETE and infinite lifetime [s].
+
+/robot_collision_sphere_node:
+  ros__parameters:
+    publish_rate_hz: 60.0                  # Keep sphere poses close to camera timestamps.
+    stamp_from_joint_state: true           # Preserve the source joint timestamp for matching.
+    require_joint_state: true              # Never publish an assumed all-zero robot pose.
+    require_complete_joint_state: true     # Require all six movable URDF joints.
+
+/robot_depth_mask_node:
+  ros__parameters:
+    filter_mode: "surface_depth"           # Compare measured depth with rendered sphere front surfaces.
+    predicted_depth_topic: "/rmp_camera/robot_predicted_depth/image_rect_raw"
+    removed_points_topic: "/rmp_camera/robot_depth_mask_removed_points"
+    publish_predicted_depth: true
+    publish_removed_points: true
+    robot_margin_m: 0.01                   # Small geometry inflation; do not use the legacy large volume margin.
+    surface_front_tolerance_m: 0.02        # Preserve measurements clearly in front of the robot [m].
+    surface_back_tolerance_m: 0.04         # Allow calibration/depth error behind predicted surface [m].
+    mask_shadow_behind_robot: false        # Only remove surface matches; retain nonmatching measurements.
+    min_depth_m: 0.05
+    max_depth_m: 5.0
+    max_rate_hz: 30.0
+    tf_timeout_s: 0.05
+    passthrough_on_missing_robot: false    # Do not contaminate Nvblox while robot pose is unavailable.
+    use_time_synchronized_robot_markers: true
+    robot_marker_buffer_duration_s: 1.0
+    robot_marker_max_stamp_delta_s: 0.05
+    fallback_to_latest_marker_on_time_miss: false

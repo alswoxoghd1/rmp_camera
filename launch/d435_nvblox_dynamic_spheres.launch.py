@@ -75,11 +75,38 @@ def _launch_setup(context):
     if source not in ("camera", "bag"):
         raise RuntimeError("source must be 'camera' or 'bag'")
 
-    run_realsense = _as_bool(LaunchConfiguration("run_realsense").perform(context)) and source == "camera"
+    run_realsense = (
+        _as_bool(LaunchConfiguration("run_realsense").perform(context))
+        and source == "camera"
+    )
     run_rviz = _as_bool(LaunchConfiguration("run_rviz").perform(context))
     run_static = _as_bool(LaunchConfiguration("run_esdf_medial_spheres").perform(context))
     run_dynamic = _as_bool(LaunchConfiguration("run_dynamic_obstacle_spheres").perform(context))
     run_fusion = _as_bool(LaunchConfiguration("run_obstacle_sphere_fusion").perform(context))
+    run_robot_self_filter = _as_bool(
+        LaunchConfiguration("run_robot_self_filter").perform(context))
+    run_robot_collision_spheres = (
+        run_robot_self_filter
+        and _as_bool(LaunchConfiguration("run_robot_collision_spheres").perform(context))
+    )
+    run_rb10_joint_state_source = (
+        run_robot_self_filter
+        and source == "camera"
+        and _as_bool(LaunchConfiguration("run_rb10_joint_state_source").perform(context))
+    )
+    robot_joint_state_topic = LaunchConfiguration(
+        "robot_joint_state_topic").perform(context).strip()
+    measured_joint_state_topic = LaunchConfiguration(
+        "measured_joint_state_topic").perform(context).strip()
+    robot_ip = LaunchConfiguration("robot_ip").perform(context).strip()
+    robot_data_port = LaunchConfiguration("robot_data_port").perform(context).strip()
+    robot_joint_state_publish_rate_hz = LaunchConfiguration(
+        "robot_joint_state_publish_rate_hz").perform(context).strip()
+    robot_urdf_path = LaunchConfiguration("robot_urdf_path").perform(context).strip()
+    robot_sphere_config_path = LaunchConfiguration(
+        "robot_sphere_config_path").perform(context).strip()
+    self_filter_output_depth_topic = LaunchConfiguration(
+        "self_filter_output_depth_topic").perform(context).strip()
     log_level = LaunchConfiguration("log_level").perform(context)
     container_name = "rmp_camera_dynamic_nvblox_container"
 
@@ -131,6 +158,17 @@ def _launch_setup(context):
                 f"run_esdf_medial_spheres:={_bool_arg(run_static)}",
                 f"run_dynamic_obstacle_spheres:={_bool_arg(run_dynamic)}",
                 f"run_obstacle_sphere_fusion:={_bool_arg(run_fusion)}",
+                f"run_robot_self_filter:={_bool_arg(run_robot_self_filter)}",
+                f"run_robot_collision_spheres:={_bool_arg(run_robot_collision_spheres)}",
+                f"run_rb10_joint_state_source:={_bool_arg(run_rb10_joint_state_source)}",
+                f"robot_joint_state_topic:={robot_joint_state_topic}",
+                f"measured_joint_state_topic:={measured_joint_state_topic}",
+                f"robot_ip:={robot_ip}",
+                f"robot_data_port:={robot_data_port}",
+                f"robot_joint_state_publish_rate_hz:={robot_joint_state_publish_rate_hz}",
+                f"robot_urdf_path:={robot_urdf_path}",
+                f"robot_sphere_config_path:={robot_sphere_config_path}",
+                f"self_filter_output_depth_topic:={self_filter_output_depth_topic}",
                 f"log_level:={log_level}",
                 "_bag_cycle:=true",
             ],
@@ -222,13 +260,74 @@ def _launch_setup(context):
             arguments=["--ros-args", "--log-level", log_level]),
     ])
     actions.extend(input_actions)
+    if run_rb10_joint_state_source:
+        actions.extend([
+            Node(
+                package="rmp_camera", executable="rb10_measured_joint_state_node",
+                name="rb10_measured_joint_state_node", output="screen",
+                parameters=[{
+                    "robot_ip": robot_ip,
+                    "data_port": int(robot_data_port),
+                    "publish_topic": measured_joint_state_topic,
+                    "publish_rate_hz": float(robot_joint_state_publish_rate_hz),
+                    "use_sim_time": use_sim_time,
+                }],
+                arguments=["--ros-args", "--log-level", log_level]),
+            Node(
+                package="rmp_camera", executable="joint_state_normalizer_node",
+                name="joint_state_normalizer_node", output="screen",
+                parameters=[{
+                    "input_topic": measured_joint_state_topic,
+                    "source_priority": [measured_joint_state_topic],
+                    "output_topic": robot_joint_state_topic,
+                    "fallback_publish_rate_hz": 50.0,
+                    "publish_zero_fallback": False,
+                    "republish_latest": False,
+                    "use_sim_time": use_sim_time,
+                }],
+                arguments=["--ros-args", "--log-level", log_level]),
+        ])
+    if run_robot_collision_spheres:
+        actions.append(Node(
+            package="rmp_camera", executable="robot_collision_sphere_node",
+            name="robot_collision_sphere_node", output="screen",
+            parameters=[
+                experiment_config,
+                {
+                    "urdf_path": robot_urdf_path,
+                    "sphere_config_path": robot_sphere_config_path,
+                    "joint_state_topic": robot_joint_state_topic,
+                    "use_sim_time": use_sim_time,
+                },
+            ],
+            arguments=["--ros-args", "--log-level", log_level]))
+    if run_robot_self_filter:
+        actions.append(Node(
+            package="rmp_camera", executable="robot_depth_mask_node",
+            name="robot_depth_mask_node", output="screen",
+            parameters=[
+                experiment_config,
+                {
+                    "input_depth_topic": depth_image_topic,
+                    "camera_info_topic": "/camera0/camera/depth/camera_info",
+                    "robot_sphere_marker_topic":
+                        "/rmp_camera/robot_collision_sphere_markers",
+                    "output_depth_topic": self_filter_output_depth_topic,
+                    "use_sim_time": use_sim_time,
+                },
+            ],
+            arguments=["--ros-args", "--log-level", log_level]))
+    nvblox_depth_image_topic = (
+        self_filter_output_depth_topic if run_robot_self_filter
+        else depth_image_topic
+    )
     actions.append(
         LoadComposableNodes(
             target_container=container_name,
             composable_node_descriptions=[ComposableNode(
                 name="nvblox_node", package="nvblox_ros", plugin="nvblox::NvbloxNode",
                 remappings=[
-                    ("camera_0/depth/image", depth_image_topic),
+                    ("camera_0/depth/image", nvblox_depth_image_topic),
                     ("camera_0/depth/camera_info", "/camera0/camera/depth/camera_info"),
                     ("camera_0/color/image", "/camera0/camera/color/image_raw"),
                     ("camera_0/color/camera_info", "/camera0/camera/color/camera_info")],
@@ -271,6 +370,9 @@ def generate_launch_description():
         Path.home() / ".local/lib/python3.10/site-packages/nvidia/cuda_runtime/lib")
     default_config = package_file(
         "rmp_camera", "config/d435_nvblox_dynamic_experiment.yaml")
+    default_robot_urdf = package_file("rmp_camera", "urdf/rb10_1300e.urdf")
+    default_robot_spheres = package_file(
+        "rmp_camera", "config/collision_spheres.yaml")
     return LaunchDescription([
         SetEnvironmentVariable(
             name="LD_LIBRARY_PATH",
@@ -300,7 +402,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "depth_image_topic",
             default_value="/camera0/realsense_splitter_node/output/depth",
-            description="Depth image consumed by Nvblox; use raw depth when a bag has no splitter output"),
+            description=(
+                "Depth image consumed by Nvblox; use raw depth when a bag "
+                "has no splitter output")),
         DeclareLaunchArgument(
             "_bag_cycle", default_value="false",
             description="Internal flag for one resettable rosbag playback pass"),
@@ -309,6 +413,33 @@ def generate_launch_description():
         DeclareLaunchArgument("run_esdf_medial_spheres", default_value="true"),
         DeclareLaunchArgument("run_dynamic_obstacle_spheres", default_value="true"),
         DeclareLaunchArgument("run_obstacle_sphere_fusion", default_value="true"),
+        DeclareLaunchArgument(
+            "run_robot_self_filter", default_value="false",
+            description="Filter robot-matching depth before Nvblox integration"),
+        DeclareLaunchArgument(
+            "run_robot_collision_spheres", default_value="true",
+            description=(
+                "Generate robot spheres from URDF and joint states; disable "
+                "when replaying recorded markers")),
+        DeclareLaunchArgument(
+            "run_rb10_joint_state_source", default_value="true",
+            description="Read measured RB10 joints directly in live-camera self-filter mode"),
+        DeclareLaunchArgument(
+            "robot_joint_state_topic",
+            default_value="/rmp_camera/joint_states_urdf"),
+        DeclareLaunchArgument(
+            "measured_joint_state_topic",
+            default_value="/rmp_camera/rb10_measured_joint_states"),
+        DeclareLaunchArgument("robot_ip", default_value="192.168.111.50"),
+        DeclareLaunchArgument("robot_data_port", default_value="5001"),
+        DeclareLaunchArgument(
+            "robot_joint_state_publish_rate_hz", default_value="50.0"),
+        DeclareLaunchArgument("robot_urdf_path", default_value=default_robot_urdf),
+        DeclareLaunchArgument(
+            "robot_sphere_config_path", default_value=default_robot_spheres),
+        DeclareLaunchArgument(
+            "self_filter_output_depth_topic",
+            default_value="/rmp_camera/robot_surface_filtered_depth/image_rect_raw"),
         DeclareLaunchArgument("log_level", default_value="info"),
         OpaqueFunction(function=_launch_setup),
     ])
