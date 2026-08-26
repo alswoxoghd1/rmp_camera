@@ -1,5 +1,8 @@
 # D435 + one Nvblox MultiMapper + static/dynamic sphere fusion experiment.
 # Edit this file only; the launch reads /experiment and all nodes read their section.
+# Every parameter inherited from the loaded Nvblox base/specialization files and
+# every parameter declared by the static, dynamic, and fusion sphere nodes is
+# explicitly listed here so upstream defaults cannot change this experiment.
 #
 # Tuning guide:
 # - Smaller voxel sizes improve detail but increase GPU memory and CPU sphere work.
@@ -33,7 +36,9 @@
 
 /nvblox_node:
   ros__parameters:
+    cuda_stream_type: 1                    # Blocking asynchronous CUDA stream.
     voxel_size: 0.05                       # Nvblox voxel edge [m]; keep equal to dynamic voxel size.
+    num_cameras: 1                         # Number of depth/color camera inputs.
     mapping_type: "dynamic"                # One MultiMapper: static background + dynamic foreground.
     esdf_mode: "3d"                        # Required by the existing dense 3D static ESDF service.
     global_frame: "base_link"
@@ -49,27 +54,61 @@
     tick_period_ms: 10                     # Nvblox scheduler tick [ms].
     integrate_depth_rate_hz: 30.0          # Depth integration frequency [Hz].
     integrate_color_rate_hz: 5.0           # Color integration frequency [Hz].
+    integrate_lidar_rate_hz: 40.0           # Inactive while use_lidar is false.
+    update_mesh_rate_hz: 5.0               # Static mesh update frequency [Hz].
     update_esdf_rate_hz: 10.0              # Static+dynamic internal ESDF update [Hz].
     publish_layer_rate_hz: 5.0             # Mesh/layer publication [Hz].
     publish_debug_vis_rate_hz: 10.0        # Other debug [Hz]; dynamic_points follows depth integration.
     decay_tsdf_rate_hz: 5.0                # Static TSDF decay [Hz].
     decay_dynamic_occupancy_rate_hz: 10.0  # Dynamic occupancy decay [Hz].
+    clear_map_outside_radius_rate_hz: 1.0  # Map-radius clearing check frequency [Hz].
     map_clearing_radius_m: 6.0             # Retained radius around map-clearing frame [m].
+    print_rates_to_console: false
+    print_timings_to_console: false
+    print_delays_to_console: false
+    print_queue_drops_to_console: false
+    print_statistics_on_console_period_ms: 10000
+    publish_esdf_distance_slice: true
+    lidar_width: 1800                      # Inactive while use_lidar is false.
+    lidar_height: 31                       # Inactive while use_lidar is false.
+    lidar_min_valid_range_m: 0.1           # Inactive while use_lidar is false.
+    lidar_max_valid_range_m: 50.0          # Inactive while use_lidar is false.
+    use_non_equal_vertical_fov_lidar_params: false
+    maximum_input_queue_length: 10
+    esdf_slice_bounds_visualization_side_length: 10.0
+    workspace_height_bounds_visualization_side_length: 10.0
+    layer_visualization_min_tsdf_weight: 0.1
+    layer_visualization_exclusion_height_m: 2.0
+    layer_visualization_exclusion_radius_m: 7.0
+    layer_visualization_undo_gamma_correction: false
+    max_back_projection_distance: 7.0
+    back_projection_subsampling: 1
+    layer_streamer_bandwidth_limit_mbps: -1.0 # Unlimited.
 
     multi_mapper:
-      connected_mask_component_size_threshold: 500 # Dynamic image component floor [pixels].
+      connected_mask_component_size_threshold: 1000 # Dynamic image component floor [pixels].
       remove_small_connected_components: true     # Reject small segmentation speckle.
 
     static_mapper:
+      do_depth_preprocessing: false
+      depth_preprocessing_num_dilations: 3
       projective_integrator_max_integration_distance_m: 2.2 # Depth integration range [m].
       projective_integrator_truncation_distance_vox: 4.0    # TSDF truncation [voxels].
       projective_integrator_weighting_mode: "constant"      # Official dynamics specialization.
       projective_integrator_max_weight: 5.0                  # TSDF observation weight cap.
       projective_tsdf_integrator_invalid_depth_decay_factor: 0.8 # Free-space invalid-depth decay.
+      free_region_occupancy_probability: 0.45
+      occupied_region_occupancy_probability: 0.55
+      unobserved_region_occupancy_probability: 0.5
+      occupied_region_half_width_m: 0.1
+      raycast_subsampling_factor: 4
       esdf_integrator_min_weight: 0.3             # Observed TSDF weight needed by ESDF.
+      esdf_integrator_max_site_distance_vox: 2.0
       esdf_integrator_max_distance_m: 2.0         # ESDF truncation distance [m].
+      mesh_integrator_min_weight: 0.1
+      mesh_integrator_weld_vertices: true
       unobserved_esdf_policy: "ignore"            # Never treat unobserved as free.
-      max_tsdf_distance_for_occupancy_m: 0.15     # TSDF band used by freespace logic [m].
+      max_tsdf_distance_for_occupancy_m: 0.18     # TSDF band used by freespace logic [m].
       max_unobserved_to_keep_consecutive_occupancy_ms: 400 # Occupancy continuity window [ms].
       min_duration_since_occupied_for_freespace_ms: 1000    # Dynamic confidence delay [ms].
       min_consecutive_occupancy_duration_for_reset_ms: 2000 # Static reset evidence [ms].
@@ -77,7 +116,15 @@
       initialize_to_high_confidence_freespace: false # Conservative startup; fewer false dynamics.
       tsdf_decay_factor: 0.95                     # Static decay multiplier per decay tick.
       tsdf_decayed_weight_threshold: 0.001        # Deallocation threshold [weight].
+      exclude_last_view_from_decay: true
+      tsdf_set_free_distance_on_decayed: false
+      tsdf_decayed_free_distance_vox: 4.0
       decay_integrator_deallocate_decayed_blocks: true # Release fully decayed GPU blocks.
+      layer_streamer_exclusion_height_m: 2.0
+      layer_streamer_exclusion_radius_m: 7.0
+      esdf_slice_height: 0.0
+      esdf_slice_min_height: -0.1
+      esdf_slice_max_height: 0.3
       workspace_bounds_type: "bounding_box"       # Bound integration to the lab experiment box.
       workspace_bounds_min_corner_x_m: -3.0
       workspace_bounds_min_corner_y_m: -3.0
@@ -97,6 +144,9 @@
       esdf_integrator_max_distance_m: 2.0           # Internal dynamic ESDF max [m].
       free_region_decay_probability: 0.55           # Dynamic free voxels decay toward unknown.
       occupied_region_decay_probability: 0.30       # Dynamic hits decay; lower clears faster.
+      esdf_slice_height: 0.0
+      esdf_slice_min_height: -0.1
+      esdf_slice_max_height: 0.3
 
 /esdf_medial_sphere_node:
   ros__parameters:
@@ -113,12 +163,12 @@
     aabb_size_z_m: 2.0
     unobserved_distance_value: -1000.0     # Nvblox unobserved sentinel [m].
     inside_epsilon_m: 0.005                # Negative-distance noise rejection [m].
-    target_coverage: 0.95                  # Required component voxel coverage [0..1].
-    coverage_tolerance_m: 0.01             # Coverage discretization tolerance [m].
+    target_coverage: 0.92                  # Required component voxel coverage [0..1].
+    coverage_tolerance_m: 0.02             # Coverage discretization tolerance [m].
     plateau_epsilon_m: 0.001               # ESDF minimum plateau tolerance [m].
-    minimum_center_spacing_m: 0.05         # Static center separation [m].
-    min_component_voxels: 8                # Static connected-component floor [voxels].
-    min_raw_sphere_radius_m: 0.01           # Static raw radius floor [m].
+    minimum_center_spacing_m: 0.10         # Static center separation [m].
+    min_component_voxels: 30                # Static connected-component floor [voxels].
+    min_raw_sphere_radius_m: 0.04           # Static raw radius floor [m].
     safety_margin_m: 0.02                  # Added to static output radius only [m].
     redundancy_tolerance_m: 0.001          # Removal containment slack [m].
     max_spheres_per_component: 128
@@ -129,9 +179,17 @@
     enable_general_coverage_pruning: true  # Remove candidates with no required unique coverage.
     enable_surface_shell_guard: true       # Preserve thin obstacle surface features.
     surface_shell_thickness_m: 0.10        # Inner ESDF shell thickness [m].
-    target_shell_coverage: 0.98            # Desired surface-shell coverage [0..1].
-    shell_coverage_loss_tolerance: 0.005   # Allowed loss from baseline shell coverage.
+    target_shell_coverage: 0.94            # Desired surface-shell coverage [0..1].
+    shell_coverage_loss_tolerance: 0.02    # Allowed loss from baseline shell coverage.
     max_optimization_matrix_elements: 20000000 # Per-component boolean matrix guard.
+    enable_agglomerative_merge: true       # Merge only conservatively valid same-component pairs.
+    merge_max_radius_m: 0.35               # Hard raw-radius cap for a merged static sphere [m].
+    merge_max_radius_growth_ratio: 1.45    # Merged radius / larger parent radius cap.
+    merge_max_gap_m: 0.05                  # Maximum parent surface gap [m].
+    merge_enable_esdf_guard: true          # Sample merged surface against static ESDF.
+    merge_max_free_space_distance_m: 0.08  # Maximum positive sampled ESDF distance [m].
+    merge_surface_sample_count: 64         # Deterministic Fibonacci surface samples.
+    merge_min_observed_surface_fraction: 0.70 # Required observed sample fraction [0..1].
     max_grid_voxels: 8000000               # Dense response memory guard [voxels].
     marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
     sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
@@ -155,36 +213,50 @@
     max_z_m: 2.5
     max_range_from_base_m: 2.0             # Radial XY crop [m]; <=0 disables.
     dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
-    dynamic_min_component_voxels: 6        # Noise component floor [voxels].
+    dynamic_min_component_voxels: 30       # Noise component floor [voxels].
     dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
     dynamic_max_components: 32             # Component processing cap.
     dynamic_max_input_points: 250000       # Input truncation cap [points].
-    dynamic_connectivity: 18               # 6 face, 18 face+edge, or 26 incl. corner.
+    dynamic_connectivity: 6                # 6 face, 18 face+edge, or 26 incl. corner.
     dynamic_dilation_voxels: 0             # Positive values expand dynamic objects [voxels].
     dynamic_closing_iterations: 1          # Fill one-voxel cracks; large values merge objects.
-    dynamic_minimum_center_spacing_m: 0.08 # Adaptive sphere center separation [m].
+    dynamic_minimum_center_spacing_m: 0.12 # Adaptive sphere center separation [m].
     dynamic_min_raw_radius_m: 0.025         # Smallest accepted raw radius [m].
     dynamic_max_raw_radius_m: 0.45          # Prevent one sphere swallowing nearby space [m].
     dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
     dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
-    dynamic_fixed_radius_m: 0.10            # Thin/oversized fallback radius [m].
+    dynamic_fixed_radius_m: 0.15            # Thin/oversized fallback radius [m].
     dynamic_enable_greedy_set_cover: true   # Select a smaller sphere subset while preserving target coverage.
     dynamic_enable_single_sphere_replacement: true # Replace compact components with one sphere.
-    dynamic_single_sphere_max_radius_m: 0.18 # Limit free-space consumed by a replacement sphere [m].
-    dynamic_target_coverage: 0.95            # Voxel-center coverage goal [0..1].
+    dynamic_single_sphere_max_radius_m: 0.28 # Limit free-space consumed by a replacement sphere [m].
+    dynamic_target_coverage: 0.92            # Voxel-center coverage goal [0..1].
     dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
     dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
     dynamic_redundancy_tolerance_m: 0.01    # Redundancy removal slack [m].
     dynamic_max_spheres_per_component: 96
     dynamic_max_iterations_per_component: 256
     dynamic_max_total_spheres: 384
-    dynamic_processing_budget_ms: 35.0      # Per-update soft CPU budget [ms].
+    dynamic_processing_budget_ms: 50.0      # Per-update soft CPU budget [ms].
     dynamic_max_local_grid_voxels: 1200000  # Dense-equivalent volume guard [voxels].
+    dynamic_enable_agglomerative_merge: true # Merge only valid same-component pairs.
+    dynamic_merge_max_radius_m: 0.30         # Hard raw-radius cap for a merged dynamic sphere [m].
+    dynamic_merge_max_radius_growth_ratio: 1.50 # Merged radius / larger parent radius cap.
+    dynamic_merge_max_gap_m: 0.08            # Maximum parent surface gap [m].
+    dynamic_merge_enable_empty_space_guard: false # Optional occupancy guard; off by default.
+    dynamic_merge_max_empty_fraction: 0.70   # Maximum unoccupied fraction when guard is enabled.
+    dynamic_merge_max_validation_voxels: 50000 # Bound optional validation work.
+    dynamic_enable_min_k_search: true        # Explore multiple valid merge orders to minimize sphere count.
+    dynamic_min_k_beam_width: 8              # Best merge states retained at each search depth.
+    dynamic_min_k_max_states: 128            # Hard cap on explored merge states per component.
+    dynamic_min_k_enable_overlap_constraint: true # Reject final sets exceeding the overlap limit when possible.
+    dynamic_max_allowed_overlap_fraction: 0.20 # Maximum pair overlap relative to the smaller sphere volume.
+    dynamic_min_k_use_output_overlap: true   # Measure overlap using safety-inflated output radii.
+    dynamic_min_k_prefer_lower_overlap: true # Break equal-count ties in favor of lower overlap.
     dynamic_tracking_enabled: true
     dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
     dynamic_smoothing_alpha: 0.70           # 1=new measurement, 0=old track.
-    dynamic_sphere_ttl_sec: 0.5             # Occlusion retention [s].
-    dynamic_max_missed_updates: 5           # Occlusion update-count cap.
+    dynamic_sphere_ttl_sec: 0.30            # Occlusion retention [s].
+    dynamic_max_missed_updates: 3           # Occlusion update-count cap.
     dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
     publish_debug_clouds: true
 
@@ -209,3 +281,32 @@
     dynamic_marker_color: [1.0, 0.12, 0.04] # RGB [0..1].
     marker_alpha: 0.65                     # Marker opacity [0..1].
     marker_lifetime_s: 0.0                 # 0 uses explicit DELETE and infinite lifetime [s].
+
+/robot_collision_sphere_node:
+  ros__parameters:
+    publish_rate_hz: 60.0                  # Keep sphere poses close to camera timestamps.
+    stamp_from_joint_state: true           # Preserve the source joint timestamp for matching.
+    require_joint_state: true              # Never publish an assumed all-zero robot pose.
+    require_complete_joint_state: true     # Require all six movable URDF joints.
+
+/robot_depth_mask_node:
+  ros__parameters:
+    filter_mode: "surface_depth"           # Compare measured depth with rendered sphere front surfaces.
+    predicted_depth_topic: "/rmp_camera/robot_predicted_depth/image_rect_raw"
+    removed_points_topic: "/rmp_camera/robot_depth_mask_removed_points"
+    publish_predicted_depth: false            # Heavy debug image; enable only while inspecting masks.
+    publish_removed_points: false             # Debug cloud; keep off during rate measurements.
+    robot_margin_m: 0.01                   # Small geometry inflation; do not use the legacy large volume margin.
+    surface_front_tolerance_m: 0.02        # Preserve measurements clearly in front of the robot [m].
+    surface_back_tolerance_m: 0.04         # Allow calibration/depth error behind predicted surface [m].
+    mask_shadow_behind_robot: false        # Only remove surface matches; retain nonmatching measurements.
+    min_depth_m: 0.05
+    max_depth_m: 5.0
+    max_rate_hz: 0.0                          # Process every incoming splitter frame.
+    statistics_period_s: 5.0                  # Input/output/drop/latency report period [s].
+    tf_timeout_s: 0.05
+    passthrough_on_missing_robot: false    # Do not contaminate Nvblox while robot pose is unavailable.
+    use_time_synchronized_robot_markers: true
+    robot_marker_buffer_duration_s: 1.0
+    robot_marker_max_stamp_delta_s: 0.05
+    fallback_to_latest_marker_on_time_miss: false

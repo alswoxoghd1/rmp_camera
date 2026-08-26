@@ -13,6 +13,14 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from rmp_camera.sphere_merge_core import (
+    PairMergeCandidate,
+    enumerate_pair_merge_candidates,
+    select_best_merge_pair,
+    sphere_set_overlap_metrics,
+    validate_merge_limits,
+)
+
 
 @dataclass(frozen=True)
 class DynamicSphereParameters:
@@ -42,6 +50,20 @@ class DynamicSphereParameters:
     max_total_spheres: int = 384
     processing_budget_ms: float = 35.0
     max_local_grid_voxels: int = 1200000
+    dynamic_enable_agglomerative_merge: bool = True
+    dynamic_merge_max_radius_m: float = 0.30
+    dynamic_merge_max_radius_growth_ratio: float = 1.50
+    dynamic_merge_max_gap_m: float = 0.08
+    dynamic_merge_enable_empty_space_guard: bool = False
+    dynamic_merge_max_empty_fraction: float = 0.70
+    dynamic_merge_max_validation_voxels: int = 50000
+    dynamic_enable_min_k_search: bool = True
+    dynamic_min_k_beam_width: int = 8
+    dynamic_min_k_max_states: int = 128
+    dynamic_max_allowed_overlap_fraction: float = 0.20
+    dynamic_min_k_use_output_overlap: bool = True
+    dynamic_min_k_enable_overlap_constraint: bool = True
+    dynamic_min_k_prefer_lower_overlap: bool = True
     min_x_m: float = -3.0
     max_x_m: float = 3.0
     min_y_m: float = -3.0
@@ -67,6 +89,26 @@ class DynamicSphereParameters:
             raise ValueError(
                 "single_sphere_max_radius_m must be at least "
                 "min_raw_radius_m")
+        validate_merge_limits(
+            self.dynamic_merge_max_radius_m,
+            self.dynamic_merge_max_radius_growth_ratio,
+            self.dynamic_merge_max_gap_m,
+        )
+        if not np.isfinite(self.dynamic_merge_max_empty_fraction):
+            raise ValueError(
+                "dynamic merge empty fraction must be finite")
+        if not 0.0 <= self.dynamic_merge_max_empty_fraction <= 1.0:
+            raise ValueError("dynamic merge empty fraction must be in [0, 1]")
+        if self.dynamic_merge_max_validation_voxels <= 0:
+            raise ValueError("dynamic merge validation voxel cap must be positive")
+        if self.dynamic_min_k_beam_width <= 0:
+            raise ValueError("dynamic min-k beam width must be positive")
+        if self.dynamic_min_k_max_states <= 0:
+            raise ValueError("dynamic min-k state cap must be positive")
+        if not np.isfinite(self.dynamic_max_allowed_overlap_fraction):
+            raise ValueError("dynamic overlap limit must be finite")
+        if not 0.0 <= self.dynamic_max_allowed_overlap_fraction <= 1.0:
+            raise ValueError("dynamic overlap limit must be in [0, 1]")
         if self.max_x_m <= self.min_x_m or self.max_y_m <= self.min_y_m:
             raise ValueError("invalid XY workspace")
         if self.max_z_m <= self.min_z_m:
@@ -91,6 +133,31 @@ class DynamicSphere:
         return np.asarray((self.x, self.y, self.z), dtype=np.float64)
 
 
+@dataclass(frozen=True)
+class DynamicSphereSearchState:
+    """One deterministic state in the bounded dynamic merge-state search."""
+
+    spheres: tuple[DynamicSphere, ...]
+    max_raw_overlap_fraction: float
+    max_output_overlap_fraction: float
+    total_raw_overlap: float
+    total_output_overlap: float
+    total_raw_volume: float
+    total_raw_radius: float
+    canonical_signature: tuple[tuple[float, ...], ...]
+
+
+@dataclass
+class DynamicMinimumKSearchResult:
+    """Best state found within the configured bounded search budget."""
+
+    spheres: list[DynamicSphere]
+    states_explored: int
+    termination_reason: str
+    overlap_constraint_satisfied: bool
+    state: DynamicSphereSearchState
+
+
 @dataclass
 class DynamicComponentResult:
     component_id: int
@@ -99,6 +166,18 @@ class DynamicComponentResult:
     coverage: float
     uncovered_voxels: np.ndarray
     termination_reason: str
+    pre_merge_sphere_count: int = 0
+    agglomerative_sphere_count: int = 0
+    min_k_sphere_count: int = 0
+    final_sphere_count: int = 0
+    max_raw_overlap_fraction: float = 0.0
+    max_output_overlap_fraction: float = 0.0
+    total_raw_overlap: float = 0.0
+    total_output_overlap: float = 0.0
+    min_k_search_applied: bool = False
+    min_k_states_explored: int = 0
+    min_k_search_termination: str = "disabled"
+    overlap_constraint_satisfied: bool = True
 
 
 @dataclass
@@ -522,6 +601,461 @@ def _optimize_component_spheres(
         deadline)
 
 
+def dynamic_merge_empty_fraction(
+    centers: np.ndarray,
+    merge_center: Sequence[float],
+    merge_radius: float,
+    params: DynamicSphereParameters,
+    deadline: float | None = None,
+) -> float | None:
+    """Estimate the unoccupied voxel fraction inside a proposed merge sphere.
+
+    ``None`` means that the validation deadline or voxel cap was reached, so a
+    conservative caller must reject the merge.
+    """
+
+    center = np.asarray(merge_center, dtype=np.float64)
+    workspace_min = np.asarray(
+        (params.min_x_m, params.min_y_m, params.min_z_m), dtype=np.float64)
+    lower = np.ceil(
+        (center - merge_radius - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    upper = np.floor(
+        (center + merge_radius - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    counts = np.maximum(0, upper - lower + 1)
+    bounding_count = int(np.prod(counts, dtype=np.int64))
+    if (
+        bounding_count <= 0
+        or bounding_count > params.dynamic_merge_max_validation_voxels
+        or (deadline is not None and monotonic() >= deadline)
+    ):
+        return None
+    ranges = [
+        np.arange(lower[axis], upper[axis] + 1, dtype=np.int64)
+        for axis in range(3)
+    ]
+    lattice = np.stack(
+        np.meshgrid(*ranges, indexing="ij"), axis=-1).reshape((-1, 3))
+    lattice_centers = workspace_min + (
+        lattice.astype(np.float64) + 0.5) * params.voxel_size_m
+    inside = np.sum((lattice_centers - center) ** 2, axis=1) <= (
+        merge_radius * merge_radius + 1e-12)
+    validation_indices = lattice[inside]
+    if len(validation_indices) == 0:
+        return None
+    if deadline is not None and monotonic() >= deadline:
+        return None
+    occupied_indices = np.rint(
+        (np.asarray(centers) - workspace_min) / params.voxel_size_m - 0.5
+    ).astype(np.int64)
+    occupied = {
+        tuple(int(value) for value in index) for index in occupied_indices
+    }
+    occupied_count = sum(
+        tuple(int(value) for value in index) in occupied
+        for index in validation_indices
+    )
+    return 1.0 - occupied_count / len(validation_indices)
+
+
+def _dynamic_sphere_sort_key(
+    sphere: DynamicSphere,
+) -> tuple[int, float, float, float, float]:
+    return (
+        sphere.component_id,
+        sphere.x,
+        sphere.y,
+        sphere.z,
+        sphere.raw_radius,
+    )
+
+
+def build_dynamic_sphere_search_state(
+    spheres: Sequence[DynamicSphere],
+) -> DynamicSphereSearchState:
+    """Build an order-independent state with raw and output overlap metrics."""
+
+    ordered = tuple(sorted(spheres, key=_dynamic_sphere_sort_key))
+    if ordered:
+        centers = np.asarray([sphere.center for sphere in ordered])
+        component_ids = np.asarray(
+            [sphere.component_id for sphere in ordered], dtype=np.int64)
+    else:
+        centers = np.empty((0, 3), dtype=np.float64)
+        component_ids = np.empty(0, dtype=np.int64)
+    raw_radii = np.asarray(
+        [sphere.raw_radius for sphere in ordered], dtype=np.float64)
+    output_radii = np.asarray(
+        [sphere.output_radius for sphere in ordered], dtype=np.float64)
+    raw_metrics = sphere_set_overlap_metrics(
+        centers, raw_radii, component_ids)
+    output_metrics = sphere_set_overlap_metrics(
+        centers, output_radii, component_ids)
+    signature = tuple(
+        (
+            float(sphere.component_id),
+            round(float(sphere.x), 9),
+            round(float(sphere.y), 9),
+            round(float(sphere.z), 9),
+            round(float(sphere.raw_radius), 9),
+        )
+        for sphere in ordered
+    )
+    return DynamicSphereSearchState(
+        spheres=ordered,
+        max_raw_overlap_fraction=raw_metrics.max_overlap_fraction,
+        max_output_overlap_fraction=output_metrics.max_overlap_fraction,
+        total_raw_overlap=raw_metrics.total_overlap_fraction,
+        total_output_overlap=output_metrics.total_overlap_fraction,
+        total_raw_volume=float(
+            (4.0 / 3.0) * np.pi * np.sum(raw_radii ** 3)),
+        total_raw_radius=float(np.sum(raw_radii)),
+        canonical_signature=signature,
+    )
+
+
+def _state_selected_overlap(
+    state: DynamicSphereSearchState,
+    params: DynamicSphereParameters,
+) -> tuple[float, float]:
+    if params.dynamic_min_k_use_output_overlap:
+        return (
+            state.max_output_overlap_fraction,
+            state.total_output_overlap,
+        )
+    return state.max_raw_overlap_fraction, state.total_raw_overlap
+
+
+def dynamic_sphere_search_state_rank_key(
+    state: DynamicSphereSearchState,
+    params: DynamicSphereParameters,
+) -> tuple[object, ...]:
+    """Rank equal-K states using the configured overlap representation."""
+
+    if params.dynamic_min_k_use_output_overlap:
+        overlap_key = (
+            state.max_output_overlap_fraction,
+            state.total_output_overlap,
+            state.max_raw_overlap_fraction,
+            state.total_raw_overlap,
+        )
+    else:
+        overlap_key = (
+            state.max_raw_overlap_fraction,
+            state.total_raw_overlap,
+            state.max_output_overlap_fraction,
+            state.total_output_overlap,
+        )
+    if not params.dynamic_min_k_prefer_lower_overlap:
+        overlap_key = ()
+    return (
+        *overlap_key,
+        state.total_raw_volume,
+        state.total_raw_radius,
+        state.canonical_signature,
+    )
+
+
+def _state_overlap_constraint_satisfied(
+    state: DynamicSphereSearchState,
+    params: DynamicSphereParameters,
+) -> bool:
+    if not params.dynamic_min_k_enable_overlap_constraint:
+        return True
+    maximum, _ = _state_selected_overlap(state, params)
+    return maximum <= params.dynamic_max_allowed_overlap_fraction + 1e-12
+
+
+def _state_fallback_key(
+    state: DynamicSphereSearchState,
+    params: DynamicSphereParameters,
+) -> tuple[object, ...]:
+    maximum, total = _state_selected_overlap(state, params)
+    violation = max(
+        0.0, maximum - params.dynamic_max_allowed_overlap_fraction)
+    return (
+        violation,
+        len(state.spheres),
+        total,
+        state.total_raw_volume,
+        state.total_raw_radius,
+        state.canonical_signature,
+    )
+
+
+def _merge_dynamic_candidate(
+    spheres: Sequence[DynamicSphere],
+    candidate: PairMergeCandidate,
+    params: DynamicSphereParameters,
+) -> list[DynamicSphere]:
+    first = spheres[candidate.first_index]
+    merged = DynamicSphere(
+        float(candidate.center[0]),
+        float(candidate.center[1]),
+        float(candidate.center[2]),
+        candidate.radius,
+        candidate.radius + params.safety_margin_m,
+        first.component_id,
+    )
+    active = [
+        sphere for index, sphere in enumerate(spheres)
+        if index not in (candidate.first_index, candidate.second_index)
+    ] + [merged]
+    active.sort(key=_dynamic_sphere_sort_key)
+    return active
+
+
+def _enumerate_valid_dynamic_merge_candidates(
+    centers: np.ndarray,
+    state: DynamicSphereSearchState,
+    params: DynamicSphereParameters,
+    deadline: float,
+) -> list[PairMergeCandidate]:
+    active = list(state.spheres)
+    baseline_covered = _covered_mask(
+        centers, active, params.coverage_tolerance_m)
+    baseline_count = int(np.count_nonzero(baseline_covered))
+
+    def validator(candidate: PairMergeCandidate) -> bool:
+        if monotonic() >= deadline:
+            return False
+        trial = _merge_dynamic_candidate(active, candidate, params)
+        covered = _covered_mask(
+            centers, trial, params.coverage_tolerance_m)
+        coverage = float(np.mean(covered)) if len(covered) else 1.0
+        if (
+            coverage + 1e-12 < params.target_coverage
+            or np.count_nonzero(covered) < baseline_count
+        ):
+            return False
+        if params.dynamic_merge_enable_empty_space_guard:
+            empty_fraction = dynamic_merge_empty_fraction(
+                centers,
+                candidate.center,
+                candidate.radius,
+                params,
+                deadline,
+            )
+            if (
+                empty_fraction is None
+                or empty_fraction
+                > params.dynamic_merge_max_empty_fraction + 1e-12
+            ):
+                return False
+        return True
+
+    return enumerate_pair_merge_candidates(
+        np.asarray([sphere.center for sphere in active]),
+        np.asarray([sphere.raw_radius for sphere in active]),
+        np.asarray([sphere.component_id for sphere in active]),
+        params.dynamic_merge_max_radius_m,
+        params.dynamic_merge_max_radius_growth_ratio,
+        params.dynamic_merge_max_gap_m,
+        validator,
+        deadline,
+    )
+
+
+def minimum_k_dynamic_sphere_search(
+    centers: np.ndarray,
+    pre_merge_spheres: Sequence[DynamicSphere],
+    params: DynamicSphereParameters,
+    deadline: float,
+) -> DynamicMinimumKSearchResult:
+    """Run a bounded deterministic minimum-K merge-state search.
+
+    The result is the minimum K found within explored merge states, not a
+    claim of a global mathematical optimum.
+    """
+
+    initial = build_dynamic_sphere_search_state(pre_merge_spheres)
+    initial_satisfied = _state_overlap_constraint_satisfied(initial, params)
+    if len(initial.spheres) < 2:
+        return DynamicMinimumKSearchResult(
+            list(initial.spheres),
+            0,
+            "not_needed",
+            initial_satisfied,
+            initial,
+        )
+
+    best_feasible = initial if initial_satisfied else None
+    best_fallback = initial
+    seen = {initial.canonical_signature}
+    beam = [initial]
+    states_explored = 0
+    termination = "no_more_valid_merges"
+
+    while beam:
+        if monotonic() >= deadline:
+            termination = "deadline"
+            break
+
+        child_states: dict[
+            tuple[tuple[float, ...], ...],
+            DynamicSphereSearchState,
+        ] = {}
+        stop_reason = None
+        for parent in beam:
+            candidates = _enumerate_valid_dynamic_merge_candidates(
+                centers, parent, params, deadline)
+            if monotonic() >= deadline:
+                stop_reason = "deadline"
+                break
+            for candidate in candidates:
+                if monotonic() >= deadline:
+                    stop_reason = "deadline"
+                    break
+                child_spheres = _merge_dynamic_candidate(
+                    parent.spheres, candidate, params)
+                child = build_dynamic_sphere_search_state(child_spheres)
+                signature = child.canonical_signature
+                if signature in seen:
+                    continue
+                if states_explored >= params.dynamic_min_k_max_states:
+                    stop_reason = "max_states"
+                    break
+                seen.add(signature)
+                child_states[signature] = child
+                states_explored += 1
+
+                if _state_fallback_key(
+                    child, params
+                ) < _state_fallback_key(best_fallback, params):
+                    best_fallback = child
+                if _state_overlap_constraint_satisfied(child, params):
+                    if (
+                        best_feasible is None
+                        or (
+                            len(child.spheres),
+                            dynamic_sphere_search_state_rank_key(child, params),
+                        ) < (
+                            len(best_feasible.spheres),
+                            dynamic_sphere_search_state_rank_key(
+                                best_feasible, params),
+                        )
+                    ):
+                        best_feasible = child
+            if stop_reason is not None:
+                break
+
+        if stop_reason is not None:
+            termination = stop_reason
+            break
+        if not child_states:
+            termination = "no_more_valid_merges"
+            break
+
+        beam = sorted(
+            child_states.values(),
+            key=lambda state: dynamic_sphere_search_state_rank_key(
+                state, params),
+        )[:params.dynamic_min_k_beam_width]
+        if any(len(state.spheres) == 1 for state in beam):
+            termination = "minimum_k_reached"
+            break
+
+    chosen = best_feasible if best_feasible is not None else best_fallback
+    constraint_satisfied = _state_overlap_constraint_satisfied(chosen, params)
+    if (
+        not constraint_satisfied
+        and termination not in ("deadline", "max_states")
+    ):
+        termination = "overlap_constraint_unmet"
+    return DynamicMinimumKSearchResult(
+        list(chosen.spheres),
+        states_explored,
+        termination,
+        constraint_satisfied,
+        chosen,
+    )
+
+
+def agglomerative_merge_dynamic_spheres(
+    centers: np.ndarray,
+    spheres: Sequence[DynamicSphere],
+    params: DynamicSphereParameters,
+    deadline: float,
+) -> list[DynamicSphere]:
+    """Merge same-component pairs conservatively within the shared deadline."""
+
+    active = list(spheres)
+    while len(active) >= 2 and monotonic() < deadline:
+        baseline_covered = _covered_mask(
+            centers, active, params.coverage_tolerance_m)
+
+        def validator(candidate: PairMergeCandidate) -> bool:
+            if monotonic() >= deadline:
+                return False
+            first = active[candidate.first_index]
+            merged = DynamicSphere(
+                float(candidate.center[0]),
+                float(candidate.center[1]),
+                float(candidate.center[2]),
+                candidate.radius,
+                candidate.radius + params.safety_margin_m,
+                first.component_id,
+            )
+            trial = [
+                sphere for index, sphere in enumerate(active)
+                if index not in (candidate.first_index, candidate.second_index)
+            ] + [merged]
+            covered = _covered_mask(
+                centers, trial, params.coverage_tolerance_m)
+            if np.count_nonzero(covered) < np.count_nonzero(baseline_covered):
+                return False
+            if params.dynamic_merge_enable_empty_space_guard:
+                empty_fraction = dynamic_merge_empty_fraction(
+                    centers,
+                    candidate.center,
+                    candidate.radius,
+                    params,
+                    deadline,
+                )
+                if (
+                    empty_fraction is None
+                    or empty_fraction
+                    > params.dynamic_merge_max_empty_fraction + 1e-12
+                ):
+                    return False
+            return True
+
+        candidate = select_best_merge_pair(
+            np.asarray([sphere.center for sphere in active]),
+            np.asarray([sphere.raw_radius for sphere in active]),
+            np.asarray([sphere.component_id for sphere in active]),
+            params.dynamic_merge_max_radius_m,
+            params.dynamic_merge_max_radius_growth_ratio,
+            params.dynamic_merge_max_gap_m,
+            validator,
+            deadline,
+        )
+        if candidate is None or monotonic() >= deadline:
+            break
+        first = active[candidate.first_index]
+        merged = DynamicSphere(
+            float(candidate.center[0]),
+            float(candidate.center[1]),
+            float(candidate.center[2]),
+            candidate.radius,
+            candidate.radius + params.safety_margin_m,
+            first.component_id,
+        )
+        active = [
+            sphere for index, sphere in enumerate(active)
+            if index not in (candidate.first_index, candidate.second_index)
+        ] + [merged]
+        active.sort(key=lambda sphere: (
+            sphere.component_id,
+            sphere.x,
+            sphere.y,
+            sphere.z,
+            sphere.raw_radius,
+        ))
+    return active
+
+
 def _component_spheres(
     indices: np.ndarray, params: DynamicSphereParameters, component_id: int,
     deadline: float,
@@ -588,12 +1122,100 @@ def _component_spheres(
     if not budget_exceeded:
         spheres = _optimize_component_spheres(
             centers, spheres, params, component_id, deadline)
+    pre_merge_spheres = list(spheres)
+    pre_merge_sphere_count = len(pre_merge_spheres)
+    agglomerative_spheres = list(pre_merge_spheres)
+    if (
+        params.dynamic_enable_agglomerative_merge
+        and len(pre_merge_spheres) >= 2
+    ):
+        agglomerative_spheres = agglomerative_merge_dynamic_spheres(
+            centers, pre_merge_spheres, params, deadline)
+    spheres = agglomerative_spheres
+    agglomerative_sphere_count = len(agglomerative_spheres)
+    min_k_search_applied = (
+        params.dynamic_enable_min_k_search
+        and len(pre_merge_spheres) >= 2
+    )
+    min_k_states_explored = 0
+    min_k_termination = (
+        "not_needed"
+        if params.dynamic_enable_min_k_search
+        else "disabled"
+    )
+    min_k_sphere_count = pre_merge_sphere_count
+
+    if params.dynamic_enable_min_k_search:
+        search_result = minimum_k_dynamic_sphere_search(
+            centers, pre_merge_spheres, params, deadline)
+        min_k_states_explored = search_result.states_explored
+        min_k_termination = search_result.termination_reason
+        min_k_sphere_count = len(search_result.spheres)
+        baseline_state = build_dynamic_sphere_search_state(
+            agglomerative_spheres)
+        search_state = search_result.state
+        candidate_states = (baseline_state, search_state)
+        feasible_states = [
+            state for state in candidate_states
+            if _state_overlap_constraint_satisfied(state, params)
+        ]
+        if feasible_states:
+            selected_state = min(
+                feasible_states,
+                key=lambda state: (
+                    len(state.spheres),
+                    dynamic_sphere_search_state_rank_key(state, params),
+                ),
+            )
+        else:
+            selected_state = min(
+                candidate_states,
+                key=lambda state: _state_fallback_key(state, params),
+            )
+        spheres = list(selected_state.spheres)
+        if (
+            selected_state.canonical_signature
+            == baseline_state.canonical_signature
+            and selected_state.canonical_signature
+            != search_state.canonical_signature
+            and min_k_termination not in ("deadline", "max_states")
+        ):
+            min_k_termination = "fallback_agglomerative"
+
+    final_state = build_dynamic_sphere_search_state(spheres)
+    overlap_constraint_satisfied = _state_overlap_constraint_satisfied(
+        final_state, params)
+    if (
+        params.dynamic_enable_min_k_search
+        and not overlap_constraint_satisfied
+        and min_k_termination not in ("deadline", "max_states")
+    ):
+        min_k_termination = "overlap_constraint_unmet"
+
     uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
     coverage = float(np.mean(~uncovered)) if len(uncovered) else 1.0
     confidence = min(1.0, coverage * min(1.0, len(centers) / max(1, params.min_component_voxels * 2)))
     spheres = [replace(s, component_coverage=coverage, confidence=confidence) for s in spheres]
     return DynamicComponentResult(
-        component_id, centers, spheres, coverage, centers[uncovered], reason)
+        component_id=component_id,
+        voxel_centers=centers,
+        spheres=spheres,
+        coverage=coverage,
+        uncovered_voxels=centers[uncovered],
+        termination_reason=reason,
+        pre_merge_sphere_count=pre_merge_sphere_count,
+        agglomerative_sphere_count=agglomerative_sphere_count,
+        min_k_sphere_count=min_k_sphere_count,
+        final_sphere_count=len(spheres),
+        max_raw_overlap_fraction=final_state.max_raw_overlap_fraction,
+        max_output_overlap_fraction=final_state.max_output_overlap_fraction,
+        total_raw_overlap=final_state.total_raw_overlap,
+        total_output_overlap=final_state.total_output_overlap,
+        min_k_search_applied=min_k_search_applied,
+        min_k_states_explored=min_k_states_explored,
+        min_k_search_termination=min_k_termination,
+        overlap_constraint_satisfied=overlap_constraint_satisfied,
+    )
 
 
 def generate_dynamic_spheres(
@@ -625,6 +1247,15 @@ def generate_dynamic_spheres(
             ~_covered_mask(result.voxel_centers, result.spheres, params.coverage_tolerance_m)]
         result.coverage = 1.0 - len(result.uncovered_voxels) / max(1, len(result.voxel_centers))
         result.spheres = [replace(s, component_coverage=result.coverage) for s in result.spheres]
+        final_state = build_dynamic_sphere_search_state(result.spheres)
+        result.final_sphere_count = len(result.spheres)
+        result.max_raw_overlap_fraction = final_state.max_raw_overlap_fraction
+        result.max_output_overlap_fraction = (
+            final_state.max_output_overlap_fraction)
+        result.total_raw_overlap = final_state.total_raw_overlap
+        result.total_output_overlap = final_state.total_output_overlap
+        result.overlap_constraint_satisfied = (
+            _state_overlap_constraint_satisfied(final_state, params))
         component_results.append(result)
         all_spheres.extend(result.spheres)
         all_voxels.append(result.voxel_centers)

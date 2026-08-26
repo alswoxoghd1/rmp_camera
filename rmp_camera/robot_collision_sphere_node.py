@@ -121,9 +121,21 @@ def parse_urdf_joints(urdf_path):
                 joint_type=joint_elem.attrib.get("type", "fixed"),
                 parent=parent_elem.attrib["link"],
                 child=child_elem.attrib["link"],
-                xyz=parse_vector(origin_elem.attrib.get("xyz") if origin_elem is not None else None, [0.0, 0.0, 0.0]),
-                rpy=parse_vector(origin_elem.attrib.get("rpy") if origin_elem is not None else None, [0.0, 0.0, 0.0]),
-                axis=parse_vector(axis_elem.attrib.get("xyz") if axis_elem is not None else None, [0.0, 0.0, 0.0]),
+                xyz=parse_vector(
+                    origin_elem.attrib.get("xyz")
+                    if origin_elem is not None else None,
+                    [0.0, 0.0, 0.0],
+                ),
+                rpy=parse_vector(
+                    origin_elem.attrib.get("rpy")
+                    if origin_elem is not None else None,
+                    [0.0, 0.0, 0.0],
+                ),
+                axis=parse_vector(
+                    axis_elem.attrib.get("xyz")
+                    if axis_elem is not None else None,
+                    [0.0, 0.0, 0.0],
+                ),
             )
         )
     return joints
@@ -134,32 +146,49 @@ class RobotCollisionSphereNode(Node):
         super().__init__("robot_collision_sphere_node")
 
         package_share = Path(get_package_share_directory("rmp_camera"))
-        self.declare_parameter("urdf_path", str(package_share / "urdf" / "rb10_1300e.urdf"))
-        self.declare_parameter("sphere_config_path", str(package_share / "config" / "collision_spheres.yaml"))
+        self.declare_parameter(
+            "urdf_path", str(package_share / "urdf" / "rb10_1300e.urdf"))
+        self.declare_parameter(
+            "sphere_config_path",
+            str(package_share / "config" / "collision_spheres.yaml"),
+        )
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("publish_rate_hz", 30.0)
         self.declare_parameter("stamp_from_joint_state", True)
+        self.declare_parameter("require_joint_state", False)
+        self.declare_parameter("require_complete_joint_state", False)
 
         self.urdf_path = Path(self.get_parameter("urdf_path").value)
         self.sphere_config_path = Path(self.get_parameter("sphere_config_path").value)
         self.joint_state_topic = self.get_parameter("joint_state_topic").value
         self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self.stamp_from_joint_state = bool(self.get_parameter("stamp_from_joint_state").value)
+        self.require_joint_state = bool(
+            self.get_parameter("require_joint_state").value)
+        self.require_complete_joint_state = bool(
+            self.get_parameter("require_complete_joint_state").value)
 
         config = self._load_config(self.sphere_config_path)
         self.base_frame = config.get("base_frame", "base_link")
         self.root_link = config.get("urdf_root_link", "link0")
         self.sphere_topic = config.get("sphere_topic", "/rmp_camera/robot_collision_spheres")
-        self.marker_topic = config.get("marker_topic", "/rmp_camera/robot_collision_sphere_markers")
+        self.marker_topic = config.get(
+            "marker_topic", "/rmp_camera/robot_collision_sphere_markers")
         self.spheres = self._load_spheres(config)
 
         self.joints = parse_urdf_joints(self.urdf_path)
+        self.movable_joint_names = {
+            joint.name
+            for joint in self.joints
+            if joint.joint_type in ("revolute", "continuous", "prismatic")
+        }
         self.children_by_parent = {}
         for joint in self.joints:
             self.children_by_parent.setdefault(joint.parent, []).append(joint)
 
         self.joint_positions = {}
         self.latest_joint_stamp = None
+        self.received_joint_state = False
         self.joint_state_sub = self.create_subscription(
             JointState,
             self.joint_state_topic,
@@ -174,7 +203,8 @@ class RobotCollisionSphereNode(Node):
             f"Loaded {len(self.spheres)} collision spheres from {self.sphere_config_path}"
         )
         self.get_logger().info(
-            f"Using URDF {self.urdf_path}, root_link={self.root_link}, base_frame={self.base_frame}"
+            f"Using URDF {self.urdf_path}, root_link={self.root_link}, "
+            f"base_frame={self.base_frame}"
         )
 
     def _load_config(self, path):
@@ -195,6 +225,7 @@ class RobotCollisionSphereNode(Node):
         return spheres
 
     def _joint_state_callback(self, msg):
+        self.received_joint_state = True
         for name, position in zip(msg.name, msg.position):
             self.joint_positions[name] = float(position)
         if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
@@ -219,6 +250,21 @@ class RobotCollisionSphereNode(Node):
         return transforms
 
     def _publish(self):
+        if self.require_joint_state and not self.received_joint_state:
+            self.get_logger().warn(
+                "Waiting for the first robot joint state before publishing collision spheres.",
+                throttle_duration_sec=2.0,
+            )
+            return
+        if self.require_complete_joint_state:
+            missing = sorted(self.movable_joint_names - self.joint_positions.keys())
+            if missing:
+                self.get_logger().warn(
+                    "Waiting for a complete robot joint state; missing: "
+                    + ", ".join(missing),
+                    throttle_duration_sec=2.0,
+                )
+                return
         if self.stamp_from_joint_state and self.latest_joint_stamp is not None:
             now = self.latest_joint_stamp
         else:

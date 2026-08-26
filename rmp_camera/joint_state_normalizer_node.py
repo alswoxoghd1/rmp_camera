@@ -40,6 +40,8 @@ class JointStateNormalizerNode(Node):
         self.declare_parameter("source_timeout_s", 1.0)
         self.declare_parameter("output_topic", "/rmp_camera/joint_states_urdf")
         self.declare_parameter("fallback_publish_rate_hz", 10.0)
+        self.declare_parameter("publish_zero_fallback", True)
+        self.declare_parameter("republish_latest", True)
 
         self.input_topics = self._input_topics_from_parameters()
         self.source_priority = self._source_priority_from_parameters()
@@ -48,6 +50,10 @@ class JointStateNormalizerNode(Node):
         self.fallback_publish_rate_hz = float(
             self.get_parameter("fallback_publish_rate_hz").value
         )
+        self.publish_zero_fallback = bool(
+            self.get_parameter("publish_zero_fallback").value)
+        self.republish_latest = bool(
+            self.get_parameter("republish_latest").value)
 
         self.publisher = self.create_publisher(JointState, self.output_topic, 10)
         self.joint_state_subscriptions = []
@@ -59,10 +65,12 @@ class JointStateNormalizerNode(Node):
         self.active_source = None
         self.active_source_last_time = None
         self.warned_no_live_source = False
-        self.timer = self.create_timer(
-            1.0 / max(self.fallback_publish_rate_hz, 1.0),
-            self._publish_latest,
-        )
+        self.timer = None
+        if self.republish_latest:
+            self.timer = self.create_timer(
+                1.0 / max(self.fallback_publish_rate_hz, 1.0),
+                self._publish_latest,
+            )
         self.get_logger().info(
             "Normalizing joint states from "
             f"{', '.join(self.input_topics)} to {self.output_topic}"
@@ -190,6 +198,13 @@ class JointStateNormalizerNode(Node):
         return msg
 
     def _publish_latest(self):
+        if not self.live_sources and not self.publish_zero_fallback:
+            if not self.warned_no_live_source:
+                self.warned_no_live_source = True
+                self.get_logger().warn(
+                    "No live joint state source received yet; suppressing zero pose fallback."
+                )
+            return
         self.latest_msg.header.stamp = self.get_clock().now().to_msg()
         self.publisher.publish(self.latest_msg)
         if not self.live_sources and not self.warned_no_live_source:
