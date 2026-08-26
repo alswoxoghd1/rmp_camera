@@ -294,15 +294,16 @@
     filter_mode: "surface_depth"           # Compare measured depth with rendered sphere front surfaces.
     predicted_depth_topic: "/rmp_camera/robot_predicted_depth/image_rect_raw"
     removed_points_topic: "/rmp_camera/robot_depth_mask_removed_points"
-    publish_predicted_depth: true
-    publish_removed_points: true
+    publish_predicted_depth: false            # Heavy debug image; enable only while inspecting masks.
+    publish_removed_points: false             # Debug cloud; keep off during rate measurements.
     robot_margin_m: 0.01                   # Small geometry inflation; do not use the legacy large volume margin.
     surface_front_tolerance_m: 0.02        # Preserve measurements clearly in front of the robot [m].
     surface_back_tolerance_m: 0.04         # Allow calibration/depth error behind predicted surface [m].
     mask_shadow_behind_robot: false        # Only remove surface matches; retain nonmatching measurements.
     min_depth_m: 0.05
     max_depth_m: 5.0
-    max_rate_hz: 30.0
+    max_rate_hz: 0.0                          # Process every incoming splitter frame.
+    statistics_period_s: 5.0                  # Input/output/drop/latency report period [s].
     tf_timeout_s: 0.05
     passthrough_on_missing_robot: false    # Do not contaminate Nvblox while robot pose is unavailable.
     use_time_synchronized_robot_markers: true

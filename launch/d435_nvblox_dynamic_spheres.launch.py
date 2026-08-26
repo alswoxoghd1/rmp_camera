@@ -1,4 +1,5 @@
-"""D435 dynamic Nvblox experiment with static/dynamic sphere fusion.
+"""
+D435 dynamic Nvblox experiment with static/dynamic sphere fusion.
 
 All numeric experiment settings come from one YAML.  This launch starts one
 RealSense camera, its emitter splitter, and one Nvblox component only; none of
@@ -65,6 +66,7 @@ def _launch_setup(context):
     sim_override = LaunchConfiguration("use_sim_time").perform(context).strip()
     bag_path_override = LaunchConfiguration("bag_path").perform(context).strip()
     bag_rate_override = LaunchConfiguration("bag_rate").perform(context).strip()
+    repeat_bag = _as_bool(LaunchConfiguration("repeat_bag").perform(context))
     depth_image_topic = LaunchConfiguration(
         "depth_image_topic").perform(context).strip()
     bag_cycle = _as_bool(LaunchConfiguration("_bag_cycle").perform(context))
@@ -139,10 +141,11 @@ def _launch_setup(context):
         bag_rate = bag_rate_override or str(experiment.get("bag_rate", 1.0))
 
     # Rewinding /clock with ros2 bag --loop leaves the accumulated Nvblox map
-    # and sphere tracks alive. Run one bag per child launch and respawn the
-    # complete processing graph so every pass starts from clean state. Keep
-    # RViz in this parent launch so its window remains open between passes.
-    if source == "bag" and not bag_cycle:
+    # and sphere tracks alive. When repetition is explicitly requested, run
+    # one bag per child launch and respawn the complete processing graph so
+    # every pass starts from clean state. A normal bag run stays in this launch
+    # and exits cleanly after one pass without a restart gap.
+    if source == "bag" and repeat_bag and not bag_cycle:
         cycle_process = ExecuteProcess(
             cmd=[
                 "ros2", "launch", "rmp_camera",
@@ -152,6 +155,7 @@ def _launch_setup(context):
                 "use_sim_time:=true",
                 f"bag_path:={bag_path}",
                 f"bag_rate:={bag_rate}",
+                "repeat_bag:=false",
                 f"depth_image_topic:={depth_image_topic}",
                 "run_realsense:=false",
                 "run_rviz:=false",
@@ -399,6 +403,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "bag_rate", default_value="",
             description="Optional rosbag playback-rate override"),
+        DeclareLaunchArgument(
+            "repeat_bag", default_value="false",
+            description=(
+                "Restart the complete processing graph after every bag pass; "
+                "false exits cleanly after one pass")),
         DeclareLaunchArgument(
             "depth_image_topic",
             default_value="/camera0/realsense_splitter_node/output/depth",

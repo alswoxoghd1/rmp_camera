@@ -12,6 +12,7 @@ import tf2_ros
 from visualization_msgs.msg import MarkerArray
 
 from rmp_camera.robot_depth_filter_core import (
+    as_ros_image_data,
     predict_sphere_surface_depth,
     surface_depth_removal_mask,
 )
@@ -34,8 +35,8 @@ class RobotDepthMaskNode(Node):
             "predicted_depth_topic", "/rmp_camera/robot_predicted_depth/image_rect_raw")
         self.declare_parameter(
             "removed_points_topic", "/rmp_camera/robot_depth_mask_removed_points")
-        self.declare_parameter("publish_removed_points", True)
-        self.declare_parameter("publish_predicted_depth", True)
+        self.declare_parameter("publish_removed_points", False)
+        self.declare_parameter("publish_predicted_depth", False)
         self.declare_parameter("filter_mode", "volume")
         self.declare_parameter("robot_margin_m", 0.05)
         self.declare_parameter("surface_front_tolerance_m", 0.02)
@@ -43,7 +44,8 @@ class RobotDepthMaskNode(Node):
         self.declare_parameter("mask_shadow_behind_robot", False)
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 5.0)
-        self.declare_parameter("max_rate_hz", 15.0)
+        self.declare_parameter("max_rate_hz", 0.0)
+        self.declare_parameter("statistics_period_s", 5.0)
         self.declare_parameter("tf_timeout_s", 0.05)
         self.declare_parameter("passthrough_on_missing_robot", True)
         self.declare_parameter("use_time_synchronized_robot_markers", True)
@@ -74,6 +76,8 @@ class RobotDepthMaskNode(Node):
         self.min_depth_m = float(self.get_parameter("min_depth_m").value)
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
         self.max_rate_hz = float(self.get_parameter("max_rate_hz").value)
+        self.statistics_period_s = max(
+            0.0, float(self.get_parameter("statistics_period_s").value))
         self.tf_timeout = Duration(seconds=float(self.get_parameter("tf_timeout_s").value))
         self.passthrough_on_missing_robot = bool(
             self.get_parameter("passthrough_on_missing_robot").value
@@ -96,6 +100,15 @@ class RobotDepthMaskNode(Node):
         self.robot_marker_buffer = []
         self.last_process_time = 0.0
         self.last_log_time = 0.0
+        self.statistics_started_at = time.monotonic()
+        self.statistics_active = False
+        self.statistics_received = 0
+        self.statistics_processed = 0
+        self.statistics_rate_limited = 0
+        self.statistics_passthrough = 0
+        self.statistics_missing_drops = 0
+        self.statistics_processing_time_s = 0.0
+        self.statistics_max_processing_time_s = 0.0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -140,6 +153,7 @@ class RobotDepthMaskNode(Node):
             f"robot_margin={self.robot_margin_m:.3f} m, "
             f"surface_band=[-{self.surface_front_tolerance_m:.3f}, "
             f"+{self.surface_back_tolerance_m:.3f}] m, "
+            f"predicted_depth={'on' if self.publish_predicted_depth else 'off'}, "
             f"removed_points={self.removed_points_topic if self.publish_removed_points else 'off'}"
         )
 
@@ -155,14 +169,21 @@ class RobotDepthMaskNode(Node):
         self.prune_robot_marker_buffer(stamp_ns)
 
     def depth_callback(self, msg):
+        callback_started_at = time.perf_counter()
         now = time.monotonic()
+        if not self.statistics_active:
+            self.statistics_started_at = now
+            self.statistics_active = True
+        self.statistics_received += 1
         if self.max_rate_hz > 0.0 and now - self.last_process_time < 1.0 / self.max_rate_hz:
+            self.statistics_rate_limited += 1
+            self.maybe_log_statistics(now)
             return
         self.last_process_time = now
 
         if self.latest_camera_info is None:
             self.log_throttled("Waiting for camera_info before depth masking.", warn=True)
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         robot_markers = self.select_robot_markers(msg.header.stamp)
@@ -172,13 +193,13 @@ class RobotDepthMaskNode(Node):
                 + self.unavailable_depth_action(),
                 warn=True,
             )
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         marker_frame = self.first_marker_frame(robot_markers)
         if not marker_frame:
             self.log_throttled("Robot marker array has no valid marker frame.", warn=True)
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         try:
@@ -193,12 +214,12 @@ class RobotDepthMaskNode(Node):
                 f"Waiting for TF {msg.header.frame_id} <- {marker_frame}: {exc}",
                 warn=True,
             )
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         parsed = self.depth_image_to_array(msg)
         if parsed is None:
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
         depth_array, full_array, depth_scale_m, invalid_value = parsed
 
@@ -208,7 +229,7 @@ class RobotDepthMaskNode(Node):
                 "Invalid camera intrinsics; " + self.unavailable_depth_action(),
                 warn=True,
             )
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         centers_base, radii, _ = marker_spheres(robot_markers)
@@ -218,7 +239,7 @@ class RobotDepthMaskNode(Node):
                 + self.unavailable_depth_action(),
                 warn=True,
             )
-            self.publish_passthrough_if_allowed(msg)
+            self.handle_unavailable_depth(msg)
             return
 
         marker_to_depth = transform_to_matrix(transform.transform)
@@ -274,7 +295,7 @@ class RobotDepthMaskNode(Node):
         output.encoding = msg.encoding
         output.is_bigendian = msg.is_bigendian
         output.step = msg.step
-        output.data = full_array.tobytes()
+        output.data = as_ros_image_data(full_array)
         self.depth_pub.publish(output)
         if self.publish_predicted_depth and predicted_depth is not None:
             self.publish_robot_predicted_depth(msg.header, predicted_depth)
@@ -290,15 +311,26 @@ class RobotDepthMaskNode(Node):
                 depth_scale_m,
             )
 
+        processing_time_s = time.perf_counter() - callback_started_at
+        self.statistics_processed += 1
+        self.statistics_processing_time_s += processing_time_s
+        self.statistics_max_processing_time_s = max(
+            self.statistics_max_processing_time_s, processing_time_s)
+        self.maybe_log_statistics()
+
         self.log_throttled(
             "Robot-masked depth: "
             f"spheres={len(centers_depth)}, removed_pixels={removed_pixels}, "
             f"frame={msg.header.frame_id}"
         )
 
-    def publish_passthrough_if_allowed(self, msg):
+    def handle_unavailable_depth(self, msg):
         if self.passthrough_on_missing_robot:
             self.depth_pub.publish(msg)
+            self.statistics_passthrough += 1
+        else:
+            self.statistics_missing_drops += 1
+        self.maybe_log_statistics()
 
     def unavailable_depth_action(self):
         if self.passthrough_on_missing_robot:
@@ -323,7 +355,7 @@ class RobotDepthMaskNode(Node):
         expected_items = row_items * msg.height
         full_array = np.frombuffer(msg.data, dtype=dtype, count=expected_items).copy()
         full_array = full_array.reshape(msg.height, row_items)
-        return full_array[:, : msg.width].copy(), full_array, scale_m, invalid_value
+        return full_array[:, : msg.width], full_array, scale_m, invalid_value
 
     @staticmethod
     def encoding_info(encoding, is_bigendian):
@@ -487,7 +519,7 @@ class RobotDepthMaskNode(Node):
         output.encoding = "32FC1"
         output.is_bigendian = False
         output.step = output.width * np.dtype(np.float32).itemsize
-        output.data = visualization.tobytes()
+        output.data = as_ros_image_data(visualization)
         self.predicted_depth_pub.publish(output)
 
     def publish_removed_pointcloud(
@@ -530,6 +562,40 @@ class RobotDepthMaskNode(Node):
             self.get_logger().warn(message)
         else:
             self.get_logger().info(message)
+
+    def maybe_log_statistics(self, now=None):
+        """Periodically report rates, drops, and successful callback latency."""
+        if self.statistics_period_s <= 0.0:
+            return
+        now = time.monotonic() if now is None else now
+        elapsed_s = now - self.statistics_started_at
+        if elapsed_s < self.statistics_period_s:
+            return
+        processed = self.statistics_processed
+        published = processed + self.statistics_passthrough
+        average_ms = (
+            self.statistics_processing_time_s * 1000.0 / processed
+            if processed > 0 else 0.0
+        )
+        self.get_logger().info(
+            "Robot depth mask stats: "
+            f"input={self.statistics_received / elapsed_s:.2f} Hz, "
+            f"output={published / elapsed_s:.2f} Hz, "
+            f"filtered={processed}, "
+            f"rate_limited={self.statistics_rate_limited}, "
+            f"passthrough={self.statistics_passthrough}, "
+            f"missing_drops={self.statistics_missing_drops}, "
+            f"processing_avg={average_ms:.2f} ms, "
+            f"processing_max={self.statistics_max_processing_time_s * 1000.0:.2f} ms"
+        )
+        self.statistics_started_at = now
+        self.statistics_received = 0
+        self.statistics_processed = 0
+        self.statistics_rate_limited = 0
+        self.statistics_passthrough = 0
+        self.statistics_missing_drops = 0
+        self.statistics_processing_time_s = 0.0
+        self.statistics_max_processing_time_s = 0.0
 
 
 def main(args=None):

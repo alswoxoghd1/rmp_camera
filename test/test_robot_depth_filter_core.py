@@ -1,6 +1,7 @@
 import numpy as np
 
 from rmp_camera.robot_depth_filter_core import (
+    as_ros_image_data,
     predict_sphere_surface_depth,
     surface_depth_removal_mask,
 )
@@ -78,3 +79,16 @@ def test_mismatched_center_and_radius_counts_are_rejected():
         assert "same number" in str(exc)
     else:
         raise AssertionError("expected mismatched sphere arrays to fail")
+
+
+def test_ros_image_data_uses_uint8_array_fast_path():
+    image = np.asarray([[1, 256], [1024, 65535]], dtype=np.uint16)
+    data = as_ros_image_data(image)
+    assert data.typecode == "B"
+    assert data.tobytes() == image.tobytes()
+
+
+def test_ros_image_data_makes_noncontiguous_input_contiguous():
+    image = np.arange(24, dtype=np.uint16).reshape(4, 6)[:, ::2]
+    data = as_ros_image_data(image)
+    assert data.tobytes() == np.ascontiguousarray(image).tobytes()

@@ -1,6 +1,21 @@
-"""Pure NumPy helpers for depth-aware robot self filtering."""
+"""Pure helpers for depth-aware robot self filtering."""
+
+from array import array
 
 import numpy as np
+
+
+def as_ros_image_data(image):
+    """
+    Return contiguous bytes through the ROS ``uint8[]`` fast path.
+
+    Assigning a Python ``bytes`` object to a generated ROS 2 ``uint8[]``
+    field makes the Python message setter validate every byte twice.  An
+    ``array('B')`` is accepted directly and avoids millions of Python-level
+    checks for each depth frame.
+    """
+    contiguous = np.ascontiguousarray(image)
+    return array("B", contiguous.tobytes(order="C"))
 
 
 def predict_sphere_surface_depth(
@@ -14,7 +29,8 @@ def predict_sphere_surface_depth(
     min_depth_m=0.05,
     max_depth_m=5.0,
 ):
-    """Render the nearest optical-Z intersection of robot spheres per pixel.
+    """
+    Render the nearest optical-Z intersection of robot spheres per pixel.
 
     Depth images report optical-axis Z rather than Euclidean ray length.  Rays
     are therefore parameterized as ``[(u-cx)/fx * z, (v-cy)/fy * z, z]`` so
@@ -103,7 +119,8 @@ def surface_depth_removal_mask(
     max_depth_m=5.0,
     mask_shadow_behind_robot=False,
 ):
-    """Classify measured depth that belongs to the predicted robot surface.
+    """
+    Classify measured depth that belongs to the predicted robot surface.
 
     Measurements clearly in front of the predicted surface are preserved.  A
     configurable asymmetric band accounts for calibration and timing errors.

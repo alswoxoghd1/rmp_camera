@@ -105,6 +105,10 @@ depth, camera calibration, measured/normalized joints, robot collision markers,
 and TF under `~/bags/nvblox_validation`. Stop it with `Ctrl+C`.
 Use `start_pipeline:=false` when the live pipeline is already running.
 
+Bag playback runs once by default and exits cleanly. Add `repeat_bag:=true`
+only when repeated passes are needed; each repeated pass intentionally restarts
+the complete Nvblox graph so maps and sphere tracks begin from a clean state.
+
 Bag self-filtering requires time-aligned joint states or recorded collision
 sphere markers. A depth-only bag cannot reconstruct a moving robot pose.
 
