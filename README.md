@@ -1,5 +1,75 @@
 # camera_rmp
 
+## 최근 학습된 다이나믹 모델 컨텍스트
+
+현재 확인된 최신 체크포인트는 다음 LPB visual dynamics 모델이다.
+
+```text
+모델 이름: train_lpb_visual_dynamics_real_relative
+체크포인트: /home/son_rb/folk_lpb_interactive_diffusion_policy_repo/outputs/2026-08-26_00-20-22/checkpoints/latest.ckpt
+정규화 파일: /home/son_rb/folk_lpb_interactive_diffusion_policy_repo/outputs/2026-08-26_00-20-22/normalizer.pth
+```
+
+이 모델은 로봇의 물리 파라미터를 직접 추정하는 모델이 아니라, `image0`와
+proprioception(position, quaternion, gripper), action을 이용해 LPB latent/visual
+dynamics를 예측하는 `LPBVisualDynamicsModel`이다. 이미지 encoder는 frozen이고
+ViT predictor를 학습했다. 설정은 `frameskip=6`, `num_hist=1`, `num_pred=1`,
+100 epochs이며 마지막 epoch의 train loss는 약 `0.0003886`이다.
+
+학습 데이터는 다음 HDF5이다.
+
+```text
+/home/son_rb/rb_ws/src/robotory_rb10_ros2/data/0825_cowork_vr_override/cowork_vr_override_dp0010_training_ready_relative_10hz.hdf5
+```
+
+데이터는 `lpb_goal_only_vr_override` 실행에서 생성된 cowork 조작 기록으로,
+3개 demo와 총 12,464개 샘플(10 Hz 기준 약 20분 46초)을 포함한다. base policy
+`/home/son_rb/Downloads/low_epoch_ckpt_DP/epoch=0010-train_loss=0.0075.ckpt`를
+실행하면서 사용자가 일부 구간을 Vive/VR teleop으로 override한 데이터다.
+`control_mode=3`인 VR override 구간은 3,526 samples(약 28.3%)이며 나머지는
+자동/base 구간이다. `avoidance_flag`는 전체 샘플에서 0이므로 RMP avoidance
+개입 데이터셋은 아니다. 모든 action은 변환 과정에서 보정되어 저장되었다.
+
+## Offline robot self-filter validation from recorded TF
+
+Validation bags that contain raw depth, CameraInfo, `/tf`, and `/tf_static`
+can be checked even when they do not contain JointState. The validator applies
+the same collision-sphere surface renderer and tolerance classifier used by
+`robot_depth_mask_node`, selecting the closest recorded robot TF for every
+sampled depth frame.
+
+Use the dynamic experiment launch as the entry point:
+
+```bash
+ros2 launch rmp_camera d435_nvblox_dynamic_spheres.launch.py \
+  source:=bag \
+  bag_path:=/home/son_rb/bags/nvblox_validation/robot_people \
+  offline_self_filter_validation_only:=true
+```
+
+The default checks every tenth depth frame, writes a JSON report under
+`/tmp/rmp_camera_self_filter_validation`, and saves diagnostic images with:
+
+- measured depth;
+- predicted robot depth;
+- classification (`red=removed`, `green=foreground kept`, `blue=behind`);
+- robot-masked depth.
+
+Use `offline_self_filter_sample_every:=1` for every depth frame. To run the
+validator while the existing bag/Nvblox experiment also plays, set
+`run_offline_self_filter_validation:=true` instead of validation-only mode.
+
+The CLI can also check multiple bags directly:
+
+```bash
+ros2 run rmp_camera validate_robot_self_filter_bag \
+  /home/son_rb/bags/nvblox_validation/only_robot \
+  /home/son_rb/bags/nvblox_validation/robot_people \
+  --sample-every 10 \
+  --debug-dir /tmp/rmp_camera_self_filter_validation \
+  --json-report /tmp/rmp_camera_self_filter_validation/report.json
+```
+
 ## Static dense-ESDF medial spheres
 
 The optional `esdf_medial_sphere_node` queries nvblox's

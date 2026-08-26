@@ -158,6 +158,22 @@ def generate_launch_description():
     raw_depth_image_topic = LaunchConfiguration("raw_depth_image_topic")
     depth_camera_info_topic = LaunchConfiguration("depth_camera_info_topic")
     masked_depth_image_topic = LaunchConfiguration("masked_depth_image_topic")
+    robot_depth_filter_mode = LaunchConfiguration("robot_depth_filter_mode")
+    robot_depth_surface_sphere_padding_m = LaunchConfiguration(
+        "robot_depth_surface_sphere_padding_m"
+    )
+    robot_depth_surface_front_tolerance_m = LaunchConfiguration(
+        "robot_depth_surface_front_tolerance_m"
+    )
+    robot_depth_surface_back_tolerance_m = LaunchConfiguration(
+        "robot_depth_surface_back_tolerance_m"
+    )
+    robot_depth_mask_shadow_behind_robot = LaunchConfiguration(
+        "robot_depth_mask_shadow_behind_robot"
+    )
+    publish_robot_predicted_depth = LaunchConfiguration(
+        "publish_robot_predicted_depth"
+    )
     publish_robot_removal_debug = LaunchConfiguration("publish_robot_removal_debug")
     robot_depth_mask_removed_points_topic = LaunchConfiguration(
         "robot_depth_mask_removed_points_topic"
@@ -177,6 +193,9 @@ def generate_launch_description():
     robot_margin_m = LaunchConfiguration("robot_margin_m")
     robot_depth_mask_margin_m = LaunchConfiguration("robot_depth_mask_margin_m")
     robot_pointcloud_filter_margin_m = LaunchConfiguration("robot_pointcloud_filter_margin_m")
+    enable_robot_pointcloud_volume_filter = LaunchConfiguration(
+        "enable_robot_pointcloud_volume_filter"
+    )
     use_time_synchronized_robot_markers = LaunchConfiguration(
         "use_time_synchronized_robot_markers"
     )
@@ -538,6 +557,10 @@ def generate_launch_description():
                     publish_robot_removal_debug,
                     value_type=bool,
                 ),
+                "filter_robot_volume": ParameterValue(
+                    enable_robot_pointcloud_volume_filter,
+                    value_type=bool,
+                ),
                 "target_frame": global_frame,
                 "robot_margin_m": robot_pointcloud_filter_margin_m,
                 "voxel_size_m": vision_filter_voxel_size_m,
@@ -578,7 +601,19 @@ def generate_launch_description():
                     publish_robot_removal_debug,
                     value_type=bool,
                 ),
+                "publish_predicted_depth": ParameterValue(
+                    publish_robot_predicted_depth,
+                    value_type=bool,
+                ),
+                "filter_mode": robot_depth_filter_mode,
                 "robot_margin_m": robot_depth_mask_margin_m,
+                "surface_sphere_padding_m": robot_depth_surface_sphere_padding_m,
+                "surface_front_tolerance_m": robot_depth_surface_front_tolerance_m,
+                "surface_back_tolerance_m": robot_depth_surface_back_tolerance_m,
+                "mask_shadow_behind_robot": ParameterValue(
+                    robot_depth_mask_shadow_behind_robot,
+                    value_type=bool,
+                ),
                 "max_rate_hz": vision_pipeline_rate_hz,
                 "passthrough_on_missing_robot": True,
                 "use_time_synchronized_robot_markers": ParameterValue(
@@ -1013,6 +1048,36 @@ def generate_launch_description():
                 "masked_depth_image_topic",
                 default_value="/rmp_camera/robot_masked_depth/image_rect_raw",
             ),
+            DeclareLaunchArgument(
+                "robot_depth_filter_mode",
+                default_value="surface_depth",
+                choices=["volume", "surface_depth"],
+                description=(
+                    "Robot depth self-filter: depth-aware surface matching or "
+                    "legacy volume masking."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "robot_depth_surface_sphere_padding_m",
+                default_value="0.0",
+                description="Padding applied only while rendering predicted robot surfaces.",
+            ),
+            DeclareLaunchArgument(
+                "robot_depth_surface_front_tolerance_m",
+                default_value="0.02",
+            ),
+            DeclareLaunchArgument(
+                "robot_depth_surface_back_tolerance_m",
+                default_value="0.03",
+            ),
+            DeclareLaunchArgument(
+                "robot_depth_mask_shadow_behind_robot",
+                default_value="False",
+            ),
+            DeclareLaunchArgument(
+                "publish_robot_predicted_depth",
+                default_value="False",
+            ),
             DeclareLaunchArgument("publish_robot_removal_debug", default_value="True"),
             DeclareLaunchArgument(
                 "robot_depth_mask_removed_points_topic",
@@ -1053,6 +1118,14 @@ def generate_launch_description():
             DeclareLaunchArgument("robot_margin_m", default_value="0.08"),
             DeclareLaunchArgument("robot_depth_mask_margin_m", default_value="0.06"),
             DeclareLaunchArgument("robot_pointcloud_filter_margin_m", default_value="0.06"),
+            DeclareLaunchArgument(
+                "enable_robot_pointcloud_volume_filter",
+                default_value="False",
+                description=(
+                    "Optionally apply legacy sphere-volume filtering to the "
+                    "separate obstacle pointcloud path."
+                ),
+            ),
             DeclareLaunchArgument("use_time_synchronized_robot_markers", default_value="True"),
             DeclareLaunchArgument("robot_marker_buffer_duration_s", default_value="1.0"),
             DeclareLaunchArgument("robot_marker_max_stamp_delta_s", default_value="0.15"),
@@ -1174,12 +1247,13 @@ def generate_launch_description():
             DeclareLaunchArgument("esdf_slice_min_height_m", default_value="0.35"),
             DeclareLaunchArgument("esdf_slice_max_height_m", default_value="0.75"),
             DeclareLaunchArgument("vision_pipeline_rate_hz", default_value="10.0"),
-            DeclareLaunchArgument("x", default_value="1.403303227"),
-            DeclareLaunchArgument("y", default_value="-1.733655308"),
-            DeclareLaunchArgument("z", default_value="0.912738743"),
-            DeclareLaunchArgument("roll", default_value="-0.108681179"),
-            DeclareLaunchArgument("pitch", default_value="0.233046210"),
-            DeclareLaunchArgument("yaw", default_value="1.782183343"),
+            # 2026-08-11 ChArUco eye-to-hand calibration: base_link -> camera0_link.
+            DeclareLaunchArgument("x", default_value="1.458262715"),
+            DeclareLaunchArgument("y", default_value="-1.804955216"),
+            DeclareLaunchArgument("z", default_value="0.916527059"),
+            DeclareLaunchArgument("roll", default_value="-0.001618987"),
+            DeclareLaunchArgument("pitch", default_value="0.257128767"),
+            DeclareLaunchArgument("yaw", default_value="2.013029376"),
             container,
             static_tf,
             odom_tf,

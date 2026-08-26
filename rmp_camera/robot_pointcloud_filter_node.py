@@ -31,6 +31,7 @@ class RobotPointCloudFilterNode(Node):
         self.declare_parameter("output_cloud_topic", "/rmp_camera/robot_free_pointcloud")
         self.declare_parameter("removed_cloud_topic", "/rmp_camera/robot_pointcloud_removed_points")
         self.declare_parameter("publish_removed_cloud", True)
+        self.declare_parameter("filter_robot_volume", True)
         self.declare_parameter("target_frame", "base_link")
         self.declare_parameter("robot_margin_m", 0.05)
         self.declare_parameter("min_depth_m", 0.05)
@@ -51,6 +52,7 @@ class RobotPointCloudFilterNode(Node):
         self.output_cloud_topic = self.get_parameter("output_cloud_topic").value
         self.removed_cloud_topic = self.get_parameter("removed_cloud_topic").value
         self.publish_removed_cloud = bool(self.get_parameter("publish_removed_cloud").value)
+        self.filter_robot_volume = bool(self.get_parameter("filter_robot_volume").value)
         self.target_frame = self.get_parameter("target_frame").value
         self.robot_margin_m = float(self.get_parameter("robot_margin_m").value)
         self.min_depth_m = float(self.get_parameter("min_depth_m").value)
@@ -108,6 +110,7 @@ class RobotPointCloudFilterNode(Node):
         self.get_logger().info(
             "Robot point cloud filter started: "
             f"{self.input_cloud_topic} -> {self.output_cloud_topic}, "
+            f"volume_filter={'on' if self.filter_robot_volume else 'off'}, "
             f"target_frame={self.target_frame}, robot_margin={self.robot_margin_m:.3f} m, "
             f"removed_cloud={self.removed_cloud_topic if self.publish_removed_cloud else 'off'}"
         )
@@ -156,30 +159,31 @@ class RobotPointCloudFilterNode(Node):
         points_base = transform_points(points, target_from_cloud)
 
         keep_mask = np.ones(len(points_base), dtype=bool)
-        robot_markers = self.select_robot_markers(msg.header.stamp)
-        if robot_markers is None:
-            if not self.passthrough_on_missing_robot:
-                self.log_throttled("Waiting for robot collision sphere markers.", warn=True)
-                return
-            self.log_throttled(
-                "Robot collision sphere markers are unavailable; publishing unfiltered cloud.",
-                warn=True,
-            )
-        else:
-            centers, radii, _ = marker_spheres(robot_markers)
-            if len(centers) == 0:
+        if self.filter_robot_volume:
+            robot_markers = self.select_robot_markers(msg.header.stamp)
+            if robot_markers is None:
                 if not self.passthrough_on_missing_robot:
-                    self.log_throttled("Robot marker array has no sphere markers.", warn=True)
+                    self.log_throttled("Waiting for robot collision sphere markers.", warn=True)
                     return
                 self.log_throttled(
-                    "Robot marker array has no sphere markers; publishing unfiltered cloud.",
+                    "Robot collision sphere markers are unavailable; publishing unfiltered cloud.",
                     warn=True,
                 )
             else:
-                expanded_radii = radii + self.robot_margin_m
-                for center, radius in zip(centers, expanded_radii):
-                    inside = np.sum((points_base - center) ** 2, axis=1) < radius * radius
-                    keep_mask &= ~inside
+                centers, radii, _ = marker_spheres(robot_markers)
+                if len(centers) == 0:
+                    if not self.passthrough_on_missing_robot:
+                        self.log_throttled("Robot marker array has no sphere markers.", warn=True)
+                        return
+                    self.log_throttled(
+                        "Robot marker array has no sphere markers; publishing unfiltered cloud.",
+                        warn=True,
+                    )
+                else:
+                    expanded_radii = radii + self.robot_margin_m
+                    for center, radius in zip(centers, expanded_radii):
+                        inside = np.sum((points_base - center) ** 2, axis=1) < radius * radius
+                        keep_mask &= ~inside
 
         filtered = points_base[keep_mask]
         removed = points_base[~keep_mask]

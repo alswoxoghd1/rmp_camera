@@ -85,6 +85,14 @@ def _launch_setup(context):
     run_static = _as_bool(LaunchConfiguration("run_esdf_medial_spheres").perform(context))
     run_dynamic = _as_bool(LaunchConfiguration("run_dynamic_obstacle_spheres").perform(context))
     run_fusion = _as_bool(LaunchConfiguration("run_obstacle_sphere_fusion").perform(context))
+    validation_only = _as_bool(
+        LaunchConfiguration("offline_self_filter_validation_only").perform(context)
+    )
+    run_offline_validation = validation_only or _as_bool(
+        LaunchConfiguration("run_offline_self_filter_validation").perform(context)
+    )
+    if run_offline_validation and source != "bag":
+        raise RuntimeError("offline self-filter validation requires source=bag")
     run_robot_self_filter = _as_bool(
         LaunchConfiguration("run_robot_self_filter").perform(context))
     run_robot_collision_spheres = (
@@ -140,6 +148,37 @@ def _launch_setup(context):
             raise RuntimeError(f"rosbag directory does not exist: {bag_path}")
         bag_rate = bag_rate_override or str(experiment.get("bag_rate", 1.0))
 
+    validation_action = None
+    if run_offline_validation:
+        validation_cmd = [
+            "ros2", "run", "rmp_camera", "validate_robot_self_filter_bag",
+            bag_path,
+            "--sample-every",
+            LaunchConfiguration("offline_self_filter_sample_every").perform(context),
+            "--max-frames",
+            LaunchConfiguration("offline_self_filter_max_frames").perform(context),
+            "--front-tolerance-m",
+            LaunchConfiguration(
+                "offline_self_filter_front_tolerance_m").perform(context),
+            "--back-tolerance-m",
+            LaunchConfiguration(
+                "offline_self_filter_back_tolerance_m").perform(context),
+            "--surface-sphere-padding-m",
+            LaunchConfiguration(
+                "offline_self_filter_surface_sphere_padding_m").perform(context),
+        ]
+        debug_dir = LaunchConfiguration(
+            "offline_self_filter_debug_dir").perform(context).strip()
+        json_report = LaunchConfiguration(
+            "offline_self_filter_json_report").perform(context).strip()
+        if debug_dir:
+            validation_cmd.extend(["--debug-dir", debug_dir])
+        if json_report:
+            validation_cmd.extend(["--json-report", json_report])
+        validation_action = ExecuteProcess(cmd=validation_cmd, output="screen")
+        if validation_only:
+            return [validation_action]
+
     # Rewinding /clock with ros2 bag --loop leaves the accumulated Nvblox map
     # and sphere tracks alive. When repetition is explicitly requested, run
     # one bag per child launch and respawn the complete processing graph so
@@ -191,6 +230,8 @@ def _launch_setup(context):
 
     actions = []
     input_actions = []
+    if validation_action is not None:
+        actions.append(validation_action)
     if source == "bag":
         bag_play = ExecuteProcess(
             cmd=["ros2", "bag", "play", bag_path, "--clock", "--rate",
@@ -317,6 +358,25 @@ def _launch_setup(context):
                     "robot_sphere_marker_topic":
                         "/rmp_camera/robot_collision_sphere_markers",
                     "output_depth_topic": self_filter_output_depth_topic,
+                    "predicted_depth_topic":
+                        "/rmp_camera/robot_predicted_depth/image_rect_raw",
+                    "removed_points_topic":
+                        "/rmp_camera/robot_depth_mask_removed_points",
+                    "publish_removed_points": _as_bool(experiment.get(
+                        "robot_depth_publish_removed_points", True)),
+                    "publish_predicted_depth": _as_bool(experiment.get(
+                        "robot_depth_publish_predicted_depth", True)),
+                    "filter_mode": "volume",
+                    "surface_sphere_padding_m": float(experiment.get(
+                        "robot_depth_surface_sphere_padding_m", 0.0)),
+                    "surface_front_tolerance_m": float(experiment.get(
+                        "robot_depth_surface_front_tolerance_m", 0.02)),
+                    "surface_back_tolerance_m": float(experiment.get(
+                        "robot_depth_surface_back_tolerance_m", 0.03)),
+                    "mask_shadow_behind_robot": _as_bool(experiment.get(
+                        "robot_depth_mask_shadow_behind_robot", False)),
+                    "max_rate_hz": float(experiment.get(
+                        "robot_depth_mask_rate_hz", 30.0)),
                     "use_sim_time": use_sim_time,
                 },
             ],
@@ -449,6 +509,28 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "self_filter_output_depth_topic",
             default_value="/rmp_camera/robot_surface_filtered_depth/image_rect_raw"),
+        DeclareLaunchArgument(
+            "run_offline_self_filter_validation", default_value="false",
+            description="Run recorded-TF validation alongside bag playback"),
+        DeclareLaunchArgument(
+            "offline_self_filter_validation_only", default_value="false",
+            description="Run only offline validation; requires source=bag"),
+        DeclareLaunchArgument(
+            "offline_self_filter_sample_every", default_value="10"),
+        DeclareLaunchArgument(
+            "offline_self_filter_max_frames", default_value="0"),
+        DeclareLaunchArgument(
+            "offline_self_filter_front_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument(
+            "offline_self_filter_back_tolerance_m", default_value="0.03"),
+        DeclareLaunchArgument(
+            "offline_self_filter_surface_sphere_padding_m", default_value="0.0"),
+        DeclareLaunchArgument(
+            "offline_self_filter_debug_dir",
+            default_value="/tmp/rmp_camera_self_filter_validation"),
+        DeclareLaunchArgument(
+            "offline_self_filter_json_report",
+            default_value="/tmp/rmp_camera_self_filter_validation/report.json"),
         DeclareLaunchArgument("log_level", default_value="info"),
         OpaqueFunction(function=_launch_setup),
     ])

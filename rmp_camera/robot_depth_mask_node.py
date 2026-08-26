@@ -39,6 +39,7 @@ class RobotDepthMaskNode(Node):
         self.declare_parameter("publish_predicted_depth", False)
         self.declare_parameter("filter_mode", "volume")
         self.declare_parameter("robot_margin_m", 0.05)
+        self.declare_parameter("surface_sphere_padding_m", 0.0)
         self.declare_parameter("surface_front_tolerance_m", 0.02)
         self.declare_parameter("surface_back_tolerance_m", 0.03)
         self.declare_parameter("mask_shadow_behind_robot", False)
@@ -67,6 +68,10 @@ class RobotDepthMaskNode(Node):
             raise ValueError(
                 "filter_mode must be either 'volume' or 'surface_depth'")
         self.robot_margin_m = float(self.get_parameter("robot_margin_m").value)
+        self.surface_sphere_padding_m = max(
+            0.0,
+            float(self.get_parameter("surface_sphere_padding_m").value),
+        )
         self.surface_front_tolerance_m = float(
             self.get_parameter("surface_front_tolerance_m").value)
         self.surface_back_tolerance_m = float(
@@ -247,13 +252,12 @@ class RobotDepthMaskNode(Node):
             marker_to_depth
             @ np.c_[centers_base, np.ones(len(centers_base), dtype=np.float64)].T
         ).T[:, :3]
-        expanded_radii = radii + self.robot_margin_m
         predicted_depth = None
         if self.filter_mode == "surface_depth":
             predicted_depth = predict_sphere_surface_depth(
                 depth_array.shape,
                 centers_depth,
-                expanded_radii,
+                radii + self.surface_sphere_padding_m,
                 fx,
                 fy,
                 cx,
@@ -274,6 +278,7 @@ class RobotDepthMaskNode(Node):
             masked_depth = depth_array.copy()
             masked_depth[removed_mask] = invalid_value
         else:
+            expanded_radii = radii + self.robot_margin_m
             masked_depth, removed_mask = self.mask_depth(
                 depth_array,
                 centers_depth,
