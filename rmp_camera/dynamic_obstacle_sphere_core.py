@@ -187,6 +187,15 @@ class DynamicSphereResult:
     voxel_centers: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float64))
     uncovered_voxels: np.ndarray = field(
         default_factory=lambda: np.empty((0, 3), dtype=np.float64))
+    robot_rejected_voxels: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float64))
+    input_component_count: int = 0
+    robot_rejected_component_count: int = 0
+    robot_rejected_voxel_count: int = 0
+    robot_rejected_component_ids: list[int] = field(default_factory=list)
+    robot_component_overlap_fractions: list[float] = field(default_factory=list)
+    robot_rejected_component_bounds: list[tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=list)
     elapsed_ms: float = 0.0
     termination_reason: str = "empty_input"
 
@@ -314,6 +323,67 @@ def voxel_centers(indices: np.ndarray, params: DynamicSphereParameters) -> np.nd
     return origin + (indices.astype(np.float64) + 0.5) * params.voxel_size_m
 
 
+def voxel_robot_sphere_overlap_mask(
+    indices: np.ndarray,
+    params: DynamicSphereParameters,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> np.ndarray:
+    """Return which voxel AABBs intersect at least one robot sphere."""
+    voxel_indices = np.asarray(indices, dtype=np.int64)
+    if voxel_indices.size == 0:
+        return np.zeros(0, dtype=bool)
+    if voxel_indices.ndim != 2 or voxel_indices.shape[1] != 3:
+        raise ValueError("indices must have shape (N, 3)")
+
+    centers = _as_points(robot_sphere_centers)
+    radii = np.asarray(robot_sphere_radii, dtype=np.float64).reshape(-1)
+    if len(centers) != len(radii):
+        raise ValueError("robot sphere centers and radii must have equal length")
+    if margin_m < 0.0 or not np.isfinite(margin_m):
+        raise ValueError("robot sphere margin must be finite and non-negative")
+    if len(centers) == 0:
+        return np.zeros(len(voxel_indices), dtype=bool)
+    if not np.isfinite(centers).all() or not np.isfinite(radii).all():
+        raise ValueError("robot sphere geometry must be finite")
+    if np.any(radii <= 0.0):
+        raise ValueError("robot sphere radii must be positive")
+
+    origin = np.asarray(
+        (params.min_x_m, params.min_y_m, params.min_z_m), dtype=np.float64)
+    voxel_min = origin + voxel_indices.astype(np.float64) * params.voxel_size_m
+    voxel_max = voxel_min + params.voxel_size_m
+    overlaps = np.zeros(len(voxel_indices), dtype=bool)
+    for center, radius in zip(centers, radii):
+        closest = np.clip(center, voxel_min, voxel_max)
+        delta = closest - center
+        squared_distance = np.einsum("ij,ij->i", delta, delta)
+        overlaps |= squared_distance <= (radius + margin_m) ** 2
+        if overlaps.all():
+            break
+    return overlaps
+
+
+def component_robot_overlap_fraction(
+    indices: np.ndarray,
+    params: DynamicSphereParameters,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> tuple[float, np.ndarray]:
+    """Return robot-intersecting voxel fraction and the per-voxel mask."""
+    mask = voxel_robot_sphere_overlap_mask(
+        indices,
+        params,
+        robot_sphere_centers,
+        robot_sphere_radii,
+        margin_m,
+    )
+    fraction = float(np.mean(mask)) if len(mask) else 0.0
+    return fraction, mask
+
+
 def _boundary_depths(indices: np.ndarray, connectivity: int) -> np.ndarray:
     """Return integer erosion depth (one at the boundary) for each voxel."""
     offsets = neighbor_offsets(connectivity)
@@ -335,7 +405,11 @@ def _boundary_depths(indices: np.ndarray, connectivity: int) -> np.ndarray:
     return np.asarray([depths[tuple(int(v) for v in row)] for row in indices], dtype=np.float64)
 
 
-def _covered_mask(points: np.ndarray, spheres: Sequence[DynamicSphere], tolerance: float) -> np.ndarray:
+def _covered_mask(
+    points: np.ndarray,
+    spheres: Sequence[DynamicSphere],
+    tolerance: float,
+) -> np.ndarray:
     covered = np.zeros(len(points), dtype=bool)
     for sphere in spheres:
         delta = points - sphere.center
@@ -502,7 +576,9 @@ def _fixed_radius_cover(
         delta = centers - center
         uncovered &= np.einsum("ij,ij->i", delta, delta) > (
             radius + params.coverage_tolerance_m) ** 2
-        if 1.0 - float(np.count_nonzero(uncovered)) / max(1, len(centers)) >= params.target_coverage:
+        coverage = 1.0 - float(np.count_nonzero(uncovered)) / max(
+            1, len(centers))
+        if coverage >= params.target_coverage:
             break
     return spheres, uncovered
 
@@ -1194,7 +1270,11 @@ def _component_spheres(
 
     uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
     coverage = float(np.mean(~uncovered)) if len(uncovered) else 1.0
-    confidence = min(1.0, coverage * min(1.0, len(centers) / max(1, params.min_component_voxels * 2)))
+    confidence = min(
+        1.0,
+        coverage * min(
+            1.0, len(centers) / max(1, params.min_component_voxels * 2)),
+    )
     spheres = [replace(s, component_coverage=coverage, confidence=confidence) for s in spheres]
     return DynamicComponentResult(
         component_id=component_id,
@@ -1219,16 +1299,31 @@ def _component_spheres(
 
 
 def generate_dynamic_spheres(
-    points: np.ndarray | Sequence[Sequence[float]], params: DynamicSphereParameters,
+    points: np.ndarray | Sequence[Sequence[float]],
+    params: DynamicSphereParameters,
+    *,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]] | None = None,
+    robot_sphere_radii: np.ndarray | Sequence[float] | None = None,
+    robot_component_overlap_threshold: float = 1.0,
+    robot_sphere_margin_m: float = 0.0,
 ) -> DynamicSphereResult:
     """Generate bounded, deterministic obstacle spheres from dynamic XYZ points."""
     start = monotonic()
+    if not 0.0 <= robot_component_overlap_threshold <= 1.0:
+        raise ValueError("robot component overlap threshold must be in [0, 1]")
+    use_robot_filter = (
+        robot_sphere_centers is not None or robot_sphere_radii is not None)
+    if use_robot_filter and (
+        robot_sphere_centers is None or robot_sphere_radii is None
+    ):
+        raise ValueError("robot sphere centers and radii must be supplied together")
     indices = filter_and_voxelize(points, params)
     if len(indices) == 0:
         return DynamicSphereResult(elapsed_ms=(monotonic() - start) * 1000.0)
     raw_components = connected_components(indices, params.connectivity)
     raw_components = [c for c in raw_components if len(c) >= params.min_component_voxels]
     raw_components = raw_components[:params.max_components]
+    input_component_count = len(raw_components)
     if not raw_components:
         return DynamicSphereResult(
             elapsed_ms=(monotonic() - start) * 1000.0, termination_reason="noise_removed")
@@ -1238,8 +1333,31 @@ def generate_dynamic_spheres(
     all_spheres: list[DynamicSphere] = []
     all_voxels = []
     all_uncovered = []
+    robot_rejected_voxels = []
+    robot_rejected_component_ids = []
+    robot_component_overlap_fractions = []
+    robot_rejected_component_bounds = []
     for component_id, component in enumerate(raw_components):
         morphed = apply_morphology(component, params)
+        if use_robot_filter:
+            overlap_fraction, _ = component_robot_overlap_fraction(
+                morphed,
+                params,
+                robot_sphere_centers,
+                robot_sphere_radii,
+                robot_sphere_margin_m,
+            )
+            robot_component_overlap_fractions.append(overlap_fraction)
+            if overlap_fraction + 1e-12 >= robot_component_overlap_threshold:
+                robot_rejected_component_ids.append(component_id)
+                rejected_centers = voxel_centers(morphed, params)
+                robot_rejected_voxels.append(rejected_centers)
+                half_voxel = 0.5 * params.voxel_size_m
+                robot_rejected_component_bounds.append((
+                    np.min(rejected_centers, axis=0) - half_voxel,
+                    np.max(rejected_centers, axis=0) + half_voxel,
+                ))
+                continue
         result = _component_spheres(morphed, params, component_id, deadline)
         remaining = params.max_total_spheres - len(all_spheres)
         result.spheres = result.spheres[:max(0, remaining)]
@@ -1263,13 +1381,29 @@ def generate_dynamic_spheres(
         if len(all_spheres) >= params.max_total_spheres:
             break
     elapsed = (monotonic() - start) * 1000.0
+    rejected_voxels = (
+        np.vstack(robot_rejected_voxels)
+        if robot_rejected_voxels else np.empty((0, 3)))
+    if component_results:
+        termination_reason = "complete"
+    elif robot_rejected_component_ids:
+        termination_reason = "robot_components_removed"
+    else:
+        termination_reason = "noise_removed"
     return DynamicSphereResult(
         components=component_results,
         spheres=all_spheres,
         voxel_centers=np.vstack(all_voxels) if all_voxels else np.empty((0, 3)),
         uncovered_voxels=np.vstack(all_uncovered) if all_uncovered else np.empty((0, 3)),
+        robot_rejected_voxels=rejected_voxels,
+        input_component_count=input_component_count,
+        robot_rejected_component_count=len(robot_rejected_component_ids),
+        robot_rejected_voxel_count=len(rejected_voxels),
+        robot_rejected_component_ids=robot_rejected_component_ids,
+        robot_component_overlap_fractions=robot_component_overlap_fractions,
+        robot_rejected_component_bounds=robot_rejected_component_bounds,
         elapsed_ms=elapsed,
-        termination_reason="complete" if component_results else "noise_removed")
+        termination_reason=termination_reason)
 
 
 @dataclass
@@ -1295,7 +1429,11 @@ class DynamicSphereTracker:
         self._next_id = 0
         self._tracks: dict[int, _Track] = {}
 
-    def update(self, detections: Iterable[DynamicSphere], timestamp_sec: float) -> list[DynamicSphere]:
+    def update(
+        self,
+        detections: Iterable[DynamicSphere],
+        timestamp_sec: float,
+    ) -> list[DynamicSphere]:
         detections = list(detections)
         now = float(timestamp_sec)
         self._expire(now)
@@ -1338,6 +1476,35 @@ class DynamicSphereTracker:
                 track.missed_updates += 1
         self._expire(now)
         return [self._tracks[key].sphere for key in sorted(self._tracks)]
+
+    def clear(self) -> None:
+        """Drop all retained tracks while preserving monotonically increasing IDs."""
+        self._tracks.clear()
+
+    def remove_tracks_in_bounds(
+        self,
+        bounds: Iterable[tuple[np.ndarray, np.ndarray]],
+        padding_m: float = 0.0,
+    ) -> None:
+        """Drop tracks centered in rejected component bounds."""
+        boxes = [
+            (
+                np.asarray(lower, dtype=np.float64) - padding_m,
+                np.asarray(upper, dtype=np.float64) + padding_m,
+            )
+            for lower, upper in bounds
+        ]
+        rejected = [
+            track_id
+            for track_id, track in self._tracks.items()
+            if any(
+                np.all(track.sphere.center >= lower)
+                and np.all(track.sphere.center <= upper)
+                for lower, upper in boxes
+            )
+        ]
+        for track_id in rejected:
+            del self._tracks[track_id]
 
     def _expire(self, now: float) -> None:
         expired = [

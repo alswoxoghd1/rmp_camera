@@ -8,6 +8,7 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphereTracker,
     agglomerative_merge_dynamic_spheres,
     build_dynamic_sphere_search_state,
+    component_robot_overlap_fraction,
     _greedy_set_cover,
     _remove_redundant,
     _sphere_coverage_masks,
@@ -15,6 +16,7 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     dynamic_sphere_search_state_rank_key,
     generate_dynamic_spheres,
     minimum_k_dynamic_sphere_search,
+    voxel_robot_sphere_overlap_mask,
     voxel_centers,
 )
 
@@ -114,6 +116,84 @@ def test_small_noise_component_is_removed():
     result = generate_dynamic_spheres(points_for(indices, p), p)
     assert len(result.components) == 1
     assert len(result.voxel_centers) == 8
+
+
+def test_voxel_robot_overlap_uses_voxel_aabb_not_only_center():
+    p = params()
+    indices = np.asarray([(0, 0, 0), (1, 0, 0)], dtype=np.int64)
+    first_center = voxel_centers(indices[:1], p)[0]
+    robot_center = first_center + np.asarray((0.05, 0.0, 0.0))
+    mask = voxel_robot_sphere_overlap_mask(
+        indices, p, [robot_center], [0.001])
+    assert mask.tolist() == [True, True]
+
+
+def test_component_robot_overlap_fraction_counts_intersecting_voxels():
+    p = params()
+    indices = np.asarray([(x, 0, 0) for x in range(10)], dtype=np.int64)
+    robot_center = voxel_centers(indices[2:3], p)[0]
+    fraction, mask = component_robot_overlap_fraction(
+        indices, p, [robot_center], [0.01])
+    assert np.isclose(fraction, 0.1)
+    assert np.flatnonzero(mask).tolist() == [2]
+
+
+def test_robot_overlap_threshold_rejects_entire_component_at_equality():
+    p = params()
+    indices = np.asarray([(x, 0, 0) for x in range(10)], dtype=np.int64)
+    points = voxel_centers(indices, p)
+    robot_center = points[2]
+    result = generate_dynamic_spheres(
+        points,
+        p,
+        robot_sphere_centers=[robot_center],
+        robot_sphere_radii=[0.01],
+        robot_component_overlap_threshold=0.10,
+    )
+    assert not result.spheres
+    assert not result.components
+    assert result.robot_rejected_component_count == 1
+    assert result.robot_rejected_voxel_count == 10
+    assert result.robot_rejected_component_ids == [0]
+    assert np.isclose(result.robot_component_overlap_fractions[0], 0.1)
+    assert result.termination_reason == "robot_components_removed"
+
+
+def test_robot_overlap_below_threshold_keeps_component():
+    p = params()
+    indices = np.asarray([(x, 0, 0) for x in range(10)], dtype=np.int64)
+    points = voxel_centers(indices, p)
+    result = generate_dynamic_spheres(
+        points,
+        p,
+        robot_sphere_centers=[points[2]],
+        robot_sphere_radii=[0.01],
+        robot_component_overlap_threshold=0.11,
+    )
+    assert result.spheres
+    assert len(result.components) == 1
+    assert result.robot_rejected_component_count == 0
+    assert result.robot_rejected_voxel_count == 0
+
+
+def test_robot_filter_rejects_only_overlapping_component():
+    p = params(max_x_m=3.0)
+    indices = np.asarray(
+        [(x, 0, 0) for x in range(5)]
+        + [(x, 0, 0) for x in range(15, 20)],
+        dtype=np.int64,
+    )
+    points = voxel_centers(indices, p)
+    result = generate_dynamic_spheres(
+        points,
+        p,
+        robot_sphere_centers=[points[2]],
+        robot_sphere_radii=[0.01],
+        robot_component_overlap_threshold=0.10,
+    )
+    assert result.robot_rejected_component_ids == [0]
+    assert [component.component_id for component in result.components] == [1]
+    assert result.spheres
 
 
 def test_thin_shell_uses_fixed_radius_fallback():
@@ -340,6 +420,17 @@ def test_tracker_exponential_smoothing():
     assert np.isclose(result.raw_radius, 0.2)
 
 
+def test_tracker_removes_only_tracks_in_rejected_component_bounds():
+    tracker = DynamicSphereTracker(0.2, 1.0, 1.0, 5)
+    tracked = tracker.update([detection(0.0), detection(1.0)], 0.0)
+    retained_id = tracked[1].track_id
+    tracker.remove_tracks_in_bounds([
+        (np.asarray((-0.1, -0.1, -0.1)), np.asarray((0.1, 0.1, 0.1))),
+    ])
+    retained = tracker.update([], 0.1)
+    assert [sphere.track_id for sphere in retained] == [retained_id]
+
+
 def merge_dynamic_sphere(x, radius=0.10):
     return DynamicSphere(x, 0.0, 0.0, radius, radius + 0.01, 0)
 
@@ -439,6 +530,7 @@ def test_dynamic_feature_off_keeps_pre_merge_geometry():
 def test_dynamic_merge_geometry_is_deterministic_for_reversed_order():
     centers = np.asarray([(x, 0.0, 0.0) for x in (0.0, 0.08, 0.16, 0.24)])
     spheres = [merge_dynamic_sphere(x) for x in (0.0, 0.08, 0.16, 0.24)]
+
     def geometry(values):
         return [tuple(round(v, 12) for v in (
             s.x, s.y, s.z, s.raw_radius, s.output_radius)) for s in values]

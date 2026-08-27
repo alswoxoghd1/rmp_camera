@@ -123,7 +123,15 @@ class RobotDepthMaskNode(Node):
             depth=2,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
-        marker_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=2)
+        # Robot markers are a high-rate pose stream.  Prefer the newest sample
+        # instead of allowing reliable delivery retries to hold up newer poses
+        # under RViz/GPU load; timestamp history is maintained below in the
+        # in-process marker buffer.
+        marker_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
             self.camera_info_topic,
@@ -408,12 +416,18 @@ class RobotDepthMaskNode(Node):
             self.robot_marker_buffer,
             key=lambda item: abs(item[0] - target_ns),
         )
-        delta_ns = abs(best_stamp_ns - target_ns)
+        signed_delta_ns = best_stamp_ns - target_ns
+        delta_ns = abs(signed_delta_ns)
         if (
             self.robot_marker_max_stamp_delta_ns > 0
             and delta_ns > self.robot_marker_max_stamp_delta_ns
         ):
             delta_s = delta_ns / 1e9
+            marker_stamps = [item[0] for item in self.robot_marker_buffer]
+            relative_span_s = (
+                (min(marker_stamps) - target_ns) / 1e9,
+                (max(marker_stamps) - target_ns) / 1e9,
+            )
             action = (
                 "Using latest marker fallback."
                 if self.fallback_to_latest_marker_on_time_miss
@@ -421,7 +435,11 @@ class RobotDepthMaskNode(Node):
             )
             self.log_throttled(
                 "No close time-synchronized robot markers for depth mask: "
-                f"delta={delta_s:.3f}s. "
+                f"delta={delta_s:.3f}s, nearest signed delta="
+                f"{signed_delta_ns / 1e9:+.3f}s, buffer relative span="
+                f"[{relative_span_s[0]:+.3f}s, "
+                f"{relative_span_s[1]:+.3f}s], "
+                f"buffer size={len(self.robot_marker_buffer)}. "
                 + action,
                 warn=True,
             )

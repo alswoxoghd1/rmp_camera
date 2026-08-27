@@ -36,6 +36,8 @@ setup(
     entry_points={
         "console_scripts": [
             "robot_collision_sphere_node = rmp_camera.robot_collision_sphere_node:main",
+            "robot_sphere_marker_correction_node = "
+            "rmp_camera.robot_sphere_marker_correction_node:main",
             "esdf_query_debug_node = rmp_camera.esdf_query_debug_node:main",
             "esdf_collision_query_node = rmp_camera.esdf_collision_query_node:main",
             "esdf_obstacle_sphere_node = rmp_camera.esdf_obstacle_sphere_node:main",

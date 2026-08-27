@@ -10,7 +10,12 @@ from geometry_msgs.msg import Point
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
@@ -22,6 +27,7 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphereTracker,
     generate_dynamic_spheres,
 )
+from rmp_camera.vision_geometry import marker_spheres
 
 
 def _rotation_matrix(x, y, z, w):
@@ -46,9 +52,16 @@ class DynamicObstacleSphereNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.latest_points = np.empty((0, 3), dtype=np.float64)
         self.latest_stamp = self.get_clock().now().to_msg()
+        self.latest_points_received_monotonic = time.monotonic()
         self.latest_frame = self.target_frame
         self.have_message = False
         self.ever_received = False
+        self.pending_points_frame = None
+        self.latest_robot_markers = None
+        self.robot_marker_buffer = []
+        self.latest_robot_marker_delta_s = None
+        self.latest_robot_marker_signed_delta_s = None
+        self.latest_robot_marker_buffer_span_s = None
         self.previous_marker_ids: set[int] = set()
         self.last_warn_time = 0.0
         self.last_info_time = 0.0
@@ -61,11 +74,24 @@ class DynamicObstacleSphereNode(Node):
         self.subscription = self.create_subscription(
             PointCloud2, self.input_dynamic_points_topic, self._points_callback,
             qos_profile_sensor_data)
+        marker_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=self.robot_marker_subscription_depth,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+        self.robot_marker_subscription = self.create_subscription(
+            MarkerArray,
+            self.robot_sphere_marker_topic,
+            self._robot_marker_callback,
+            marker_qos,
+        )
         self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 2)
         self.sphere_pub = self.create_publisher(PointCloud2, self.sphere_cloud_topic, 2)
         self.voxel_pub = self.create_publisher(PointCloud2, self.dynamic_voxel_cloud_topic, 2)
         self.uncovered_pub = self.create_publisher(
             PointCloud2, self.uncovered_voxel_cloud_topic, 2)
+        self.robot_rejected_voxel_pub = self.create_publisher(
+            PointCloud2, self.robot_rejected_voxel_cloud_topic, 2)
         period = 1.0 if self.dynamic_update_rate_hz <= 0.0 else max(
             0.01, 1.0 / self.dynamic_update_rate_hz)
         self.timer = self.create_timer(period, self._tick)
@@ -79,7 +105,10 @@ class DynamicObstacleSphereNode(Node):
             f"empty_guard={self.dynamic_merge_enable_empty_space_guard}, "
             f"min_k={self.dynamic_enable_min_k_search}, "
             f"beam={self.dynamic_min_k_beam_width}, "
-            f"max_states={self.dynamic_min_k_max_states}")
+            f"max_states={self.dynamic_min_k_max_states}, "
+            f"robot_component_filter={self.robot_component_filter_enabled}, "
+            f"robot_overlap_threshold="
+            f"{self.robot_component_overlap_threshold:.3f}")
 
     def _declare_parameters(self):
         defaults = {
@@ -89,6 +118,10 @@ class DynamicObstacleSphereNode(Node):
             "sphere_cloud_topic": "/rmp_camera/dynamic_obstacle_sphere_cloud",
             "dynamic_voxel_cloud_topic": "/rmp_camera/dynamic_obstacle_voxels",
             "uncovered_voxel_cloud_topic": "/rmp_camera/dynamic_uncovered_voxels",
+            "robot_sphere_marker_topic":
+                "/rmp_camera/robot_collision_sphere_markers",
+            "robot_rejected_voxel_cloud_topic":
+                "/rmp_camera/dynamic_robot_rejected_voxels",
             "min_x_m": -3.0, "max_x_m": 3.0,
             "min_y_m": -3.0, "max_y_m": 3.0,
             "min_z_m": -0.2, "max_z_m": 2.5,
@@ -139,6 +172,18 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_sphere_ttl_sec": 0.8,
             "dynamic_max_missed_updates": 8,
             "dynamic_update_rate_hz": 10.0,
+            "robot_component_filter_enabled": False,
+            "robot_component_overlap_threshold": 0.10,
+            "robot_sphere_filter_margin_m": 0.0,
+            "robot_marker_expected_sphere_count": 35,
+            "robot_marker_require_expected_count": True,
+            "use_time_synchronized_robot_markers": True,
+            "robot_marker_buffer_duration_s": 1.0,
+            "robot_marker_max_stamp_delta_s": 0.05,
+            "robot_marker_sync_wait_timeout_s": 0.25,
+            "robot_marker_subscription_depth": 2,
+            "fallback_to_latest_marker_on_time_miss": False,
+            "robot_component_filter_fail_closed": True,
             "publish_debug_clouds": True,
         }
         for name, value in defaults.items():
@@ -148,7 +193,8 @@ class DynamicObstacleSphereNode(Node):
         string_names = (
             "input_dynamic_points_topic", "target_frame", "marker_topic",
             "sphere_cloud_topic", "dynamic_voxel_cloud_topic",
-            "uncovered_voxel_cloud_topic")
+            "uncovered_voxel_cloud_topic", "robot_sphere_marker_topic",
+            "robot_rejected_voxel_cloud_topic")
         for name in string_names:
             setattr(self, name, str(self.get_parameter(name).value))
         float_names = (
@@ -164,7 +210,10 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_sphere_ttl_sec", "dynamic_update_rate_hz",
             "dynamic_merge_max_radius_m", "dynamic_merge_max_radius_growth_ratio",
             "dynamic_merge_max_gap_m", "dynamic_merge_max_empty_fraction",
-            "dynamic_max_allowed_overlap_fraction")
+            "dynamic_max_allowed_overlap_fraction",
+            "robot_component_overlap_threshold", "robot_sphere_filter_margin_m",
+            "robot_marker_buffer_duration_s", "robot_marker_max_stamp_delta_s",
+            "robot_marker_sync_wait_timeout_s")
         for name in float_names:
             setattr(self, name, float(self.get_parameter(name).value))
         int_names = (
@@ -175,7 +224,9 @@ class DynamicObstacleSphereNode(Node):
             "dynamic_max_total_spheres", "dynamic_max_local_grid_voxels",
             "dynamic_max_missed_updates",
             "dynamic_merge_max_validation_voxels",
-            "dynamic_min_k_beam_width", "dynamic_min_k_max_states")
+            "dynamic_min_k_beam_width", "dynamic_min_k_max_states",
+            "robot_marker_expected_sphere_count",
+            "robot_marker_subscription_depth")
         for name in int_names:
             setattr(self, name, int(self.get_parameter(name).value))
         self.dynamic_enable_fixed_radius_fallback = bool(
@@ -199,7 +250,34 @@ class DynamicObstacleSphereNode(Node):
             self.get_parameter("dynamic_min_k_prefer_lower_overlap").value)
         self.dynamic_tracking_enabled = bool(
             self.get_parameter("dynamic_tracking_enabled").value)
+        self.robot_component_filter_enabled = bool(
+            self.get_parameter("robot_component_filter_enabled").value)
+        self.robot_marker_require_expected_count = bool(
+            self.get_parameter("robot_marker_require_expected_count").value)
+        self.use_time_synchronized_robot_markers = bool(
+            self.get_parameter("use_time_synchronized_robot_markers").value)
+        self.fallback_to_latest_marker_on_time_miss = bool(
+            self.get_parameter("fallback_to_latest_marker_on_time_miss").value)
+        self.robot_component_filter_fail_closed = bool(
+            self.get_parameter("robot_component_filter_fail_closed").value)
         self.publish_debug_clouds = bool(self.get_parameter("publish_debug_clouds").value)
+        if not 0.0 <= self.robot_component_overlap_threshold <= 1.0:
+            raise ValueError(
+                "robot_component_overlap_threshold must be in [0, 1]")
+        if self.robot_sphere_filter_margin_m < 0.0:
+            raise ValueError("robot_sphere_filter_margin_m must be non-negative")
+        if self.robot_marker_expected_sphere_count <= 0:
+            raise ValueError(
+                "robot_marker_expected_sphere_count must be positive")
+        if self.robot_marker_subscription_depth <= 0:
+            raise ValueError("robot_marker_subscription_depth must be positive")
+        if self.robot_marker_sync_wait_timeout_s < 0.0:
+            raise ValueError(
+                "robot_marker_sync_wait_timeout_s must be non-negative")
+        self.robot_marker_buffer_duration_ns = int(
+            max(0.0, self.robot_marker_buffer_duration_s) * 1e9)
+        self.robot_marker_max_stamp_delta_ns = int(
+            max(0.0, self.robot_marker_max_stamp_delta_s) * 1e9)
 
     def _core_parameters(self):
         return DynamicSphereParameters(
@@ -276,20 +354,217 @@ class DynamicObstacleSphereNode(Node):
                 return
         self.latest_points = points
         self.latest_stamp = message.header.stamp
+        self.latest_points_received_monotonic = time.monotonic()
         self.latest_frame = self.target_frame
         self.have_message = True
         self.ever_received = True
 
+    def _robot_marker_callback(self, message):
+        self.latest_robot_markers = message
+        stamp_ns = self._marker_stamp_ns(message)
+        if stamp_ns == 0:
+            stamp_ns = self._stamp_to_ns(self.get_clock().now().to_msg())
+        self.robot_marker_buffer.append((stamp_ns, message))
+        self._prune_robot_marker_buffer(stamp_ns)
+
+    def _select_robot_markers(self, stamp):
+        if not self.use_time_synchronized_robot_markers:
+            self.latest_robot_marker_delta_s = None
+            self.latest_robot_marker_signed_delta_s = None
+            self.latest_robot_marker_buffer_span_s = None
+            return self.latest_robot_markers
+        if not self.robot_marker_buffer:
+            self.latest_robot_marker_delta_s = None
+            self.latest_robot_marker_signed_delta_s = None
+            self.latest_robot_marker_buffer_span_s = None
+            return None
+        target_ns = self._stamp_to_ns(stamp)
+        if target_ns == 0:
+            self.latest_robot_marker_delta_s = None
+            self.latest_robot_marker_signed_delta_s = None
+            self.latest_robot_marker_buffer_span_s = None
+            return self.latest_robot_markers
+        best_stamp_ns, best_markers = min(
+            self.robot_marker_buffer,
+            key=lambda item: abs(item[0] - target_ns),
+        )
+        signed_delta_ns = best_stamp_ns - target_ns
+        delta_ns = abs(signed_delta_ns)
+        self.latest_robot_marker_delta_s = delta_ns / 1e9
+        self.latest_robot_marker_signed_delta_s = signed_delta_ns / 1e9
+        marker_stamps = [item[0] for item in self.robot_marker_buffer]
+        self.latest_robot_marker_buffer_span_s = (
+            (min(marker_stamps) - target_ns) / 1e9,
+            (max(marker_stamps) - target_ns) / 1e9,
+        )
+        if (
+            self.robot_marker_max_stamp_delta_ns > 0
+            and delta_ns > self.robot_marker_max_stamp_delta_ns
+        ):
+            if self.fallback_to_latest_marker_on_time_miss:
+                return self.latest_robot_markers
+            return None
+        return best_markers
+
+    def _robot_sphere_geometry(self, marker_array, stamp):
+        if marker_array is None:
+            return None
+        centers, radii, _ = marker_spheres(marker_array)
+        if (
+            self.robot_marker_require_expected_count
+            and len(centers) != self.robot_marker_expected_sphere_count
+        ):
+            self._warn_throttled(
+                "dropping dynamic frame: expected "
+                f"{self.robot_marker_expected_sphere_count} robot spheres, "
+                f"received {len(centers)}")
+            return None
+        if len(centers) == 0:
+            return None
+        marker_frames = {
+            marker.header.frame_id for marker in marker_array.markers
+            if marker.type == marker.SPHERE and marker.action == marker.ADD
+        }
+        if len(marker_frames) != 1 or not next(iter(marker_frames), ""):
+            self._warn_throttled(
+                "dropping dynamic frame: robot spheres need one valid frame")
+            return None
+        marker_frame = next(iter(marker_frames))
+        if marker_frame != self.target_frame:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.target_frame,
+                    marker_frame,
+                    stamp,
+                    timeout=Duration(seconds=0.05),
+                )
+                q = transform.transform.rotation
+                t = transform.transform.translation
+                centers = centers @ _rotation_matrix(q.x, q.y, q.z, q.w).T
+                centers += np.asarray((t.x, t.y, t.z), dtype=np.float64)
+            except TransformException as exc:
+                self._warn_throttled(
+                    "dropping dynamic frame: cannot transform robot spheres "
+                    f"{marker_frame}->{self.target_frame}: {exc}")
+                return None
+        if (
+            not np.isfinite(centers).all()
+            or not np.isfinite(radii).all()
+            or np.any(radii <= 0.0)
+        ):
+            self._warn_throttled(
+                "dropping dynamic frame: invalid robot sphere geometry")
+            return None
+        return centers, radii
+
+    def _prune_robot_marker_buffer(self, latest_stamp_ns):
+        if self.robot_marker_buffer_duration_ns <= 0:
+            self.robot_marker_buffer = self.robot_marker_buffer[-1:]
+            return
+        cutoff = latest_stamp_ns - self.robot_marker_buffer_duration_ns
+        self.robot_marker_buffer = [
+            item for item in self.robot_marker_buffer if item[0] >= cutoff]
+
+    @classmethod
+    def _marker_stamp_ns(cls, marker_array):
+        for marker in marker_array.markers:
+            stamp_ns = cls._stamp_to_ns(marker.header.stamp)
+            if stamp_ns != 0:
+                return stamp_ns
+        return 0
+
+    @staticmethod
+    def _stamp_to_ns(stamp):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
     def _tick(self):
         if not self.ever_received:
             return
-        points = self.latest_points if self.have_message else np.empty((0, 3), dtype=np.float64)
-        self.have_message = False
-        result = generate_dynamic_spheres(points, self._core_parameters())
+        if self.pending_points_frame is None and self.have_message:
+            self.pending_points_frame = (
+                self.latest_points,
+                self.latest_stamp,
+                self.latest_points_received_monotonic,
+            )
+            self.have_message = False
+        has_new_points_message = self.pending_points_frame is not None
+        if has_new_points_message:
+            points, point_stamp, received_monotonic = self.pending_points_frame
+        else:
+            points = np.empty((0, 3), dtype=np.float64)
+            point_stamp = self.latest_stamp
+            received_monotonic = time.monotonic()
+        robot_centers = None
+        robot_radii = None
+        robot_sphere_count = 0
+        if self.robot_component_filter_enabled and has_new_points_message:
+            robot_markers = self._select_robot_markers(point_stamp)
+            geometry = self._robot_sphere_geometry(robot_markers, point_stamp)
+            if geometry is None:
+                if self.robot_component_filter_fail_closed:
+                    waited_s = time.monotonic() - received_monotonic
+                    if waited_s < self.robot_marker_sync_wait_timeout_s:
+                        return
+                    delta = self.latest_robot_marker_delta_s
+                    delta_text = "unknown" if delta is None else f"{delta:.3f}s"
+                    signed_delta = getattr(
+                        self, "latest_robot_marker_signed_delta_s", None)
+                    signed_delta_text = (
+                        "unknown" if signed_delta is None
+                        else f"{signed_delta:+.3f}s")
+                    span = getattr(
+                        self, "latest_robot_marker_buffer_span_s", None)
+                    span_text = (
+                        "unknown" if span is None
+                        else f"[{span[0]:+.3f}s, {span[1]:+.3f}s]")
+                    self._warn_throttled(
+                        "dropping dynamic frame: synchronized robot spheres "
+                        f"unavailable after waiting {waited_s:.3f}s "
+                        f"(marker delta={delta_text}, nearest signed delta="
+                        f"{signed_delta_text}, buffer relative span={span_text}, "
+                        f"buffer size="
+                        f"{len(getattr(self, 'robot_marker_buffer', []))})")
+                    self.pending_points_frame = None
+                    self.tracker.clear()
+                    stamp = self.get_clock().now().to_msg()
+                    self._publish_sphere_cloud(stamp, [])
+                    self._publish_markers(stamp, [])
+                    if self.publish_debug_clouds:
+                        empty = np.empty((0, 3), dtype=np.float64)
+                        self._publish_xyz_cloud(self.voxel_pub, stamp, empty)
+                        self._publish_xyz_cloud(self.uncovered_pub, stamp, empty)
+                        self._publish_xyz_cloud(
+                            self.robot_rejected_voxel_pub, stamp, empty)
+                    return
+            else:
+                robot_centers, robot_radii = geometry
+                robot_sphere_count = len(robot_centers)
+        elif self.robot_component_filter_enabled:
+            # The timer also drives tracker missed-update/TTL behavior.  An
+            # empty timer tick is not a pointcloud frame, so reusing the last
+            # point timestamp here would create false marker-sync failures.
+            self.latest_robot_marker_delta_s = None
+            self.latest_robot_marker_signed_delta_s = None
+            self.latest_robot_marker_buffer_span_s = None
+        if has_new_points_message:
+            self.pending_points_frame = None
+        result = generate_dynamic_spheres(
+            points,
+            self._core_parameters(),
+            robot_sphere_centers=robot_centers,
+            robot_sphere_radii=robot_radii,
+            robot_component_overlap_threshold=(
+                self.robot_component_overlap_threshold),
+            robot_sphere_margin_m=self.robot_sphere_filter_margin_m,
+        )
         now = self.get_clock().now()
         now_sec = now.nanoseconds * 1e-9
         spheres = result.spheres
         if self.dynamic_tracking_enabled:
+            self.tracker.remove_tracks_in_bounds(
+                result.robot_rejected_component_bounds,
+                self.dynamic_association_distance_m,
+            )
             spheres = self.tracker.update(spheres, now_sec)
         stamp = now.to_msg()
         self._publish_sphere_cloud(stamp, spheres)
@@ -297,6 +572,11 @@ class DynamicObstacleSphereNode(Node):
         if self.publish_debug_clouds:
             self._publish_xyz_cloud(self.voxel_pub, stamp, result.voxel_centers)
             self._publish_xyz_cloud(self.uncovered_pub, stamp, result.uncovered_voxels)
+            self._publish_xyz_cloud(
+                self.robot_rejected_voxel_pub,
+                stamp,
+                result.robot_rejected_voxels,
+            )
         coverage = 1.0 - len(result.uncovered_voxels) / max(
             1, len(result.voxel_centers))
         pre_merge_count = sum(
@@ -326,6 +606,11 @@ class DynamicObstacleSphereNode(Node):
         overlap_constraint_ok = all(
             component.overlap_constraint_satisfied
             for component in result.components)
+        max_robot_component_overlap = max(
+            result.robot_component_overlap_fractions, default=0.0)
+        marker_delta_text = (
+            "n/a" if self.latest_robot_marker_delta_s is None
+            else f"{self.latest_robot_marker_delta_s:.3f}s")
         self._info_throttled(
             f"dynamic points={len(points)}, voxels={len(result.voxel_centers)}, "
             f"pre_merge_spheres={pre_merge_count}, "
@@ -333,6 +618,14 @@ class DynamicObstacleSphereNode(Node):
             f"min_k_spheres={min_k_count}, "
             f"generated_spheres={len(result.spheres)}, "
             f"tracked_spheres={len(spheres)}, "
+            f"components={result.input_component_count}, "
+            f"robot_rejected_components="
+            f"{result.robot_rejected_component_count}, "
+            f"robot_rejected_voxels={result.robot_rejected_voxel_count}, "
+            f"robot_spheres={robot_sphere_count}, "
+            f"marker_delta={marker_delta_text}, "
+            f"max_robot_component_overlap="
+            f"{max_robot_component_overlap:.3f}, "
             f"max_raw_overlap={max_raw_overlap:.3f}, "
             f"max_output_overlap={max_output_overlap:.3f}, "
             f"min_k_states={min_k_states}, min_k_reason={min_k_reason}, "

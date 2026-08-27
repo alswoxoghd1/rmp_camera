@@ -95,6 +95,8 @@ def _launch_setup(context):
         raise RuntimeError("offline self-filter validation requires source=bag")
     run_robot_self_filter = _as_bool(
         LaunchConfiguration("run_robot_self_filter").perform(context))
+    run_robot_sphere_marker_correction = _as_bool(
+        LaunchConfiguration("run_robot_sphere_marker_correction").perform(context))
     run_robot_collision_spheres = (
         run_robot_self_filter
         and _as_bool(LaunchConfiguration("run_robot_collision_spheres").perform(context))
@@ -117,6 +119,14 @@ def _launch_setup(context):
         "robot_sphere_config_path").perform(context).strip()
     self_filter_output_depth_topic = LaunchConfiguration(
         "self_filter_output_depth_topic").perform(context).strip()
+    raw_robot_marker_topic = "/rmp_camera/robot_collision_sphere_markers"
+    calibrated_robot_marker_topic = (
+        "/rmp_camera/calibrated_robot_collision_sphere_markers")
+    robot_marker_topic = (
+        calibrated_robot_marker_topic
+        if run_robot_sphere_marker_correction
+        else raw_robot_marker_topic
+    )
     log_level = LaunchConfiguration("log_level").perform(context)
     container_name = "rmp_camera_dynamic_nvblox_container"
 
@@ -346,6 +356,14 @@ def _launch_setup(context):
                 },
             ],
             arguments=["--ros-args", "--log-level", log_level]))
+    if run_robot_sphere_marker_correction:
+        actions.append(Node(
+            package="rmp_camera",
+            executable="robot_sphere_marker_correction_node",
+            name="robot_sphere_marker_correction_node",
+            output="screen",
+            parameters=[experiment_config, effective],
+            arguments=["--ros-args", "--log-level", log_level]))
     if run_robot_self_filter:
         actions.append(Node(
             package="rmp_camera", executable="robot_depth_mask_node",
@@ -355,8 +373,7 @@ def _launch_setup(context):
                 {
                     "input_depth_topic": depth_image_topic,
                     "camera_info_topic": "/camera0/camera/depth/camera_info",
-                    "robot_sphere_marker_topic":
-                        "/rmp_camera/robot_collision_sphere_markers",
+                    "robot_sphere_marker_topic": robot_marker_topic,
                     "output_depth_topic": self_filter_output_depth_topic,
                     "predicted_depth_topic":
                         "/rmp_camera/robot_predicted_depth/image_rect_raw",
@@ -403,19 +420,25 @@ def _launch_setup(context):
         actions.append(Node(
             package="rmp_camera", executable="esdf_medial_sphere_node",
             name="esdf_medial_sphere_node", output="screen",
-            parameters=[experiment_config, effective],
+            parameters=[experiment_config, effective, {
+                "robot_sphere_marker_topic": robot_marker_topic,
+            }],
             arguments=["--ros-args", "--log-level", log_level]))
     if run_dynamic:
         actions.append(Node(
             package="rmp_camera", executable="dynamic_obstacle_sphere_node",
             name="dynamic_obstacle_sphere_node", output="screen",
-            parameters=[experiment_config, effective],
+            parameters=[experiment_config, effective, {
+                "robot_sphere_marker_topic": robot_marker_topic,
+            }],
             arguments=["--ros-args", "--log-level", log_level]))
     if run_fusion:
         actions.append(Node(
             package="rmp_camera", executable="obstacle_sphere_fusion_node",
             name="obstacle_sphere_fusion_node", output="screen",
-            parameters=[experiment_config, effective],
+            parameters=[experiment_config, effective, {
+                "robot_sphere_marker_topic": robot_marker_topic,
+            }],
             arguments=["--ros-args", "--log-level", log_level]))
     if run_rviz:
         actions.append(Node(
@@ -490,6 +513,11 @@ def generate_launch_description():
             description=(
                 "Generate robot spheres from URDF and joint states; disable "
                 "when replaying recorded markers")),
+        DeclareLaunchArgument(
+            "run_robot_sphere_marker_correction", default_value="true",
+            description=(
+                "Relay raw robot sphere markers through the configurable "
+                "bag-safe correction transform")),
         DeclareLaunchArgument(
             "run_rb10_joint_state_source", default_value="true",
             description="Read measured RB10 joints directly in live-camera self-filter mode"),

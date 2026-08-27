@@ -39,14 +39,21 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Point, Vector3
 from nvblox_msgs.srv import EsdfAndGradients
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 from rmp_camera.esdf_medial_sphere_core import generate_medial_spheres
+from rmp_camera.vision_geometry import (
+    marker_spheres,
+    quaternion_to_matrix,
+)
 
 
 class DenseEsdfGrid:
@@ -112,8 +119,24 @@ class EsdfMedialSphereNode(Node):
         self.previous_marker_keys = set()
         self.last_info_time = 0.0
         self.last_warn_time = 0.0
+        self.latest_robot_markers = None
+        self.robot_marker_buffer = []
+        self.latest_robot_marker_delta_s = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.client = self.create_client(EsdfAndGradients, self.service_name)
+        marker_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=self.robot_marker_subscription_depth,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+        self.robot_marker_subscription = self.create_subscription(
+            MarkerArray,
+            self.robot_sphere_marker_topic,
+            self._robot_marker_callback,
+            marker_qos,
+        )
         self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 2)
         self.sphere_cloud_pub = self.create_publisher(
             PointCloud2, self.sphere_cloud_topic, 2
@@ -123,6 +146,9 @@ class EsdfMedialSphereNode(Node):
         )
         self.uncovered_cloud_pub = self.create_publisher(
             PointCloud2, self.uncovered_voxel_cloud_topic, 2
+        )
+        self.robot_rejected_voxel_pub = self.create_publisher(
+            PointCloud2, self.robot_rejected_voxel_cloud_topic, 2
         )
         period = 1.0 if self.update_rate_hz <= 0.0 else max(
             0.02, 1.0 / self.update_rate_hz
@@ -141,7 +167,10 @@ class EsdfMedialSphereNode(Node):
             f"merge_growth<={self.merge_max_radius_growth_ratio:.3f}, "
             f"merge_gap<={self.merge_max_gap_m:.3f} m, "
             f"merge_esdf_guard={self.merge_enable_esdf_guard}, "
-            f"merge_samples={self.merge_surface_sample_count}"
+            f"merge_samples={self.merge_surface_sample_count}, "
+            f"robot_component_filter={self.robot_component_filter_enabled}, "
+            f"robot_overlap_threshold="
+            f"{self.robot_component_overlap_threshold:.3f}"
         )
 
     def _declare_parameters(self):
@@ -185,6 +214,21 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("merge_max_free_space_distance_m", 0.08)
         self.declare_parameter("merge_surface_sample_count", 64)
         self.declare_parameter("merge_min_observed_surface_fraction", 0.70)
+        self.declare_parameter("robot_component_filter_enabled", False)
+        self.declare_parameter(
+            "robot_sphere_marker_topic",
+            "/rmp_camera/calibrated_robot_collision_sphere_markers",
+        )
+        self.declare_parameter("robot_component_overlap_threshold", 0.10)
+        self.declare_parameter("robot_sphere_filter_margin_m", 0.0)
+        self.declare_parameter("robot_marker_expected_sphere_count", 35)
+        self.declare_parameter("robot_marker_require_expected_count", True)
+        self.declare_parameter("use_time_synchronized_robot_markers", True)
+        self.declare_parameter("robot_marker_buffer_duration_s", 1.0)
+        self.declare_parameter("robot_marker_max_stamp_delta_s", 0.10)
+        self.declare_parameter("robot_marker_subscription_depth", 2)
+        self.declare_parameter("fallback_to_latest_marker_on_time_miss", False)
+        self.declare_parameter("robot_component_filter_fail_closed", True)
         self.declare_parameter("max_grid_voxels", 8000000)
         self.declare_parameter(
             "marker_topic", "/rmp_camera/esdf_medial_sphere_markers"
@@ -199,6 +243,10 @@ class EsdfMedialSphereNode(Node):
             "uncovered_voxel_cloud_topic",
             "/rmp_camera/esdf_medial_uncovered_voxels",
         )
+        self.declare_parameter(
+            "robot_rejected_voxel_cloud_topic",
+            "/rmp_camera/static_robot_rejected_voxels",
+        )
         self.declare_parameter("publish_debug_clouds", True)
 
     def _read_parameters(self):
@@ -209,6 +257,8 @@ class EsdfMedialSphereNode(Node):
             "sphere_cloud_topic",
             "inside_voxel_cloud_topic",
             "uncovered_voxel_cloud_topic",
+            "robot_sphere_marker_topic",
+            "robot_rejected_voxel_cloud_topic",
         ):
             setattr(self, name, str(self.get_parameter(name).value))
         for name in (
@@ -230,6 +280,10 @@ class EsdfMedialSphereNode(Node):
             "merge_max_gap_m",
             "merge_max_free_space_distance_m",
             "merge_min_observed_surface_fraction",
+            "robot_component_overlap_threshold",
+            "robot_sphere_filter_margin_m",
+            "robot_marker_buffer_duration_s",
+            "robot_marker_max_stamp_delta_s",
         ):
             setattr(self, name, float(self.get_parameter(name).value))
         for name in (
@@ -240,6 +294,8 @@ class EsdfMedialSphereNode(Node):
             "max_optimization_matrix_elements",
             "merge_surface_sample_count",
             "max_grid_voxels",
+            "robot_marker_expected_sphere_count",
+            "robot_marker_subscription_depth",
         ):
             setattr(self, name, int(self.get_parameter(name).value))
         self.aabb_min_m = np.array(
@@ -277,6 +333,21 @@ class EsdfMedialSphereNode(Node):
         )
         self.merge_enable_esdf_guard = self._as_bool(
             self.get_parameter("merge_enable_esdf_guard").value
+        )
+        self.robot_component_filter_enabled = self._as_bool(
+            self.get_parameter("robot_component_filter_enabled").value
+        )
+        self.robot_marker_require_expected_count = self._as_bool(
+            self.get_parameter("robot_marker_require_expected_count").value
+        )
+        self.use_time_synchronized_robot_markers = self._as_bool(
+            self.get_parameter("use_time_synchronized_robot_markers").value
+        )
+        self.fallback_to_latest_marker_on_time_miss = self._as_bool(
+            self.get_parameter("fallback_to_latest_marker_on_time_miss").value
+        )
+        self.robot_component_filter_fail_closed = self._as_bool(
+            self.get_parameter("robot_component_filter_fail_closed").value
         )
         self.publish_debug_clouds = self._as_bool(
             self.get_parameter("publish_debug_clouds").value
@@ -316,6 +387,127 @@ class EsdfMedialSphereNode(Node):
         if not 0.0 <= self.merge_min_observed_surface_fraction <= 1.0:
             raise ValueError(
                 "merge_min_observed_surface_fraction must be in [0, 1]")
+        if not 0.0 <= self.robot_component_overlap_threshold <= 1.0:
+            raise ValueError(
+                "robot_component_overlap_threshold must be in [0, 1]")
+        if self.robot_sphere_filter_margin_m < 0.0:
+            raise ValueError("robot_sphere_filter_margin_m must be non-negative")
+        if self.robot_marker_expected_sphere_count <= 0:
+            raise ValueError("robot_marker_expected_sphere_count must be positive")
+        if self.robot_marker_subscription_depth <= 0:
+            raise ValueError("robot_marker_subscription_depth must be positive")
+        self.robot_marker_buffer_duration_ns = int(
+            max(0.0, self.robot_marker_buffer_duration_s) * 1e9)
+        self.robot_marker_max_stamp_delta_ns = int(
+            max(0.0, self.robot_marker_max_stamp_delta_s) * 1e9)
+
+    def _robot_marker_callback(self, message):
+        self.latest_robot_markers = message
+        stamp_ns = self._marker_stamp_ns(message)
+        if stamp_ns == 0:
+            stamp_ns = self._stamp_to_ns(self.get_clock().now().to_msg())
+        self.robot_marker_buffer.append((stamp_ns, message))
+        self._prune_robot_marker_buffer(stamp_ns)
+
+    def _select_robot_markers(self, stamp):
+        if not self.use_time_synchronized_robot_markers:
+            self.latest_robot_marker_delta_s = None
+            return self.latest_robot_markers
+        if not self.robot_marker_buffer:
+            self.latest_robot_marker_delta_s = None
+            return None
+        target_ns = self._stamp_to_ns(stamp)
+        if target_ns == 0:
+            self.latest_robot_marker_delta_s = None
+            return self.latest_robot_markers
+        best_stamp_ns, best_markers = min(
+            self.robot_marker_buffer,
+            key=lambda item: abs(item[0] - target_ns),
+        )
+        delta_ns = abs(best_stamp_ns - target_ns)
+        self.latest_robot_marker_delta_s = delta_ns / 1e9
+        if (
+            self.robot_marker_max_stamp_delta_ns > 0
+            and delta_ns > self.robot_marker_max_stamp_delta_ns
+        ):
+            if self.fallback_to_latest_marker_on_time_miss:
+                return self.latest_robot_markers
+            return None
+        return best_markers
+
+    def _robot_sphere_geometry(self, marker_array, stamp):
+        if marker_array is None:
+            return None
+        centers, radii, _ = marker_spheres(marker_array)
+        if (
+            self.robot_marker_require_expected_count
+            and len(centers) != self.robot_marker_expected_sphere_count
+        ):
+            self._warn_throttled(
+                "dropping static sphere update: expected "
+                f"{self.robot_marker_expected_sphere_count} robot spheres, "
+                f"received {len(centers)}")
+            return None
+        if len(centers) == 0:
+            return None
+        marker_frames = {
+            marker.header.frame_id for marker in marker_array.markers
+            if marker.type == marker.SPHERE and marker.action == marker.ADD
+        }
+        if len(marker_frames) != 1 or not next(iter(marker_frames), ""):
+            self._warn_throttled(
+                "dropping static sphere update: robot spheres need one valid frame")
+            return None
+        marker_frame = next(iter(marker_frames))
+        if marker_frame != self.target_frame:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.target_frame,
+                    marker_frame,
+                    stamp,
+                    timeout=Duration(seconds=0.05),
+                )
+                rotation = quaternion_to_matrix(transform.transform.rotation)
+                translation = transform.transform.translation
+                centers = centers @ rotation.T
+                centers += np.asarray(
+                    (translation.x, translation.y, translation.z),
+                    dtype=np.float64,
+                )
+            except TransformException as exc:
+                self._warn_throttled(
+                    "dropping static sphere update: cannot transform robot spheres "
+                    f"{marker_frame}->{self.target_frame}: {exc}")
+                return None
+        if (
+            not np.isfinite(centers).all()
+            or not np.isfinite(radii).all()
+            or np.any(radii <= 0.0)
+        ):
+            self._warn_throttled(
+                "dropping static sphere update: invalid robot sphere geometry")
+            return None
+        return centers, radii
+
+    def _prune_robot_marker_buffer(self, latest_stamp_ns):
+        if self.robot_marker_buffer_duration_ns <= 0:
+            self.robot_marker_buffer = self.robot_marker_buffer[-1:]
+            return
+        cutoff = latest_stamp_ns - self.robot_marker_buffer_duration_ns
+        self.robot_marker_buffer = [
+            item for item in self.robot_marker_buffer if item[0] >= cutoff]
+
+    @classmethod
+    def _marker_stamp_ns(cls, marker_array):
+        for marker in marker_array.markers:
+            stamp_ns = cls._stamp_to_ns(marker.header.stamp)
+            if stamp_ns != 0:
+                return stamp_ns
+        return 0
+
+    @staticmethod
+    def _stamp_to_ns(stamp):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
     def tick(self):
         if self.pending:
@@ -369,6 +561,26 @@ class EsdfMedialSphereNode(Node):
             self._warn_throttled(f"Invalid/empty ESDF grid: {grid.error}")
             self.publish_empty(stamp)
             return
+        robot_centers = None
+        robot_radii = None
+        robot_sphere_count = 0
+        if self.robot_component_filter_enabled:
+            robot_markers = self._select_robot_markers(stamp)
+            geometry = self._robot_sphere_geometry(robot_markers, stamp)
+            if geometry is None:
+                if self.robot_component_filter_fail_closed:
+                    delta_text = (
+                        "unknown" if self.latest_robot_marker_delta_s is None
+                        else f"{self.latest_robot_marker_delta_s:.3f}s")
+                    self._warn_throttled(
+                        "dropping static sphere update: synchronized robot "
+                        f"spheres unavailable (marker delta={delta_text}, "
+                        f"buffer size={len(self.robot_marker_buffer)})")
+                    self.publish_empty(stamp)
+                    return
+            else:
+                robot_centers, robot_radii = geometry
+                robot_sphere_count = len(robot_centers)
         processing_started_at = time.monotonic()
         sentinel_tolerance = max(
             1e-9, abs(self.unobserved_distance_value) * 1e-12
@@ -413,6 +625,11 @@ class EsdfMedialSphereNode(Node):
                 merge_max_free_space_distance_m=self.merge_max_free_space_distance_m,
                 merge_surface_sample_count=self.merge_surface_sample_count,
                 merge_min_observed_surface_fraction=self.merge_min_observed_surface_fraction,
+                robot_sphere_centers=robot_centers,
+                robot_sphere_radii=robot_radii,
+                robot_component_overlap_threshold=(
+                    self.robot_component_overlap_threshold),
+                robot_sphere_margin_m=self.robot_sphere_filter_margin_m,
             )
         except Exception as exc:
             self._warn_throttled(f"ESDF medial sphere processing failed: {exc}")
@@ -424,15 +641,17 @@ class EsdfMedialSphereNode(Node):
         if self.publish_debug_clouds:
             self.publish_inside_cloud(stamp, grid, result)
             self.publish_uncovered_cloud(stamp, grid, result)
+            self.publish_robot_rejected_cloud(stamp, grid, result)
         warnings = []
         inside_count = int(np.count_nonzero(result.inside_mask))
+        raw_inside_count = inside_count + result.robot_rejected_voxel_count
         if negative_count == 0:
             warnings.append("no negative ESDF voxels; no fallback spheres generated")
-        elif inside_count == 0:
+        elif raw_inside_count == 0:
             warnings.append(
                 "no inside voxels after inside_epsilon_m; no fallback spheres generated"
             )
-        if inside_count and not result.components:
+        if raw_inside_count and result.input_component_count == 0:
             warnings.append("all inside components were below min_component_voxels")
         for component in result.components:
             if component.coverage + 1e-12 < self.target_coverage:
@@ -453,11 +672,24 @@ class EsdfMedialSphereNode(Node):
             f"{component.component_id}:{component.coverage:.3f}"
             for component in result.components
         )
+        marker_delta_text = (
+            "n/a" if self.latest_robot_marker_delta_s is None
+            else f"{self.latest_robot_marker_delta_s:.3f}s"
+        )
+        max_robot_component_overlap = max(
+            result.robot_component_overlap_fractions, default=0.0)
         self._info_throttled(
             "Dense ESDF medial spheres: "
             f"shape={grid.shape}, voxel={grid.voxel_size_m:.4f} m, "
-            f"observed={observed_count}, inside={inside_count}, "
-            f"components={len(result.components)}, "
+            f"observed={observed_count}, inside_pre_robot={raw_inside_count}, "
+            f"inside={inside_count}, components={result.input_component_count}, "
+            f"robot_rejected_components="
+            f"{result.robot_rejected_component_count}, "
+            f"robot_rejected_voxels={result.robot_rejected_voxel_count}, "
+            f"robot_spheres={robot_sphere_count}, "
+            f"marker_delta={marker_delta_text}, "
+            f"max_robot_component_overlap="
+            f"{max_robot_component_overlap:.3f}, "
             f"removed_small={result.removed_small_components}, "
             f"pre_merge_spheres={sum(c.pre_merge_sphere_count for c in result.components)}, "
             f"post_merge_spheres={len(result.spheres)}, coverage=[{coverage_text}], "
@@ -479,6 +711,11 @@ class EsdfMedialSphereNode(Node):
                 )
             )
             self.uncovered_cloud_pub.publish(
+                point_cloud2.create_cloud(
+                    self._header(stamp), self._uncovered_fields(), []
+                )
+            )
+            self.robot_rejected_voxel_pub.publish(
                 point_cloud2.create_cloud(
                     self._header(stamp), self._uncovered_fields(), []
                 )
@@ -598,6 +835,28 @@ class EsdfMedialSphereNode(Node):
                     )
                 )
         self.uncovered_cloud_pub.publish(
+            point_cloud2.create_cloud(
+                self._header(stamp), self._uncovered_fields(), rows
+            )
+        )
+
+    def publish_robot_rejected_cloud(self, stamp, grid, result):
+        rows = []
+        for index_array in result.robot_rejected_voxel_indices:
+            index = tuple(int(value) for value in index_array)
+            point = grid.origin_m + (index_array.astype(np.float64) + 0.5) * (
+                grid.voxel_size_m
+            )
+            rows.append(
+                (
+                    float(point[0]),
+                    float(point[1]),
+                    float(point[2]),
+                    float(grid.values[index]),
+                    int(result.component_labels[index]),
+                )
+            )
+        self.robot_rejected_voxel_pub.publish(
             point_cloud2.create_cloud(
                 self._header(stamp), self._uncovered_fields(), rows
             )

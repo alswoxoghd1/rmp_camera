@@ -58,6 +58,14 @@ class GenerationResult:
     removed_small_components: int
     total_limit_applied: bool
     coverage_lost_component_ids: List[int]
+    input_component_count: int = 0
+    robot_rejected_component_count: int = 0
+    robot_rejected_voxel_count: int = 0
+    robot_rejected_component_ids: List[int] = field(default_factory=list)
+    robot_component_overlap_fractions: List[float] = field(default_factory=list)
+    robot_rejected_voxel_indices: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.int64)
+    )
 
 
 def make_neighbor_offsets_18() -> Tuple[Index3, ...]:
@@ -142,6 +150,74 @@ def connected_components_18(inside_mask: np.ndarray) -> List[np.ndarray]:
                     queue.append(neighbor)
         components.append(np.asarray(indices, dtype=np.int64))
     return components
+
+
+def static_voxel_robot_sphere_overlap_mask(
+    voxel_indices: np.ndarray,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> np.ndarray:
+    """Return which static voxel AABBs intersect a robot sphere."""
+
+    indices = _as_index_array(voxel_indices)
+    if voxel_size_m <= 0.0:
+        raise ValueError("voxel_size_m must be positive")
+    if margin_m < 0.0 or not np.isfinite(margin_m):
+        raise ValueError("robot sphere margin must be finite and non-negative")
+    if len(indices) == 0:
+        return np.zeros(0, dtype=bool)
+
+    centers = np.asarray(robot_sphere_centers, dtype=np.float64)
+    if centers.size == 0:
+        centers = np.empty((0, 3), dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("robot sphere centers must have shape (N, 3)")
+    radii = np.asarray(robot_sphere_radii, dtype=np.float64).reshape(-1)
+    if len(centers) != len(radii):
+        raise ValueError("robot sphere centers and radii must have equal length")
+    if not np.isfinite(centers).all() or not np.isfinite(radii).all():
+        raise ValueError("robot sphere geometry must be finite")
+    if np.any(radii <= 0.0):
+        raise ValueError("robot sphere radii must be positive")
+    if len(centers) == 0:
+        return np.zeros(len(indices), dtype=bool)
+
+    origin = _as_origin(origin_m)
+    voxel_min = origin + indices.astype(np.float64) * voxel_size_m
+    voxel_max = voxel_min + voxel_size_m
+    overlaps = np.zeros(len(indices), dtype=bool)
+    for center, radius in zip(centers, radii):
+        closest = np.clip(center, voxel_min, voxel_max)
+        delta = closest - center
+        squared_distance = np.einsum("ij,ij->i", delta, delta)
+        overlaps |= squared_distance <= (radius + margin_m) ** 2
+        if overlaps.all():
+            break
+    return overlaps
+
+
+def static_component_robot_overlap_fraction(
+    voxel_indices: np.ndarray,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> Tuple[float, np.ndarray]:
+    """Return robot-intersecting static voxel fraction and its mask."""
+
+    mask = static_voxel_robot_sphere_overlap_mask(
+        voxel_indices,
+        origin_m,
+        voxel_size_m,
+        robot_sphere_centers,
+        robot_sphere_radii,
+        margin_m,
+    )
+    return (float(np.mean(mask)) if len(mask) else 0.0), mask
 
 
 def find_local_minimum_candidates(
@@ -458,7 +534,7 @@ def remove_redundant_spheres(
         if not active[container_index]:
             continue
         container = spheres[container_index]
-        for candidate_index in order[order_position + 1 :]:
+        for candidate_index in order[order_position + 1:]:
             if not active[candidate_index]:
                 continue
             candidate = spheres[candidate_index]
@@ -1137,7 +1213,6 @@ def _validate_optimization_parameters(
         raise ValueError("max_optimization_matrix_elements must be positive")
 
 
-
 def generate_medial_spheres(
     esdf_grid: np.ndarray,
     origin_m: Sequence[float],
@@ -1171,6 +1246,10 @@ def generate_medial_spheres(
     merge_max_free_space_distance_m: float = 0.08,
     merge_surface_sample_count: int = 64,
     merge_min_observed_surface_fraction: float = 0.70,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]] | None = None,
+    robot_sphere_radii: np.ndarray | Sequence[float] | None = None,
+    robot_component_overlap_threshold: float = 1.0,
+    robot_sphere_margin_m: float = 0.0,
 ) -> GenerationResult:
     """Run the complete component-wise signed-ESDF sphere algorithm.
 
@@ -1187,6 +1266,14 @@ def generate_medial_spheres(
         raise ValueError("esdf_grid must be 3D and voxel_size_m must be positive")
     if min_component_voxels < 1 or max_total_spheres < 0:
         raise ValueError("min_component_voxels must be positive and total cap non-negative")
+    if not 0.0 <= robot_component_overlap_threshold <= 1.0:
+        raise ValueError("robot component overlap threshold must be in [0, 1]")
+    use_robot_filter = (
+        robot_sphere_centers is not None or robot_sphere_radii is not None)
+    if use_robot_filter and (
+        robot_sphere_centers is None or robot_sphere_radii is None
+    ):
+        raise ValueError("robot sphere centers and radii must be supplied together")
     _validate_optimization_parameters(
         surface_shell_thickness_m,
         target_shell_coverage,
@@ -1211,10 +1298,29 @@ def generate_medial_spheres(
     ]
     removed_small_components = len(raw_components) - len(kept_components)
     component_labels = np.full(values.shape, -1, dtype=np.int32)
+    filtered_inside_mask = inside_mask.copy()
     results: List[ComponentResult] = []
+    robot_rejected_component_ids: List[int] = []
+    robot_component_overlap_fractions: List[float] = []
+    robot_rejected_voxel_indices: List[np.ndarray] = []
 
     for component_id, component_indices in enumerate(kept_components):
         component_labels[tuple(component_indices.T)] = component_id
+        if use_robot_filter:
+            overlap_fraction, _ = static_component_robot_overlap_fraction(
+                component_indices,
+                origin,
+                voxel_size_m,
+                robot_sphere_centers,
+                robot_sphere_radii,
+                robot_sphere_margin_m,
+            )
+            robot_component_overlap_fractions.append(overlap_fraction)
+            if overlap_fraction + 1e-12 >= robot_component_overlap_threshold:
+                robot_rejected_component_ids.append(component_id)
+                robot_rejected_voxel_indices.append(component_indices)
+                filtered_inside_mask[tuple(component_indices.T)] = False
+                continue
         minima = find_local_minimum_candidates(values, component_indices)
         representatives = group_or_reduce_plateaus(
             values,
@@ -1351,14 +1457,25 @@ def generate_medial_spheres(
             if result.coverage + 1e-12 < target_coverage
         ]
     spheres = [sphere for result in results for sphere in result.spheres]
+    rejected_indices = (
+        np.vstack(robot_rejected_voxel_indices)
+        if robot_rejected_voxel_indices
+        else np.empty((0, 3), dtype=np.int64)
+    )
     return GenerationResult(
-        inside_mask=inside_mask,
+        inside_mask=filtered_inside_mask,
         component_labels=component_labels,
         components=results,
         spheres=spheres,
         removed_small_components=removed_small_components,
         total_limit_applied=total_limit_applied,
         coverage_lost_component_ids=coverage_lost_component_ids,
+        input_component_count=len(kept_components),
+        robot_rejected_component_count=len(robot_rejected_component_ids),
+        robot_rejected_voxel_count=len(rejected_indices),
+        robot_rejected_component_ids=robot_rejected_component_ids,
+        robot_component_overlap_fractions=robot_component_overlap_fractions,
+        robot_rejected_voxel_indices=rejected_indices,
     )
 
 

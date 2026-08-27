@@ -103,7 +103,7 @@
       projective_integrator_truncation_distance_vox: 4.0    # TSDF truncation [voxels].
       projective_integrator_weighting_mode: "constant"      # Official dynamics specialization.
       projective_integrator_max_weight: 5.0                  # TSDF observation weight cap.
-      projective_tsdf_integrator_invalid_depth_decay_factor: 0.8 # Free-space invalid-depth decay.
+      projective_tsdf_integrator_invalid_depth_decay_factor: -1.0 # Ignore invalid depth without TSDF decay.
       free_region_occupancy_probability: 0.45
       occupied_region_occupancy_probability: 0.55
       unobserved_region_occupancy_probability: 0.5
@@ -197,11 +197,24 @@
     merge_max_free_space_distance_m: 0.08  # Maximum positive sampled ESDF distance [m].
     merge_surface_sample_count: 64         # Deterministic Fibonacci surface samples.
     merge_min_observed_surface_fraction: 0.70 # Required observed sample fraction [0..1].
+    robot_component_filter_enabled: true   # Reject static components overlapping the robot.
+    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
+    robot_component_overlap_threshold: 0.10 # Reject when intersecting static voxel ratio is >= 10%.
+    robot_sphere_filter_margin_m: 0.03      # Inflate robot spheres for static voxel-AABB tests [m].
+    robot_marker_expected_sphere_count: 35
+    robot_marker_require_expected_count: true
+    use_time_synchronized_robot_markers: true
+    robot_marker_buffer_duration_s: 1.0
+    robot_marker_max_stamp_delta_s: 0.10    # Static query time-to-marker tolerance [s].
+    robot_marker_subscription_depth: 2
+    fallback_to_latest_marker_on_time_miss: false
+    robot_component_filter_fail_closed: true # Publish no static spheres without valid robot geometry.
     max_grid_voxels: 8000000               # Dense response memory guard [voxels].
     marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
     sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
     inside_voxel_cloud_topic: "/rmp_camera/esdf_medial_inside_voxels"
     uncovered_voxel_cloud_topic: "/rmp_camera/esdf_medial_uncovered_voxels"
+    robot_rejected_voxel_cloud_topic: "/rmp_camera/static_robot_rejected_voxels"
     publish_debug_clouds: true
 
 /dynamic_obstacle_sphere_node:
@@ -265,6 +278,20 @@
     dynamic_sphere_ttl_sec: 0.15            # Occlusion retention [s].
     dynamic_max_missed_updates: 1           # Occlusion update-count cap.
     dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
+    robot_component_filter_enabled: true    # Reject components substantially overlapping the robot.
+    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
+    robot_component_overlap_threshold: 0.01 # Reject when intersecting voxel ratio is >= this value.
+    robot_sphere_filter_margin_m: 0.03       # Inflate robot spheres for voxel-AABB tests [m].
+    robot_marker_expected_sphere_count: 35
+    robot_marker_require_expected_count: true
+    use_time_synchronized_robot_markers: true
+    robot_marker_buffer_duration_s: 1.0
+    robot_marker_max_stamp_delta_s: 0.05     # Accepted point-to-marker timestamp error [s].
+    robot_marker_sync_wait_timeout_s: 0.25   # Wait for delayed marker callbacks before fail-closed drop.
+    robot_marker_subscription_depth: 2      # Keep only fresh callbacks; timestamp history is buffered in-node.
+    fallback_to_latest_marker_on_time_miss: false
+    robot_component_filter_fail_closed: true # Drop frame if valid synchronized spheres are unavailable.
+    robot_rejected_voxel_cloud_topic: "/rmp_camera/dynamic_robot_rejected_voxels"
     publish_debug_clouds: true
 
 /obstacle_sphere_fusion_node:
@@ -285,7 +312,7 @@
     keep_dynamic_until_static_overlap: true # Prevent stopped-object handover gaps.
     dynamic_absolute_max_ttl_sec: 3.0      # Hard ghost limit even without static overlap [s].
     robot_overlap_filter_enabled: true     # Remove obstacles containing a robot sphere.
-    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
     robot_overlap_coverage_threshold: 0.50 # Remove when any robot sphere is >=80% contained.
     robot_overlap_sample_count: 256        # Volume samples per individual robot sphere.
     robot_overlap_robot_margin_m: 0.0      # Optional robot radius expansion; makes containment stricter.
@@ -301,6 +328,20 @@
     stamp_from_joint_state: true           # Preserve the source joint timestamp for matching.
     require_joint_state: true              # Never publish an assumed all-zero robot pose.
     require_complete_joint_state: true     # Require all six movable URDF joints.
+
+/robot_sphere_marker_correction_node:
+  ros__parameters:
+    input_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    output_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
+    correction_frame: "camera0_depth_optical_frame" # Camera-view axes: +X right, +Y down, +Z forward.
+    translation_x_m: -0.05                   # Move all recorded sphere centers right/left [m].
+    translation_y_m: 0.0                   # Move all recorded sphere centers down/up [m].
+    translation_z_m: -0.01                   # Negative moves spheres toward the camera [m].
+    rotation_roll_rad: 0.0                 # Rigid correction about camera optical X [rad].
+    rotation_pitch_rad: 0.0                # Rigid correction about camera optical Y [rad].
+    rotation_yaw_rad: 0.0                  # Rigid correction about camera optical Z [rad].
+    tf_timeout_s: 0.05
+    passthrough_on_tf_failure: false       # Fail closed instead of publishing uncorrected markers.
 
 /robot_depth_mask_node:
   ros__parameters:

@@ -22,6 +22,8 @@ from rmp_camera.esdf_medial_sphere_core import (
     optimize_component_spheres,
     remove_redundant_spheres,
     sphere_coverage_masks,
+    static_component_robot_overlap_fraction,
+    static_voxel_robot_sphere_overlap_mask,
 )
 
 
@@ -93,6 +95,75 @@ def test_two_separated_cubes_are_two_components():
     mask[0:2, 0:2, 0:2] = True
     mask[5:7, 0:2, 0:2] = True
     assert [len(component) for component in connected_components_18(mask)] == [8, 8]
+
+
+def test_static_robot_overlap_uses_voxel_aabb_not_only_center():
+    indices = np.asarray([[0, 0, 0]], dtype=np.int64)
+    mask = static_voxel_robot_sphere_overlap_mask(
+        indices,
+        (0.0, 0.0, 0.0),
+        0.1,
+        [[0.101, 0.05, 0.05]],
+        [0.002],
+    )
+    assert mask.tolist() == [True]
+
+
+def test_static_component_robot_overlap_fraction_counts_voxels():
+    indices = np.asarray([[x, 0, 0] for x in range(10)], dtype=np.int64)
+    fraction, mask = static_component_robot_overlap_fraction(
+        indices,
+        (0.0, 0.0, 0.0),
+        1.0,
+        [[0.5, 0.5, 0.5]],
+        [0.01],
+    )
+    assert np.isclose(fraction, 0.1)
+    assert np.count_nonzero(mask) == 1
+
+
+def test_static_robot_overlap_rejects_entire_component_at_threshold():
+    grid = np.ones((14, 1, 1), dtype=np.float64)
+    grid[0:10, 0, 0] = -0.2
+    grid[12:14, 0, 0] = -0.2
+
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        robot_sphere_centers=[[0.5, 0.5, 0.5]],
+        robot_sphere_radii=[0.01],
+        robot_component_overlap_threshold=0.10,
+    )
+
+    assert result.input_component_count == 2
+    assert result.robot_rejected_component_count == 1
+    assert result.robot_rejected_component_ids == [0]
+    assert result.robot_rejected_voxel_count == 10
+    assert np.isclose(result.robot_component_overlap_fractions[0], 0.1)
+    assert np.count_nonzero(result.inside_mask) == 2
+    assert {component.component_id for component in result.components} == {1}
+    assert {sphere.component_id for sphere in result.spheres} == {1}
+
+
+def test_static_robot_overlap_below_threshold_keeps_component():
+    grid = np.full((10, 1, 1), -0.2, dtype=np.float64)
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        1.0,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        robot_sphere_centers=[[0.5, 0.5, 0.5]],
+        robot_sphere_radii=[0.01],
+        robot_component_overlap_threshold=0.11,
+    )
+
+    assert result.robot_rejected_component_count == 0
+    assert len(result.components) == 1
+    assert result.spheres
 
 
 def test_unobserved_sentinel_is_not_inside():
@@ -361,7 +432,6 @@ def test_surface_shell_guard_preserves_thin_protrusion_sphere():
     assert with_guard[2] == 1.0
 
 
-
 def test_empty_surface_shell_disables_guard_without_division_by_zero():
     grid = np.full((5, 1, 1), -1.0)
     grid[2, 0, 0] = -3.0
@@ -426,7 +496,6 @@ def test_optimized_static_generation_is_deterministic():
         for _ in range(3)
     ]
     assert signatures[0] == signatures[1] == signatures[2]
-
 
 
 def test_final_static_spheres_keep_exact_safety_margin_and_esdf_radius():
