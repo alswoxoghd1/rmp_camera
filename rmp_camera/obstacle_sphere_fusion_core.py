@@ -80,6 +80,92 @@ def spheres_overlap(a: FusionSphere, b: FusionSphere, tolerance_m: float = 0.0) 
     return distance <= a.output_radius + b.output_radius + tolerance_m
 
 
+def unit_ball_samples(sample_count: int) -> np.ndarray:
+    """Return deterministic, approximately uniform samples inside a unit ball."""
+
+    count = int(sample_count)
+    if count <= 0:
+        raise ValueError("sample_count must be positive")
+    indices = np.arange(count, dtype=np.float64)
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - 2.0 * (indices + 0.5) / count
+    radial_xy = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    directions = np.column_stack((
+        radial_xy * np.cos(indices * golden_angle),
+        radial_xy * np.sin(indices * golden_angle),
+        z,
+    ))
+    volume_radii = ((indices + 0.5) / count) ** (1.0 / 3.0)
+    return directions * volume_radii[:, None]
+
+
+def maximum_robot_containment_fraction(
+    obstacle_center: Sequence[float],
+    obstacle_radius: float,
+    robot_centers: np.ndarray,
+    robot_radii: np.ndarray,
+    sample_count: int = 256,
+) -> float:
+    """Estimate the largest robot-sphere volume fraction inside an obstacle."""
+
+    center = np.asarray(obstacle_center, dtype=np.float64)
+    radius = float(obstacle_radius)
+    centers = np.asarray(robot_centers, dtype=np.float64)
+    radii = np.asarray(robot_radii, dtype=np.float64)
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("obstacle_center must be a finite three-vector")
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("obstacle_radius must be finite and non-negative")
+    if centers.ndim != 2 or centers.shape[1:] != (3,):
+        raise ValueError("robot_centers must have shape (N, 3)")
+    if radii.shape != (len(centers),):
+        raise ValueError("robot_centers and robot_radii have incompatible shapes")
+    if not np.isfinite(centers).all():
+        raise ValueError("robot sphere centers must be finite")
+    if not np.isfinite(radii).all() or np.any(radii < 0.0):
+        raise ValueError("robot sphere radii must be finite and non-negative")
+    if len(centers) == 0:
+        return 0.0
+    unit_samples = unit_ball_samples(sample_count)
+    points = (
+        centers[:, None, :]
+        + radii[:, None, None] * unit_samples[None, :, :]
+    )
+    squared_distances = np.sum(
+        (points - center[None, None, :]) ** 2,
+        axis=2,
+    )
+    contained = squared_distances <= radius * radius
+    fractions = np.count_nonzero(contained, axis=1) / contained.shape[1]
+    return float(np.max(fractions))
+
+
+def filter_spheres_containing_robot(
+    spheres: Sequence[FusionSphere],
+    robot_centers: np.ndarray,
+    robot_radii: np.ndarray,
+    coverage_threshold: float = 0.8,
+    sample_count: int = 256,
+) -> tuple[list[FusionSphere], list[FusionSphere]]:
+    """Remove obstacles containing at least one robot sphere by threshold."""
+
+    threshold = float(coverage_threshold)
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("coverage_threshold must be in [0, 1]")
+    kept = []
+    removed = []
+    for sphere in spheres:
+        coverage = maximum_robot_containment_fraction(
+            sphere.center,
+            sphere.output_radius,
+            robot_centers,
+            robot_radii,
+            sample_count,
+        )
+        (removed if coverage >= threshold else kept).append(sphere)
+    return kept, removed
+
+
 def fuse_spheres(
     static_spheres: Sequence[FusionSphere], dynamic_spheres: Sequence[FusionSphere],
     params: FusionParameters,

@@ -28,7 +28,7 @@
     robot_depth_surface_front_tolerance_m: 0.02 # Front surface band [m].
     robot_depth_surface_back_tolerance_m: 0.03  # Back surface band [m].
     robot_depth_mask_shadow_behind_robot: false # Preserve background behind robot.
-    robot_depth_mask_rate_hz: 30.0         # Actual mask-node processing limit [Hz].
+    robot_depth_mask_rate_hz: 0.0         # Actual mask-node processing limit [Hz].
     robot_depth_publish_predicted_depth: true # Publish predicted robot depth for inspection.
     robot_depth_publish_removed_points: true  # Publish removed 3D points for inspection.
     realsense_decimation_filter_enabled: false  # Downsample depth; faster but loses small objects.
@@ -67,7 +67,7 @@
     publish_layer_rate_hz: 5.0             # Mesh/layer publication [Hz].
     publish_debug_vis_rate_hz: 10.0        # Other debug [Hz]; dynamic_points follows depth integration.
     decay_tsdf_rate_hz: 5.0                # Static TSDF decay [Hz].
-    decay_dynamic_occupancy_rate_hz: 10.0  # Dynamic occupancy decay [Hz].
+    decay_dynamic_occupancy_rate_hz: 20.0  # Dynamic occupancy decay [Hz].
     clear_map_outside_radius_rate_hz: 1.0  # Map-radius clearing check frequency [Hz].
     map_clearing_radius_m: 6.0             # Retained radius around map-clearing frame [m].
     print_rates_to_console: false
@@ -98,7 +98,7 @@
 
     static_mapper:
       do_depth_preprocessing: false
-      depth_preprocessing_num_dilations: 3
+      depth_preprocessing_num_dilations: 1
       projective_integrator_max_integration_distance_m: 2.2 # Depth integration range [m].
       projective_integrator_truncation_distance_vox: 4.0    # TSDF truncation [voxels].
       projective_integrator_weighting_mode: "constant"      # Official dynamics specialization.
@@ -117,8 +117,8 @@
       unobserved_esdf_policy: "ignore"            # Never treat unobserved as free.
       max_tsdf_distance_for_occupancy_m: 0.18     # TSDF band used by freespace logic [m].
       max_unobserved_to_keep_consecutive_occupancy_ms: 400 # Occupancy continuity window [ms].
-      min_duration_since_occupied_for_freespace_ms: 1000    # Dynamic confidence delay [ms].
-      min_consecutive_occupancy_duration_for_reset_ms: 2000 # Static reset evidence [ms].
+      min_duration_since_occupied_for_freespace_ms: 1250    # Dynamic confidence delay [ms].
+      min_consecutive_occupancy_duration_for_reset_ms: 1200 # Static reset evidence [ms].
       check_neighborhood: true                    # Use neighboring voxels for freespace evidence.
       initialize_to_high_confidence_freespace: false # Conservative startup; fewer false dynamics.
       tsdf_decay_factor: 0.95                     # Static decay multiplier per decay tick.
@@ -144,13 +144,13 @@
       projective_integrator_max_integration_distance_m: 2.2 # Foreground depth range [m].
       projective_integrator_truncation_distance_vox: 4.0    # Occupancy projective band [voxels].
       free_region_occupancy_probability: 0.2       # Free-space inverse sensor probability.
-      occupied_region_occupancy_probability: 0.9   # Hit probability; higher is more persistent.
+      occupied_region_occupancy_probability: 0.8   # Hit probability; higher is more persistent.
       unobserved_region_occupancy_probability: 0.35 # Unknown ray probability.
       occupied_region_half_width_m: 0.15           # Occupied band half-width [m].
       esdf_integrator_min_weight: 2.0               # Occupancy weight needed by dynamic ESDF.
       esdf_integrator_max_distance_m: 2.0           # Internal dynamic ESDF max [m].
       free_region_decay_probability: 0.55           # Dynamic free voxels decay toward unknown.
-      occupied_region_decay_probability: 0.30       # Dynamic hits decay; lower clears faster.
+      occupied_region_decay_probability: 0.20       # Dynamic hits decay; lower clears faster.
       esdf_slice_height: 0.0
       esdf_slice_min_height: -0.1
       esdf_slice_max_height: 0.3
@@ -220,7 +220,7 @@
     max_z_m: 2.5
     max_range_from_base_m: 2.0             # Radial XY crop [m]; <=0 disables.
     dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
-    dynamic_min_component_voxels: 30       # Noise component floor [voxels].
+    dynamic_min_component_voxels: 50       # Noise component floor [voxels].
     dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
     dynamic_max_components: 32             # Component processing cap.
     dynamic_max_input_points: 250000       # Input truncation cap [points].
@@ -261,9 +261,9 @@
     dynamic_min_k_prefer_lower_overlap: true # Break equal-count ties in favor of lower overlap.
     dynamic_tracking_enabled: true
     dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
-    dynamic_smoothing_alpha: 0.70           # 1=new measurement, 0=old track.
-    dynamic_sphere_ttl_sec: 0.30            # Occlusion retention [s].
-    dynamic_max_missed_updates: 3           # Occlusion update-count cap.
+    dynamic_smoothing_alpha: 0.80           # 1=new measurement, 0=old track.
+    dynamic_sphere_ttl_sec: 0.15            # Occlusion retention [s].
+    dynamic_max_missed_updates: 1           # Occlusion update-count cap.
     dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
     publish_debug_clouds: true
 
@@ -284,6 +284,12 @@
     dynamic_handover_grace_sec: 0.5        # Fresh dynamic priority window [s].
     keep_dynamic_until_static_overlap: true # Prevent stopped-object handover gaps.
     dynamic_absolute_max_ttl_sec: 3.0      # Hard ghost limit even without static overlap [s].
+    robot_overlap_filter_enabled: true     # Remove obstacles containing a robot sphere.
+    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    robot_overlap_coverage_threshold: 0.50 # Remove when any robot sphere is >=80% contained.
+    robot_overlap_sample_count: 256        # Volume samples per individual robot sphere.
+    robot_overlap_robot_margin_m: 0.0      # Optional robot radius expansion; makes containment stricter.
+    robot_overlap_marker_timeout_s: 0.25   # Keep obstacles when robot markers are stale [s].
     static_marker_color: [0.15, 0.55, 1.0] # RGB [0..1].
     dynamic_marker_color: [1.0, 0.12, 0.04] # RGB [0..1].
     marker_alpha: 0.65                     # Marker opacity [0..1].
@@ -298,12 +304,12 @@
 
 /robot_depth_mask_node:
   ros__parameters:
-    filter_mode: "surface_depth"           # Compare measured depth with rendered sphere front surfaces.
+    filter_mode: "volume"                  # Remove measured 3D points inside robot collision spheres.
     predicted_depth_topic: "/rmp_camera/robot_predicted_depth/image_rect_raw"
     removed_points_topic: "/rmp_camera/robot_depth_mask_removed_points"
     publish_predicted_depth: false            # Heavy debug image; enable only while inspecting masks.
     publish_removed_points: false             # Debug cloud; keep off during rate measurements.
-    robot_margin_m: 0.01                   # Small geometry inflation; do not use the legacy large volume margin.
+    robot_margin_m: 0.05                   # Small geometry inflation; do not use the legacy large volume margin.
     surface_front_tolerance_m: 0.02        # Preserve measurements clearly in front of the robot [m].
     surface_back_tolerance_m: 0.04         # Allow calibration/depth error behind predicted surface [m].
     mask_shadow_behind_robot: false        # Only remove surface matches; retain nonmatching measurements.

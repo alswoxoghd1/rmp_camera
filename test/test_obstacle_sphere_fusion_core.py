@@ -1,6 +1,8 @@
 from rmp_camera.obstacle_sphere_fusion_core import (
+    filter_spheres_containing_robot,
     FusionParameters,
     FusionSphere,
+    maximum_robot_containment_fraction,
     SphereFusionCache,
     fuse_spheres,
     spheres_from_field_rows,
@@ -109,3 +111,54 @@ def test_pointcloud_field_order_is_name_based():
     assert item.output_radius == 0.25
     assert item.track_id == 42
     assert item.confidence == 0.8
+
+
+def test_robot_containment_is_full_when_robot_is_inside_obstacle():
+    coverage = maximum_robot_containment_fraction(
+        (0.0, 0.0, 0.0),
+        0.3,
+        [[0.0, 0.0, 0.0]],
+        [0.2],
+        sample_count=256,
+    )
+    assert coverage == 1.0
+
+
+def test_robot_containment_is_zero_for_disjoint_obstacle():
+    coverage = maximum_robot_containment_fraction(
+        (1.0, 0.0, 0.0),
+        0.2,
+        [[0.0, 0.0, 0.0]],
+        [0.3],
+        sample_count=256,
+    )
+    assert coverage == 0.0
+
+
+def test_robot_filter_removes_obstacle_containing_robot_sphere():
+    robot_centers = [[0.0, 0.0, 0.0]]
+    robot_radii = [0.2]
+    covered = sphere(0.0, 1, radius=0.3)
+    disjoint = sphere(1.0, 1, radius=0.2)
+    kept, removed = filter_spheres_containing_robot(
+        [covered, disjoint],
+        robot_centers,
+        robot_radii,
+        coverage_threshold=0.8,
+        sample_count=256,
+    )
+    assert kept == [disjoint]
+    assert removed == [covered]
+
+
+def test_obstacle_inside_larger_robot_sphere_is_preserved():
+    obstacle = sphere(0.0, 1, radius=0.2)
+    kept, removed = filter_spheres_containing_robot(
+        [obstacle],
+        [[0.0, 0.0, 0.0]],
+        [0.3],
+        coverage_threshold=0.8,
+        sample_count=256,
+    )
+    assert kept == [obstacle]
+    assert removed == []

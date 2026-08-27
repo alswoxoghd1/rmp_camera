@@ -6,6 +6,7 @@ Panels:
       Expanded:
         - /Dynamic reconstruction1
         - /Dynamic reconstruction1/Dynamic voxels1
+        - /MarkerArray1
       Splitter Ratio: 0.550000011920929
     Tree Height: 212
 Visualization Manager:
@@ -263,6 +264,7 @@ Visualization Manager:
           Combined static dynamic spheres: true
           Value: true
         Grid: true
+        MarkerArray: true
         Static reconstruction:
           Static ESDF inside voxels: true
           Static TSDF mesh markers: true
@@ -271,6 +273,18 @@ Visualization Manager:
         TF: true
         Value: true
       Zoom Factor: 1
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        robot_collision_spheres: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rmp_camera/robot_collision_sphere_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 34; 36; 40
