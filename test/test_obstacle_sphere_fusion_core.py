@@ -42,6 +42,19 @@ def test_real_3d_overlap_prefers_dynamic():
     assert result[0].source_type == 1
 
 
+def test_human_sphere_suppresses_only_overlapping_geometry_duplicates():
+    human = sphere(0.0, 2, radius=0.25)
+    result = fuse_spheres(
+        [sphere(1.0, 0)], [sphere(0.1, 1)], params(), [human])
+    assert [item.source_type for item in result] == [2, 0]
+
+
+def test_nonhuman_obstacle_is_kept_beside_human():
+    result = fuse_spheres(
+        [], [sphere(1.0, 1)], params(), [sphere(0.0, 2)])
+    assert {item.source_type for item in result} == {1, 2}
+
+
 def test_same_camera_ray_but_separated_in_3d_keeps_static():
     result = fuse_spheres(
         [sphere(0.0, 0, radius=0.1, z=0.0)],
@@ -91,6 +104,42 @@ def test_stale_dynamic_without_handover_is_removed():
     cache = SphereFusionCache(params(keep_dynamic_until_static_overlap=False))
     cache.update_dynamic([sphere(0.0, 1)], "base_link", 0.0)
     assert cache.combined(0.6) == []
+
+
+def test_human_cache_has_independent_short_ttl():
+    cache = SphereFusionCache(params(
+        human_handover_grace_sec=0.3,
+        human_absolute_max_ttl_sec=0.3,
+    ))
+    assert cache.update_human([sphere(0.0, 2)], "base_link", 1.0)
+    assert cache.combined(1.2)[0].source_type == 2
+    assert cache.combined(1.31) == []
+
+
+def test_confirmed_empty_human_frames_clear_without_second_fusion_ttl():
+    cache = SphereFusionCache(params(
+        human_handover_grace_sec=0.3,
+        human_absolute_max_ttl_sec=0.3,
+        human_empty_confirmation_frames=3,
+    ))
+    assert cache.update_human([sphere(0.0, 2)], "base_link", 1.0)
+    assert cache.combined(1.1)
+    assert cache.update_human([], "base_link", 1.1)
+    assert cache.update_human([], "base_link", 1.13)
+    assert cache.combined(1.13)
+    assert cache.update_human([], "base_link", 1.16)
+    assert cache.combined(1.16) == []
+
+
+def test_nonempty_human_frame_resets_empty_confirmation():
+    cache = SphereFusionCache(params(human_empty_confirmation_frames=3))
+    detected = [sphere(0.0, 2)]
+    assert cache.update_human(detected, "base_link", 1.0)
+    assert cache.update_human([], "base_link", 1.03)
+    assert cache.update_human([], "base_link", 1.06)
+    assert cache.update_human(detected, "base_link", 1.09)
+    assert cache.human_empty_count == 0
+    assert cache.combined(1.09)
 
 
 def test_frame_mismatch_is_rejected_without_corrupting_cache():

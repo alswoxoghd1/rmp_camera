@@ -43,6 +43,7 @@ setup(
             "esdf_obstacle_sphere_node = rmp_camera.esdf_obstacle_sphere_node:main",
             "esdf_medial_sphere_node = rmp_camera.esdf_medial_sphere_node:main",
             "dynamic_obstacle_sphere_node = rmp_camera.dynamic_obstacle_sphere_node:main",
+            "human_depth_projection_node = rmp_camera.human_depth_projection_node:main",
             "obstacle_sphere_fusion_node = rmp_camera.obstacle_sphere_fusion_node:main",
             "nvblox_esdf_slice_obstacle_sphere_node = "
             "rmp_camera.nvblox_esdf_slice_obstacle_sphere_node:main",
@@ -53,12 +54,17 @@ setup(
             "rmp_camera.charuco_eye_to_hand_calibrator_node:main",
             "robot_pointcloud_filter_node = rmp_camera.robot_pointcloud_filter_node:main",
             "robot_depth_mask_node = rmp_camera.robot_depth_mask_node:main",
+            "depth_edge_filter_node = rmp_camera.depth_edge_filter_node:main",
             "depth_to_pointcloud_node = rmp_camera.depth_to_pointcloud_node:main",
             "vision_closest_obstacle_node = rmp_camera.vision_closest_obstacle_node:main",
             "obstacle_body_sphere_node = rmp_camera.obstacle_body_sphere_node:main",
             "camera_obstacle_sphere_echo = rmp_camera.camera_obstacle_sphere_echo:main",
             "validate_robot_self_filter_bag = "
             "rmp_camera.robot_self_filter_bag_validator:main",
+            "calibrate_robot_depth_extrinsic = "
+            "rmp_camera.robot_depth_extrinsic_calibrator:main",
+            "calibrate_tcp_click_extrinsic = "
+            "rmp_camera.tcp_click_extrinsic_calibrator:main",
         ],
     },
 )

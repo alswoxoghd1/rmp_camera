@@ -1,5 +1,7 @@
 """ROS-free unit tests for dense signed-ESDF medial spheres."""
 
+from time import monotonic
+
 import numpy as np
 
 from rmp_camera.esdf_medial_sphere_core import (
@@ -20,6 +22,8 @@ from rmp_camera.esdf_medial_sphere_core import (
     make_surface_shell_mask,
     make_neighbor_offsets_18,
     optimize_component_spheres,
+    minimum_k_static_sphere_search,
+    prune_overlapping_static_spheres,
     remove_redundant_spheres,
     sphere_coverage_masks,
     static_component_robot_overlap_fraction,
@@ -209,6 +213,82 @@ def test_initial_sphere_radius_is_negative_esdf_at_center():
     assert len(spheres) == 1
     assert spheres[0].raw_radius == 0.375
     assert spheres[0].output_radius == 0.395
+
+
+def test_static_raw_radius_cap_clips_deep_esdf_candidates():
+    grid = np.full((3, 1, 1), -0.50)
+    spheres = create_initial_spheres(
+        grid,
+        np.array([[1, 0, 0]]),
+        (0.0, 0.0, 0.0),
+        0.1,
+        0.01,
+        0.005,
+        0,
+        0.25,
+    )
+    assert len(spheres) == 1
+    assert spheres[0].raw_radius == 0.25
+    assert spheres[0].output_radius == 0.255
+
+
+def test_static_raw_radius_cap_applies_to_complete_generation():
+    grid = signed_box_esdf(
+        (15, 7, 7),
+        (0.5, 0.5, 0.5),
+        (7.0, 3.0, 3.0),
+        voxel_size_m=0.5,
+    )
+    result = generate_medial_spheres(
+        grid,
+        (0.0, 0.0, 0.0),
+        0.5,
+        inside_epsilon_m=0.0,
+        min_component_voxels=1,
+        min_raw_sphere_radius_m=0.05,
+        max_raw_sphere_radius_m=0.75,
+        safety_margin_m=0.01,
+        minimum_center_spacing_m=0.5,
+        target_coverage=0.90,
+        enable_agglomerative_merge=True,
+        merge_max_radius_m=0.75,
+    )
+    assert result.spheres
+    assert max(sphere.raw_radius for sphere in result.spheres) <= 0.75
+    assert max(sphere.output_radius for sphere in result.spheres) <= 0.76
+
+
+def test_post_merge_overlap_pruning_preserves_volume_and_shell_coverage():
+    grid = np.full((3, 1, 1), -0.05)
+    component = np.argwhere(np.ones_like(grid, dtype=bool))
+    spheres = [
+        Sphere(np.array((1.5, 0.5, 0.5)), 1.2, 1.2, 0, (1, 0, 0), True),
+        Sphere(np.array((1.5, 0.5, 0.5)), 1.0, 1.0, 0, (1, 0, 0), True),
+    ]
+    pruned, removed = prune_overlapping_static_spheres(
+        grid,
+        component,
+        spheres,
+        (0.0, 0.0, 0.0),
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        True,
+        0.10,
+        1.0,
+        0.0,
+        100,
+        0.20,
+        8,
+        4,
+    )
+    coverage, _ = calculate_component_coverage(
+        component, pruned, (0.0, 0.0, 0.0), 1.0, 0.0)
+    assert removed == 1
+    assert len(pruned) == 1
+    assert pruned[0].raw_radius == 1.0
+    assert coverage == 1.0
 
 
 def test_spheres_are_added_until_target_coverage():
@@ -683,6 +763,94 @@ def test_static_merge_is_deterministic_for_reversed_sphere_order():
         result_signature(static_merge(grid, component, spheres[::-1])))
 
 
+def test_static_min_k_search_escapes_greedy_merge_order_trap():
+    coordinates = (
+        0.0,
+        0.1441209636081885,
+        0.2344194989337105,
+        0.3537910818681569,
+    )
+    radii = (
+        0.07167951434830674,
+        0.09462533464404828,
+        0.0821887855824767,
+        0.06762221353458232,
+    )
+    spheres = [
+        merge_sphere((x, 0.0, 0.0), radius, (index, 0, 0), safety=0.01)
+        for index, (x, radius) in enumerate(zip(coordinates, radii))
+    ]
+    voxel_size = 0.001
+    origin = (-0.0005, -0.0005, -0.0005)
+    component = np.asarray([
+        (round(x / voxel_size), 0, 0) for x in coordinates
+    ], dtype=np.int64)
+    grid = np.full((400, 3, 3), -0.1)
+    merge_args = (
+        grid,
+        component,
+        spheres,
+        origin,
+        voxel_size,
+        0.0,
+        0.01,
+        -1000.0,
+        0.17680082144659784,
+        1.6856652026068732,
+        0.058939303977189085,
+        False,
+        0.08,
+        64,
+        0.70,
+    )
+    greedy = agglomerative_merge_static_spheres(*merge_args)
+    bounded = minimum_k_static_sphere_search(
+        *merge_args, 16, 512, monotonic() + 1.0)
+
+    assert len(greedy) == 3
+    assert len(bounded.spheres) == 2
+    assert bounded.states_explored <= 512
+    before, _ = calculate_component_coverage(
+        component, spheres, origin, voxel_size, 0.0)
+    after, _ = calculate_component_coverage(
+        component, bounded.spheres, origin, voxel_size, 0.0)
+    assert after + 1e-12 >= before
+
+
+def test_static_min_k_search_is_deterministic_for_reversed_input():
+    grid = np.full((20, 20, 20), -0.1)
+    component = np.asarray([(x, 4, 4) for x in range(4, 11)])
+    spheres = [
+        merge_sphere((0.225 + 0.08 * index, 0.225, 0.225), 0.10,
+                     (4 + 2 * index, 4, 4))
+        for index in range(4)
+    ]
+
+    def run(values):
+        return minimum_k_static_sphere_search(
+            grid,
+            component,
+            values,
+            (0.0, 0.0, 0.0),
+            0.05,
+            0.0,
+            0.02,
+            -1000.0,
+            0.35,
+            1.5,
+            0.05,
+            False,
+            0.08,
+            64,
+            0.70,
+            8,
+            128,
+            monotonic() + 1.0,
+        )
+
+    assert sphere_signature(run(spheres)) == sphere_signature(run(spheres[::-1]))
+
+
 def test_static_feature_off_preserves_pre_merge_geometry():
     grid = signed_box_esdf(
         (12, 7, 7), (1.0, 1.0, 1.0), (11.0, 6.0, 6.0))
@@ -705,6 +873,79 @@ def test_static_feature_off_preserves_pre_merge_geometry():
     assert disabled.components[0].pre_merge_sphere_count == len(disabled.spheres)
 
 
+def test_component_coarse_cover_reduces_large_thin_component():
+    grid = np.full((24, 24, 16), 0.10, dtype=np.float64)
+    grid[5:19, 5:19, 7:9] = -0.05
+    common = dict(
+        origin_m=(0.0, 0.0, 0.0),
+        voxel_size_m=0.05,
+        inside_epsilon_m=0.005,
+        target_coverage=0.90,
+        coverage_tolerance_m=0.02,
+        minimum_center_spacing_m=0.05,
+        min_component_voxels=1,
+        min_raw_sphere_radius_m=0.04,
+        max_raw_sphere_radius_m=0.32,
+        safety_margin_m=0.005,
+        surface_shell_thickness_m=0.10,
+        target_shell_coverage=0.94,
+        shell_coverage_loss_tolerance=0.02,
+        enable_agglomerative_merge=False,
+        merge_max_radius_m=0.32,
+        enable_min_k_search=False,
+        enable_post_merge_overlap_pruning=False,
+    )
+    baseline = generate_medial_spheres(
+        grid, enable_component_coarse_cover=False, **common)
+    coarse = generate_medial_spheres(
+        grid,
+        enable_component_coarse_cover=True,
+        component_coarse_min_voxels=120,
+        component_coarse_radius_scale=0.45,
+        component_coarse_max_radius_m=0.32,
+        component_coarse_max_empty_fraction=0.75,
+        component_coarse_max_free_space_distance_m=0.15,
+        **common,
+    )
+
+    assert baseline.components[0].coverage >= common["target_coverage"]
+    assert coarse.components[0].coverage >= common["target_coverage"]
+    assert len(coarse.spheres) < len(baseline.spheres)
+    assert coarse.components[0].coarse_candidate_count > 0
+    assert coarse.components[0].coarse_selected_count > 0
+    assert max(sphere.raw_radius for sphere in coarse.spheres) <= 0.32
+
+
+def test_component_coarse_cover_does_not_change_small_component():
+    grid = np.full((16, 16, 12), 0.10, dtype=np.float64)
+    grid[4:11, 4:11, 5:7] = -0.05  # 98 voxels, below the 120-voxel gate.
+    result = generate_medial_spheres(
+        grid,
+        origin_m=(0.0, 0.0, 0.0),
+        voxel_size_m=0.05,
+        inside_epsilon_m=0.005,
+        target_coverage=0.90,
+        coverage_tolerance_m=0.02,
+        minimum_center_spacing_m=0.10,
+        min_component_voxels=1,
+        min_raw_sphere_radius_m=0.04,
+        max_raw_sphere_radius_m=0.32,
+        enable_component_coarse_cover=True,
+        component_coarse_min_voxels=120,
+        component_coarse_radius_scale=0.45,
+        component_coarse_max_radius_m=0.32,
+        component_coarse_max_empty_fraction=0.75,
+        component_coarse_max_free_space_distance_m=0.15,
+        merge_max_radius_m=0.32,
+        enable_agglomerative_merge=False,
+        enable_min_k_search=False,
+        enable_post_merge_overlap_pruning=False,
+    )
+
+    assert result.components[0].coarse_candidate_count == 0
+    assert result.components[0].coarse_selected_count == 0
+
+
 def test_static_merge_parameter_validation():
     grid = np.full((1, 1, 1), -0.1)
     invalid_kwargs = [
@@ -714,6 +955,14 @@ def test_static_merge_parameter_validation():
         {"merge_max_free_space_distance_m": -0.1},
         {"merge_surface_sample_count": 0},
         {"merge_min_observed_surface_fraction": 1.1},
+        {"min_k_beam_width": 0},
+        {"min_k_max_states": 0},
+        {"min_k_processing_budget_ms": 0.0},
+        {"component_coarse_min_voxels": 0},
+        {"component_coarse_radius_scale": -0.1},
+        {"component_coarse_max_radius_m": 0.0},
+        {"component_coarse_max_empty_fraction": 1.1},
+        {"component_coarse_max_free_space_distance_m": -0.1},
     ]
     for kwargs in invalid_kwargs:
         try:

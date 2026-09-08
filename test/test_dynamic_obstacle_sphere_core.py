@@ -8,6 +8,8 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     DynamicSphereTracker,
     agglomerative_merge_dynamic_spheres,
     build_dynamic_sphere_search_state,
+    component_adaptive_fixed_radius,
+    component_adaptive_radius_cap,
     component_robot_overlap_fraction,
     _greedy_set_cover,
     _remove_redundant,
@@ -16,6 +18,7 @@ from rmp_camera.dynamic_obstacle_sphere_core import (
     dynamic_sphere_search_state_rank_key,
     generate_dynamic_spheres,
     minimum_k_dynamic_sphere_search,
+    prune_overlapping_tracked_spheres,
     voxel_robot_sphere_overlap_mask,
     voxel_centers,
 )
@@ -205,6 +208,69 @@ def test_thin_shell_uses_fixed_radius_fallback():
     assert result.spheres
     assert result.components[0].termination_reason == "thin_component_fallback"
     assert all(np.isclose(s.raw_radius, 0.13) for s in result.spheres)
+
+
+def test_component_adaptive_radius_cap_scales_with_voxel_count():
+    configured = params(
+        voxel_size_m=0.05,
+        min_raw_radius_m=0.025,
+        max_raw_radius_m=0.28,
+        fixed_radius_m=0.06,
+        component_radius_scale=0.60,
+    )
+    small = np.zeros((27, 3), dtype=np.float64)
+    large = np.zeros((1000, 3), dtype=np.float64)
+    assert np.isclose(
+        component_adaptive_radius_cap(small, configured, 0.28), 0.09)
+    assert np.isclose(
+        component_adaptive_radius_cap(large, configured, 0.28), 0.28)
+    assert component_adaptive_radius_cap(
+        small, configured, 0.28
+    ) < component_adaptive_radius_cap(large, configured, 0.28)
+
+
+def test_component_adaptive_radius_cap_can_be_disabled():
+    configured = params(
+        max_raw_radius_m=0.28,
+        component_radius_scale=0.0,
+    )
+    centers = np.zeros((8, 3), dtype=np.float64)
+    assert np.isclose(
+        component_adaptive_radius_cap(centers, configured, 0.25), 0.25)
+
+
+def test_component_adaptive_fixed_radius_keeps_small_and_grows_large():
+    configured = params(
+        voxel_size_m=0.05,
+        min_raw_radius_m=0.025,
+        max_raw_radius_m=0.28,
+        fixed_radius_m=0.06,
+        component_radius_scale=0.60,
+        component_fixed_radius_scale=0.35,
+    )
+    hand = np.zeros((58, 3), dtype=np.float64)
+    wide = np.zeros((248, 3), dtype=np.float64)
+    assert np.isclose(
+        component_adaptive_fixed_radius(hand, configured),
+        0.35 * 0.05 * np.cbrt(58),
+    )
+    assert np.isclose(
+        component_adaptive_fixed_radius(wide, configured),
+        0.35 * 0.05 * np.cbrt(248),
+    )
+    assert component_adaptive_fixed_radius(hand, configured) < 0.07
+    assert component_adaptive_fixed_radius(wide, configured) > 0.10
+
+
+def test_component_adaptive_fixed_radius_can_be_disabled():
+    configured = params(
+        min_raw_radius_m=0.025,
+        max_raw_radius_m=0.28,
+        fixed_radius_m=0.06,
+        component_fixed_radius_scale=0.0,
+    )
+    centers = np.zeros((248, 3), dtype=np.float64)
+    assert np.isclose(component_adaptive_fixed_radius(centers, configured), 0.06)
 
 
 def test_target_coverage_is_reported_and_uncovered_matches():
@@ -412,12 +478,41 @@ def test_tracker_expires_by_missed_update_limit():
     assert tracker.update([], 0.2) == []
 
 
+def test_tracker_snapshot_does_not_count_as_missed_update():
+    tracker = DynamicSphereTracker(0.2, 1.0, 1.0, 1)
+    track_id = tracker.update([detection(0.0)], 0.0)[0].track_id
+
+    for timestamp in (0.1, 0.2, 0.3):
+        assert tracker.snapshot(timestamp)[0].track_id == track_id
+
+    assert tracker.update([], 0.4)[0].track_id == track_id
+    assert tracker.update([], 0.5) == []
+
+
+def test_tracker_snapshot_still_applies_ttl_expiry():
+    tracker = DynamicSphereTracker(0.2, 1.0, 0.25, 10)
+    tracker.update([detection(0.0)], 0.0)
+
+    assert tracker.snapshot(0.20)
+    assert tracker.snapshot(0.26) == []
+
+
 def test_tracker_exponential_smoothing():
     tracker = DynamicSphereTracker(2.0, 0.25, 1.0, 5)
     tracker.update([detection(0.0, 0.1)], 0.0)
     result = tracker.update([detection(1.0, 0.5)], 0.1)[0]
     assert np.isclose(result.x, 0.25)
     assert np.isclose(result.raw_radius, 0.2)
+
+
+def test_tracker_can_smooth_center_and_radius_at_different_rates():
+    tracker = DynamicSphereTracker(
+        2.0, 0.50, 1.0, 5, radius_smoothing_alpha=0.05)
+    tracker.update([detection(0.0, 0.1)], 0.0)
+    result = tracker.update([detection(1.0, 0.5)], 0.1)[0]
+    assert np.isclose(result.x, 0.5)
+    assert np.isclose(result.raw_radius, 0.12)
+    assert np.isclose(result.output_radius, 0.12)
 
 
 def test_tracker_removes_only_tracks_in_rejected_component_bounds():
@@ -833,3 +928,53 @@ def test_min_k_search_reuses_optional_empty_space_guard():
     )
     assert len(unguarded.spheres) == 1
     assert len(guarded.spheres) == 2
+
+
+def test_post_tracking_pruning_removes_covered_new_duplicate():
+    voxels = np.asarray((
+        (-0.10, 0.0, 0.0),
+        (0.00, 0.0, 0.0),
+        (0.10, 0.0, 0.0),
+    ))
+    spheres = [
+        DynamicSphere(
+            0.0, 0.0, 0.0, 0.20, 0.205, 0,
+            track_id=7, age=10, confidence=1.0),
+        DynamicSphere(
+            0.0, 0.0, 0.0, 0.15, 0.155, 0,
+            track_id=8, age=1, confidence=0.95),
+    ]
+    pruned, removed_ids = prune_overlapping_tracked_spheres(
+        [voxels], spheres, 1.0, 0.0, 0.10)
+    assert [sphere.track_id for sphere in pruned] == [7]
+    assert removed_ids == {8}
+
+
+def test_post_tracking_pruning_keeps_overlap_with_unique_coverage():
+    voxels = np.asarray((
+        (-0.10, 0.0, 0.0),
+        (0.25, 0.0, 0.0),
+    ))
+    spheres = [
+        DynamicSphere(
+            0.0, 0.0, 0.0, 0.16, 0.18, 0,
+            track_id=1, age=3, confidence=1.0),
+        DynamicSphere(
+            0.15, 0.0, 0.0, 0.16, 0.18, 0,
+            track_id=2, age=1, confidence=0.95),
+    ]
+    pruned, removed_ids = prune_overlapping_tracked_spheres(
+        [voxels], spheres, 1.0, 0.0, 0.10)
+    assert len(pruned) == 2
+    assert not removed_ids
+
+
+def test_tracker_can_drop_post_pruned_ids():
+    tracker = DynamicSphereTracker(0.20, 1.0, 1.0, 10)
+    first = tracker.update([
+        DynamicSphere(0.0, 0.0, 0.0, 0.1, 0.1),
+        DynamicSphere(0.3, 0.0, 0.0, 0.1, 0.1),
+    ], 0.0)
+    tracker.remove_track_ids({first[0].track_id})
+    remaining = tracker.update([], 0.01)
+    assert [sphere.track_id for sphere in remaining] == [first[1].track_id]

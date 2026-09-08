@@ -12,11 +12,16 @@ from time import monotonic
 from typing import Iterable, Sequence
 
 import numpy as np
+from rmp_camera.component_tracking import ComponentAssociator
+from rmp_camera.local_width_sphere_cover import (
+    local_width_cover, VoxelSupportGuard, visible_width_radius_cap,
+)
 
 from rmp_camera.sphere_merge_core import (
     PairMergeCandidate,
     enumerate_pair_merge_candidates,
     select_best_merge_pair,
+    sphere_overlap_fraction,
     sphere_set_overlap_metrics,
     validate_merge_limits,
 )
@@ -41,6 +46,13 @@ class DynamicSphereParameters:
     enable_greedy_set_cover: bool = True
     enable_single_sphere_replacement: bool = True
     single_sphere_max_radius_m: float = 0.18
+    component_radius_scale: float = 0.0
+    component_fixed_radius_scale: float = 0.0
+    local_width_cover_enabled: bool = False
+    local_width_ratio: float = 1.4
+    local_width_budget_ms: float = 5.0
+    local_width_integrated: bool = False
+    observation_guard_mode: str = 'off'
     target_coverage: float = 0.95
     coverage_tolerance_m: float = 0.02
     safety_margin_m: float = 0.015
@@ -49,6 +61,10 @@ class DynamicSphereParameters:
     max_iterations_per_component: int = 256
     max_total_spheres: int = 384
     processing_budget_ms: float = 35.0
+    # Optional shared foreground merge/search budget. Seed/set-cover creation
+    # retains its original budget; shortening that could force tiny fallback
+    # spheres and make downstream tracking slower instead of faster.
+    refinement_budget_ms: float | None = None
     max_local_grid_voxels: int = 1200000
     dynamic_enable_agglomerative_merge: bool = True
     dynamic_merge_max_radius_m: float = 0.30
@@ -73,6 +89,14 @@ class DynamicSphereParameters:
     max_range_from_base_m: float = 5.0
 
     def validate(self) -> None:
+        if self.observation_guard_mode not in ('off','audit','observed'):
+            raise ValueError('invalid sphere observation guard mode')
+        if (not np.isfinite(self.local_width_ratio) or self.local_width_ratio < 1.
+                or not np.isfinite(self.local_width_budget_ms) or self.local_width_budget_ms < 0.):
+            raise ValueError("invalid local-width ratio/budget")
+        if self.refinement_budget_ms is not None and (
+                not np.isfinite(self.refinement_budget_ms) or self.refinement_budget_ms < 0.):
+            raise ValueError("refinement_budget_ms must be finite and non-negative")
         if self.voxel_size_m <= 0.0:
             raise ValueError("voxel_size_m must be positive")
         if self.connectivity not in (6, 18, 26):
@@ -89,6 +113,17 @@ class DynamicSphereParameters:
             raise ValueError(
                 "single_sphere_max_radius_m must be at least "
                 "min_raw_radius_m")
+        if (
+            not np.isfinite(self.component_radius_scale)
+            or self.component_radius_scale < 0.0
+        ):
+            raise ValueError("component_radius_scale must be finite and non-negative")
+        if (
+            not np.isfinite(self.component_fixed_radius_scale)
+            or self.component_fixed_radius_scale < 0.0
+        ):
+            raise ValueError(
+                "component_fixed_radius_scale must be finite and non-negative")
         validate_merge_limits(
             self.dynamic_merge_max_radius_m,
             self.dynamic_merge_max_radius_growth_ratio,
@@ -127,6 +162,8 @@ class DynamicSphere:
     track_id: int = -1
     age: int = 1
     confidence: float = 0.0
+    # Internal provenance only; existing ROS cloud/marker schema is unchanged.
+    local_width: bool = False
 
     @property
     def center(self) -> np.ndarray:
@@ -178,6 +215,15 @@ class DynamicComponentResult:
     min_k_states_explored: int = 0
     min_k_search_termination: str = "disabled"
     overlap_constraint_satisfied: bool = True
+    refinement_elapsed_ms: float = 0.0
+    refinement_budget_exhausted: bool = False
+    local_width_applied: bool = False
+    local_width_reason: str = "disabled"
+    local_width_elapsed_ms: float = 0.0
+    local_width_candidates: int = 0
+    local_width_regions: int = 0
+    local_width_min_region_coverage: float = 1.0
+    local_width_saved_spheres: int = 0
 
 
 @dataclass
@@ -445,6 +491,111 @@ def _sphere_coverage_masks(
     return masks
 
 
+def component_adaptive_radius_cap(
+    centers: np.ndarray,
+    params: DynamicSphereParameters,
+    absolute_max_radius_m: float,
+) -> float:
+    """Scale the single/merge radius cap with component voxel count.
+
+    A zero scale preserves the legacy global cap.  For a positive scale, the
+    characteristic component length is ``voxel_size * cbrt(voxel_count)``.
+    This keeps small hand-sized components from using a torso-sized enclosing
+    sphere while still allowing dense, large components to approach the global
+    radius limit.  The fixed fallback radius is retained as the lower bound so
+    thin components never lose the coverage supplied by their seed spheres.
+    """
+
+    cap = min(float(absolute_max_radius_m), params.max_raw_radius_m)
+    if params.component_radius_scale <= 0.0 or len(centers) == 0:
+        return cap
+    component_cap = (
+        params.component_radius_scale
+        * params.voxel_size_m
+        * float(np.cbrt(len(centers)))
+    )
+    lower_bound = params.min_raw_radius_m
+    if params.enable_fixed_radius_fallback:
+        lower_bound = max(lower_bound, params.fixed_radius_m)
+    return min(cap, max(lower_bound, component_cap))
+
+
+def component_adaptive_fixed_radius(
+    centers: np.ndarray,
+    params: DynamicSphereParameters,
+) -> float:
+    """Return a size-aware radius for thin-component fallback spheres.
+
+    Dynamic point clouds are usually thin surface shells, so their boundary
+    depth often cannot produce a useful adaptive radius.  A single global
+    fallback radius then makes wide objects use the same small spheres as a
+    hand.  A positive scale grows the fallback with the characteristic
+    component length while retaining ``fixed_radius_m`` as the floor and the
+    existing component-aware/global radius limits as the ceiling.  Zero keeps
+    the legacy fixed-radius behavior.
+    """
+
+    base_radius = min(
+        params.max_raw_radius_m,
+        max(params.min_raw_radius_m, params.fixed_radius_m),
+    )
+    if params.component_fixed_radius_scale <= 0.0 or len(centers) == 0:
+        return base_radius
+    scaled_radius = (
+        params.component_fixed_radius_scale
+        * params.voxel_size_m
+        * float(np.cbrt(len(centers)))
+    )
+    component_cap = component_adaptive_radius_cap(
+        centers, params, params.max_raw_radius_m)
+    return min(component_cap, max(base_radius, scaled_radius))
+
+
+class DynamicCandidateValidator:
+    """One current-geometry policy for local proposal and cached reuse."""
+    def __init__(self, centers, params, evidence=None):
+        self.centers, self.params = centers, params
+        self.evidence = evidence
+        self.origin = np.asarray((params.min_x_m, params.min_y_m, params.min_z_m))
+        self.maximum = np.asarray((params.max_x_m, params.max_y_m, params.max_z_m))
+        self.cap = min(params.max_raw_radius_m, params.dynamic_merge_max_radius_m)
+        self.legacy_cap = component_adaptive_radius_cap(centers, params, self.cap)
+        self.density = (VoxelSupportGuard(centers, self.origin, params.voxel_size_m,
+            params.dynamic_merge_max_empty_fraction, params.dynamic_merge_max_validation_voxels)
+            if params.dynamic_merge_enable_empty_space_guard and len(centers) else None)
+
+    def __call__(self, center, radius, deadline, *, local_width=True):
+        p = self.params
+        if (monotonic() >= deadline or not np.isfinite(center).all() or not np.isfinite(radius)
+                or np.any(center < self.origin) or np.any(center > self.maximum)
+                or not p.min_raw_radius_m <= radius <= self.cap + 1e-12
+                or (p.max_range_from_base_m > 0 and np.linalg.norm(center[:2]) > p.max_range_from_base_m)
+                or not len(self.centers)):
+            return False
+        cap = (visible_width_radius_cap(self.centers, center, radius,
+                voxel_size=p.voxel_size_m, min_radius=p.min_raw_radius_m,
+                max_radius=self.cap, tolerance=p.coverage_tolerance_m,
+                width_ratio=p.local_width_ratio) if local_width else self.legacy_cap)
+        if radius > cap + 1e-10 or not np.any(_covered_mask(self.centers,
+                [DynamicSphere(*center, radius, radius)], p.coverage_tolerance_m)):
+            return False
+        if self.density is None:
+            return True
+        evaluation = self.density.evaluate(center,radius,deadline)
+        if evaluation is None:
+            return False
+        samples,empty = evaluation
+        density_ok=empty<=self.density.max_empty+1e-12
+        if self.evidence is not None and p.observation_guard_mode!='off':
+            ray_ok=self.evidence.validate(samples,self.density,deadline)
+            if ray_ok is not None and ray_ok!=density_ok:
+                key='ray_alternative_accept' if ray_ok else 'ray_alternative_reject'
+                self.evidence.stats[key]=self.evidence.stats.get(key,0)+1
+            if p.observation_guard_mode=='observed' and ray_ok is not None:
+                return ray_ok and monotonic()<deadline
+        return density_ok
+
+
 def _single_sphere_candidates(
     centers: np.ndarray, spheres: Sequence[DynamicSphere],
     params: DynamicSphereParameters, component_id: int,
@@ -475,7 +626,8 @@ def _single_sphere_candidates(
             unique_centers.append(np.asarray(center, dtype=np.float64))
 
     kth_index = max(0, int(np.ceil(params.target_coverage * len(centers))) - 1)
-    radius_cap = min(params.max_raw_radius_m, params.single_sphere_max_radius_m)
+    radius_cap = component_adaptive_radius_cap(
+        centers, params, params.single_sphere_max_radius_m)
     candidates = []
     for center in unique_centers:
         distances = np.linalg.norm(centers - center, axis=1)
@@ -560,11 +712,18 @@ def _greedy_set_cover(
 
 def _fixed_radius_cover(
     centers: np.ndarray, params: DynamicSphereParameters, component_id: int,
-    limit: int,
+    limit: int, radius_m: float | None = None,
 ) -> tuple[list[DynamicSphere], np.ndarray]:
     spheres: list[DynamicSphere] = []
     uncovered = np.ones(len(centers), dtype=bool)
-    radius = min(params.max_raw_radius_m, max(params.min_raw_radius_m, params.fixed_radius_m))
+    radius = (
+        component_adaptive_fixed_radius(centers, params)
+        if radius_m is None
+        else min(
+            params.max_raw_radius_m,
+            max(params.min_raw_radius_m, float(radius_m)),
+        )
+    )
     for idx in range(len(centers)):
         if not uncovered[idx] or len(spheres) >= limit:
             continue
@@ -637,11 +796,19 @@ def _remove_redundant(
 def _optimize_component_spheres(
     centers: np.ndarray, spheres: list[DynamicSphere],
     params: DynamicSphereParameters, component_id: int, deadline: float,
+    *, return_masks: bool = False,
 ) -> list[DynamicSphere]:
     """Minimize candidates using one-sphere replacement, set cover, then deletion."""
     original = list(spheres)
+    def finish(selected, candidates=None, masks=None):
+        if not return_masks:
+            return selected
+        if masks is None:
+            return selected, None
+        rows = {id(s): i for i, s in enumerate(candidates)}
+        return selected, masks[[rows[id(s)] for s in selected]]
     if len(original) < 2 or len(centers) == 0 or monotonic() >= deadline:
-        return original
+        return finish(original)
 
     single_candidates = []
     if params.enable_single_sphere_replacement:
@@ -652,14 +819,14 @@ def _optimize_component_spheres(
         centers, candidates, params.coverage_tolerance_m,
         params.redundancy_tolerance_m, deadline)
     if coverage_masks is None or redundancy_masks is None:
-        return original
+        return finish(original)
 
     if single_candidates:
         best_single = _best_single_sphere(
             single_candidates, coverage_masks[len(original):],
             len(original), params)
         if best_single is not None:
-            return [best_single]
+            return finish([best_single], candidates, coverage_masks)
 
     selected_indices = list(range(len(original)))
     if params.enable_greedy_set_cover:
@@ -671,10 +838,11 @@ def _optimize_component_spheres(
             selected_indices = greedy_indices
 
     selected_spheres = [candidates[index] for index in selected_indices]
-    return _remove_redundant(
+    selected = _remove_redundant(
         centers, selected_spheres, params,
         coverage_masks[selected_indices], redundancy_masks[selected_indices],
         deadline)
+    return finish(selected, candidates, coverage_masks)
 
 
 def dynamic_merge_empty_fraction(
@@ -873,6 +1041,7 @@ def _merge_dynamic_candidate(
         candidate.radius,
         candidate.radius + params.safety_margin_m,
         first.component_id,
+        local_width=first.local_width or spheres[candidate.second_index].local_width,
     )
     active = [
         sphere for index, sphere in enumerate(spheres)
@@ -889,12 +1058,19 @@ def _enumerate_valid_dynamic_merge_candidates(
     deadline: float,
 ) -> list[PairMergeCandidate]:
     active = list(state.spheres)
+    local_validator = DynamicCandidateValidator(centers, params) if any(s.local_width for s in active) else None
+    legacy_cap = component_adaptive_radius_cap(centers, params, params.dynamic_merge_max_radius_m)
     baseline_covered = _covered_mask(
         centers, active, params.coverage_tolerance_m)
     baseline_count = int(np.count_nonzero(baseline_covered))
 
     def validator(candidate: PairMergeCandidate) -> bool:
         if monotonic() >= deadline:
+            return False
+        is_local = active[candidate.first_index].local_width or active[candidate.second_index].local_width
+        if not is_local and candidate.radius > legacy_cap + 1e-12:
+            return False
+        if is_local and not local_validator(candidate.center, candidate.radius, deadline):
             return False
         trial = _merge_dynamic_candidate(active, candidate, params)
         covered = _covered_mask(
@@ -903,9 +1079,10 @@ def _enumerate_valid_dynamic_merge_candidates(
         if (
             coverage + 1e-12 < params.target_coverage
             or np.count_nonzero(covered) < baseline_count
+            or (is_local and not np.all(covered[baseline_covered]))
         ):
             return False
-        if params.dynamic_merge_enable_empty_space_guard:
+        if params.dynamic_merge_enable_empty_space_guard and not is_local:
             empty_fraction = dynamic_merge_empty_fraction(
                 centers,
                 candidate.center,
@@ -921,11 +1098,12 @@ def _enumerate_valid_dynamic_merge_candidates(
                 return False
         return True
 
+    merge_radius_cap = local_validator.cap if local_validator is not None else legacy_cap
     return enumerate_pair_merge_candidates(
         np.asarray([sphere.center for sphere in active]),
         np.asarray([sphere.raw_radius for sphere in active]),
         np.asarray([sphere.component_id for sphere in active]),
-        params.dynamic_merge_max_radius_m,
+        merge_radius_cap,
         params.dynamic_merge_max_radius_growth_ratio,
         params.dynamic_merge_max_gap_m,
         validator,
@@ -1057,6 +1235,10 @@ def agglomerative_merge_dynamic_spheres(
     """Merge same-component pairs conservatively within the shared deadline."""
 
     active = list(spheres)
+    local_validator = DynamicCandidateValidator(centers, params) if any(s.local_width for s in active) else None
+    legacy_cap = component_adaptive_radius_cap(
+        centers, params, params.dynamic_merge_max_radius_m)
+    merge_radius_cap = local_validator.cap if local_validator is not None else legacy_cap
     while len(active) >= 2 and monotonic() < deadline:
         baseline_covered = _covered_mask(
             centers, active, params.coverage_tolerance_m)
@@ -1065,6 +1247,11 @@ def agglomerative_merge_dynamic_spheres(
             if monotonic() >= deadline:
                 return False
             first = active[candidate.first_index]
+            is_local = first.local_width or active[candidate.second_index].local_width
+            if not is_local and candidate.radius > legacy_cap + 1e-12:
+                return False
+            if is_local and not local_validator(candidate.center, candidate.radius, deadline):
+                return False
             merged = DynamicSphere(
                 float(candidate.center[0]),
                 float(candidate.center[1]),
@@ -1072,6 +1259,7 @@ def agglomerative_merge_dynamic_spheres(
                 candidate.radius,
                 candidate.radius + params.safety_margin_m,
                 first.component_id,
+                local_width=is_local,
             )
             trial = [
                 sphere for index, sphere in enumerate(active)
@@ -1079,9 +1267,10 @@ def agglomerative_merge_dynamic_spheres(
             ] + [merged]
             covered = _covered_mask(
                 centers, trial, params.coverage_tolerance_m)
-            if np.count_nonzero(covered) < np.count_nonzero(baseline_covered):
+            if (np.count_nonzero(covered) < np.count_nonzero(baseline_covered)
+                    or (is_local and not np.all(covered[baseline_covered]))):
                 return False
-            if params.dynamic_merge_enable_empty_space_guard:
+            if params.dynamic_merge_enable_empty_space_guard and not is_local:
                 empty_fraction = dynamic_merge_empty_fraction(
                     centers,
                     candidate.center,
@@ -1101,7 +1290,7 @@ def agglomerative_merge_dynamic_spheres(
             np.asarray([sphere.center for sphere in active]),
             np.asarray([sphere.raw_radius for sphere in active]),
             np.asarray([sphere.component_id for sphere in active]),
-            params.dynamic_merge_max_radius_m,
+            merge_radius_cap,
             params.dynamic_merge_max_radius_growth_ratio,
             params.dynamic_merge_max_gap_m,
             validator,
@@ -1117,6 +1306,7 @@ def agglomerative_merge_dynamic_spheres(
             candidate.radius,
             candidate.radius + params.safety_margin_m,
             first.component_id,
+            local_width=first.local_width or active[candidate.second_index].local_width,
         )
         active = [
             sphere for index, sphere in enumerate(active)
@@ -1134,9 +1324,10 @@ def agglomerative_merge_dynamic_spheres(
 
 def _component_spheres(
     indices: np.ndarray, params: DynamicSphereParameters, component_id: int,
-    deadline: float,
+    deadline: float, *, local_width_cache=None, observation_evidence=None,
 ) -> DynamicComponentResult:
     centers = voxel_centers(indices, params)
+    component_fixed_radius = component_adaptive_fixed_radius(centers, params)
     local_extent = np.ptp(indices, axis=0) + 1 if len(indices) else np.ones(3, dtype=int)
     local_volume = int(np.prod(local_extent, dtype=np.int64))
     oversized = len(indices) > params.max_component_voxels or (
@@ -1159,6 +1350,7 @@ def _component_spheres(
             key=lambda i: (-float(radii[i]),) + tuple(float(v) for v in centers[i]))
         spheres = []
         uncovered = np.ones(len(centers), dtype=bool)
+        near_existing_center = np.zeros(len(centers), dtype=bool)
         reason = "target_coverage"
         iterations = 0
         for idx in order:
@@ -1178,26 +1370,157 @@ def _component_spheres(
             if radius < params.min_useful_adaptive_radius_m:
                 continue
             center = centers[idx]
-            if spheres and min(np.linalg.norm(center - s.center) for s in spheres) < (
-                    params.minimum_center_spacing_m):
+            if near_existing_center[idx]:
                 continue
             spheres.append(DynamicSphere(
                 float(center[0]), float(center[1]), float(center[2]), radius,
                 radius + params.safety_margin_m, component_id))
-            uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+            # Accumulate only the newly added sphere. Rechecking all prior
+            # spheres for every seed gave the same union at quadratic cost.
+            uncovered &= ~_covered_mask(centers, spheres[-1:], params.coverage_tolerance_m)
+            near_existing_center |= np.linalg.norm(centers - center, axis=1) < (
+                params.minimum_center_spacing_m)
             if float(np.mean(~uncovered)) + 1e-12 >= params.target_coverage:
                 break
         if (not spheres or float(np.mean(~uncovered)) < params.target_coverage) and (
                 params.enable_fixed_radius_fallback):
             remaining_limit = max(0, params.max_spheres_per_component - len(spheres))
             fixed, _ = _fixed_radius_cover(
-                centers[uncovered], params, component_id, remaining_limit)
+                centers[uncovered], params, component_id, remaining_limit,
+                radius_m=component_fixed_radius)
             spheres.extend(fixed)
             reason = "thin_component_fallback" if not oversized else reason
             uncovered = ~_covered_mask(centers, spheres, params.coverage_tolerance_m)
+    integrate_local = params.local_width_cover_enabled and params.local_width_integrated
+    coverage_masks = None
     if not budget_exceeded:
-        spheres = _optimize_component_spheres(
-            centers, spheres, params, component_id, deadline)
+        optimized = _optimize_component_spheres(
+            centers, spheres, params, component_id, deadline,
+            **({'return_masks': True} if integrate_local else {}))
+        if integrate_local:
+            spheres, coverage_masks = optimized
+        else:
+            spheres = optimized
+    local_result = None
+    if integrate_local:
+        covered = (np.any(coverage_masks, axis=0) if coverage_masks is not None
+                   else _covered_mask(centers, spheres, params.coverage_tolerance_m))
+        local_result = DynamicComponentResult(component_id, centers, spheres,
+            float(np.mean(covered)), centers[~covered], reason)
+        _apply_local_width_cover(local_result, params, coverage_masks=coverage_masks,
+                                attempt_cache=local_width_cache, observation_evidence=observation_evidence)
+        spheres = local_result.spheres
+    refinement_deadline = deadline
+    if params.refinement_budget_ms is not None:
+        refinement_deadline = min(deadline, monotonic() + params.refinement_budget_ms / 1000.)
+    result = refine_dynamic_component(
+        centers, spheres, params, component_id, refinement_deadline, reason)
+    if local_result is not None:
+        for name, value in vars(local_result).items():
+            if name.startswith('local_width_'):
+                setattr(result, name, value)
+    elif params.local_width_cover_enabled:
+        _apply_local_width_cover(result, params)
+    return result
+
+
+def _apply_local_width_cover(result, params, *, coverage_masks=None, attempt_cache=None, observation_evidence=None):
+    """Reconstruct from local voxel widths, not enclosing old inflated balls."""
+    centers, spheres = result.voxel_centers, result.spheres
+    if not 2 <= len(spheres) <= 64 or len(centers) > 8192 or params.local_width_budget_ms <= 0:
+        result.local_width_reason = "not_needed_or_limit"
+        return
+    radius_cap = min(params.max_raw_radius_m, params.dynamic_merge_max_radius_m)
+    if radius_cap < params.min_raw_radius_m:
+        result.local_width_reason = "radius_limit"
+        return
+    start = monotonic()
+    origin = np.asarray((params.min_x_m, params.min_y_m, params.min_z_m))
+    descriptor = None
+    if attempt_cache is not None:
+        descriptor = attempt_cache.descriptor(centers, params.voxel_size_m, origin, len(spheres))
+        if attempt_cache.matches(descriptor, start):
+            result.local_width_reason = 'recent_no_gain'
+            result.local_width_elapsed_ms = (monotonic()-start)*1000.
+            return
+    maximum = np.asarray((params.max_x_m, params.max_y_m, params.max_z_m))
+    guard = (VoxelSupportGuard(centers, origin, params.voxel_size_m,
+                params.dynamic_merge_max_empty_fraction, params.dynamic_merge_max_validation_voxels)
+             if params.dynamic_merge_enable_empty_space_guard and not params.local_width_integrated else None)
+
+    def valid(center, radius, deadline):
+        # Match the existing center crop; sphere volume may cross the ROI just
+        # as legacy boundary spheres do. No new outside-ROI center is allowed.
+        return (np.all(center >= origin) and np.all(center <= maximum)
+                and (params.max_range_from_base_m <= 0
+                     or np.linalg.norm(center[:2]) <= params.max_range_from_base_m)
+                and (guard is None or guard(center, radius, deadline)))
+
+    if params.local_width_integrated:
+        valid = DynamicCandidateValidator(centers, params, observation_evidence)
+
+    proposal = local_width_cover(centers, [s.center for s in spheres],
+        [s.raw_radius for s in spheres], voxel_size=params.voxel_size_m,
+        min_radius=params.min_raw_radius_m,
+        # Local width replaces the whole-component cbrt(N) heuristic here.
+        # Absolute raw/merge limits stay unchanged; narrow local parts still
+        # have the stricter width-derived cap inside local_width_cover().
+        max_radius=radius_cap,
+        tolerance=params.coverage_tolerance_m, target_coverage=params.target_coverage,
+        width_ratio=params.local_width_ratio,
+        budget_ms=max(0., params.local_width_budget_ms - (monotonic() - start) * 1000.),
+        validator=valid, old_coverage_masks=coverage_masks)
+    result.local_width_reason = proposal.reason
+    result.local_width_candidates = proposal.candidates
+    result.local_width_regions = proposal.regions
+    result.local_width_min_region_coverage = proposal.min_region_coverage
+    if proposal.applied:
+        trial = [spheres[index] if index < len(spheres) else DynamicSphere(
+            *center, float(radius), float(radius) + params.safety_margin_m,
+            result.component_id, local_width=True) for index, center, radius in zip(
+                proposal.selected, proposal.centers, proposal.radii)]
+        state = build_dynamic_sphere_search_state(trial)
+        required = _covered_mask(centers, spheres, params.coverage_tolerance_m)
+        covered = _covered_mask(centers, trial, params.coverage_tolerance_m)
+        # Don't trade a feasible overlap configuration for an infeasible one.
+        # Existing infeasible sets may improve K without increasing total overlap.
+        baseline = build_dynamic_sphere_search_state(spheres)
+        if not np.all(covered[required]):
+            result.local_width_reason = "coverage_rejected"
+        elif ((_state_overlap_constraint_satisfied(baseline, params)
+             and not _state_overlap_constraint_satisfied(state, params))
+                or (_state_selected_overlap(state, params)[1]
+                    > _state_selected_overlap(baseline, params)[1] + 1e-12)):
+            result.local_width_reason = "overlap_rejected"
+        else:
+            result.local_width_applied = True
+            result.local_width_saved_spheres = len(spheres) - len(trial)
+            result.coverage = float(np.mean(covered))
+            result.uncovered_voxels = centers[~covered]
+            confidence = max((s.confidence for s in spheres), default=0.)
+            result.spheres = [replace(s, component_coverage=result.coverage, confidence=confidence) for s in trial]
+            result.final_sphere_count = len(trial)
+            result.max_raw_overlap_fraction = state.max_raw_overlap_fraction
+            result.max_output_overlap_fraction = state.max_output_overlap_fraction
+            result.total_raw_overlap = state.total_raw_overlap
+            result.total_output_overlap = state.total_output_overlap
+            result.overlap_constraint_satisfied = _state_overlap_constraint_satisfied(state, params)
+    result.local_width_elapsed_ms = (monotonic() - start) * 1000.
+    if attempt_cache is not None:
+        attempt_cache.remember(descriptor, result.local_width_reason, monotonic())
+
+
+def refine_dynamic_component(
+    centers: np.ndarray, spheres: Sequence[DynamicSphere],
+    params: DynamicSphereParameters, component_id: int, deadline: float,
+    reason: str = "refined",
+) -> DynamicComponentResult:
+    """Refine an existing cover without repeating voxelization or seed creation.
+
+    The synchronous path and the optional background worker use exactly the
+    same merge/search selection, limits and coverage checks.
+    """
+    refinement_start = monotonic()
     pre_merge_spheres = list(spheres)
     pre_merge_sphere_count = len(pre_merge_spheres)
     agglomerative_spheres = list(pre_merge_spheres)
@@ -1258,7 +1581,8 @@ def _component_spheres(
         ):
             min_k_termination = "fallback_agglomerative"
 
-    final_state = build_dynamic_sphere_search_state(spheres)
+    final_state = (selected_state if params.dynamic_enable_min_k_search
+                   else build_dynamic_sphere_search_state(spheres))
     overlap_constraint_satisfied = _state_overlap_constraint_satisfied(
         final_state, params)
     if (
@@ -1295,6 +1619,8 @@ def _component_spheres(
         min_k_states_explored=min_k_states_explored,
         min_k_search_termination=min_k_termination,
         overlap_constraint_satisfied=overlap_constraint_satisfied,
+        refinement_elapsed_ms=(monotonic() - refinement_start) * 1000.,
+        refinement_budget_exhausted=monotonic() >= deadline,
     )
 
 
@@ -1306,6 +1632,8 @@ def generate_dynamic_spheres(
     robot_sphere_radii: np.ndarray | Sequence[float] | None = None,
     robot_component_overlap_threshold: float = 1.0,
     robot_sphere_margin_m: float = 0.0,
+    local_width_cache=None,
+    observation_evidence=None,
 ) -> DynamicSphereResult:
     """Generate bounded, deterministic obstacle spheres from dynamic XYZ points."""
     start = monotonic()
@@ -1319,12 +1647,16 @@ def generate_dynamic_spheres(
         raise ValueError("robot sphere centers and radii must be supplied together")
     indices = filter_and_voxelize(points, params)
     if len(indices) == 0:
+        if local_width_cache is not None:
+            local_width_cache.clear()
         return DynamicSphereResult(elapsed_ms=(monotonic() - start) * 1000.0)
     raw_components = connected_components(indices, params.connectivity)
     raw_components = [c for c in raw_components if len(c) >= params.min_component_voxels]
     raw_components = raw_components[:params.max_components]
     input_component_count = len(raw_components)
     if not raw_components:
+        if local_width_cache is not None:
+            local_width_cache.clear()
         return DynamicSphereResult(
             elapsed_ms=(monotonic() - start) * 1000.0, termination_reason="noise_removed")
     budget_sec = max(0.0, params.processing_budget_ms) / 1000.0
@@ -1337,6 +1669,8 @@ def generate_dynamic_spheres(
     robot_rejected_component_ids = []
     robot_component_overlap_fractions = []
     robot_rejected_component_bounds = []
+    remaining_refinement_ms = params.refinement_budget_ms
+    remaining_local_width_ms = params.local_width_budget_ms
     for component_id, component in enumerate(raw_components):
         morphed = apply_morphology(component, params)
         if use_robot_filter:
@@ -1358,22 +1692,32 @@ def generate_dynamic_spheres(
                     np.max(rejected_centers, axis=0) + half_voxel,
                 ))
                 continue
-        result = _component_spheres(morphed, params, component_id, deadline)
+        component_params = (replace(params, refinement_budget_ms=remaining_refinement_ms)
+                            if remaining_refinement_ms is not None else params)
+        component_params = replace(component_params, local_width_budget_ms=remaining_local_width_ms)
+        result = _component_spheres(morphed, component_params, component_id, deadline,
+            **({'local_width_cache': local_width_cache} if local_width_cache is not None else {}),
+            **({'observation_evidence': observation_evidence} if observation_evidence is not None else {}))
+        remaining_local_width_ms = max(0., remaining_local_width_ms - result.local_width_elapsed_ms)
+        if remaining_refinement_ms is not None:
+            remaining_refinement_ms = max(0., remaining_refinement_ms - result.refinement_elapsed_ms)
         remaining = params.max_total_spheres - len(all_spheres)
-        result.spheres = result.spheres[:max(0, remaining)]
-        result.uncovered_voxels = result.voxel_centers[
-            ~_covered_mask(result.voxel_centers, result.spheres, params.coverage_tolerance_m)]
-        result.coverage = 1.0 - len(result.uncovered_voxels) / max(1, len(result.voxel_centers))
-        result.spheres = [replace(s, component_coverage=result.coverage) for s in result.spheres]
-        final_state = build_dynamic_sphere_search_state(result.spheres)
-        result.final_sphere_count = len(result.spheres)
-        result.max_raw_overlap_fraction = final_state.max_raw_overlap_fraction
-        result.max_output_overlap_fraction = (
-            final_state.max_output_overlap_fraction)
-        result.total_raw_overlap = final_state.total_raw_overlap
-        result.total_output_overlap = final_state.total_output_overlap
-        result.overlap_constraint_satisfied = (
-            _state_overlap_constraint_satisfied(final_state, params))
+        if len(result.spheres) > max(0, remaining):
+            # Component results already contain exact coverage/overlap. Only
+            # invalidate that work when the global cap actually truncates it.
+            result.spheres = result.spheres[:max(0, remaining)]
+            result.uncovered_voxels = result.voxel_centers[
+                ~_covered_mask(result.voxel_centers, result.spheres, params.coverage_tolerance_m)]
+            result.coverage = 1.0 - len(result.uncovered_voxels) / max(1, len(result.voxel_centers))
+            result.spheres = [replace(s, component_coverage=result.coverage) for s in result.spheres]
+            final_state = build_dynamic_sphere_search_state(result.spheres)
+            result.final_sphere_count = len(result.spheres)
+            result.max_raw_overlap_fraction = final_state.max_raw_overlap_fraction
+            result.max_output_overlap_fraction = final_state.max_output_overlap_fraction
+            result.total_raw_overlap = final_state.total_raw_overlap
+            result.total_output_overlap = final_state.total_output_overlap
+            result.overlap_constraint_satisfied = (
+                _state_overlap_constraint_satisfied(final_state, params))
         component_results.append(result)
         all_spheres.extend(result.spheres)
         all_voxels.append(result.voxel_centers)
@@ -1390,6 +1734,8 @@ def generate_dynamic_spheres(
         termination_reason = "robot_components_removed"
     else:
         termination_reason = "noise_removed"
+    if not component_results and local_width_cache is not None:
+        local_width_cache.clear()
     return DynamicSphereResult(
         components=component_results,
         spheres=all_spheres,
@@ -1406,6 +1752,117 @@ def generate_dynamic_spheres(
         termination_reason=termination_reason)
 
 
+def prune_overlapping_tracked_spheres(
+    voxel_groups: Sequence[np.ndarray],
+    spheres: Sequence[DynamicSphere],
+    target_coverage: float,
+    coverage_tolerance_m: float,
+    max_overlap_fraction: float,
+    max_spheres: int = 64,
+    max_removals: int = 16,
+    max_matrix_elements: int = 2000000,
+    *, fresh_track_ids: set[int] | None = None,
+) -> tuple[list[DynamicSphere], set[int]]:
+    """Remove redundant tracked spheres while preserving every component.
+
+    Output-radius overlap selects candidates, while raw-radius voxel coverage
+    guards each current component.  Hard sphere, removal, and matrix caps keep
+    this post-tracking pass bounded at the node's high update rate.
+    """
+
+    if not 0.0 <= target_coverage <= 1.0:
+        raise ValueError("target_coverage must be in [0, 1]")
+    if coverage_tolerance_m < 0.0:
+        raise ValueError("coverage_tolerance_m must be non-negative")
+    if not 0.0 <= max_overlap_fraction <= 1.0:
+        raise ValueError("tracked overlap fraction must be in [0, 1]")
+    if max_spheres <= 0 or max_removals < 0 or max_matrix_elements <= 0:
+        raise ValueError("tracked pruning limits are invalid")
+
+    active_spheres = list(spheres)
+    groups = [_as_points(group) for group in voxel_groups if len(group)]
+    total_points = sum(len(group) for group in groups)
+    if (
+        len(active_spheres) < 2
+        or len(active_spheres) > max_spheres
+        or max_removals == 0
+        or total_points == 0
+        or len(active_spheres) * total_points > max_matrix_elements
+    ):
+        return active_spheres, set()
+
+    points = np.vstack(groups)
+    coverage_masks = _sphere_coverage_masks(
+        points, active_spheres, coverage_tolerance_m)
+    group_slices = []
+    start = 0
+    for group in groups:
+        group_slices.append(slice(start, start + len(group)))
+        start += len(group)
+    baseline_covered = np.any(coverage_masks, axis=0)
+    required_coverage = [
+        min(target_coverage, float(np.mean(baseline_covered[group_slice])))
+        for group_slice in group_slices
+    ]
+
+    active = list(range(len(active_spheres)))
+    removed_track_ids: set[int] = set()
+    removed_count = 0
+    while len(active) > 1 and removed_count < max_removals:
+        coverage_count = np.count_nonzero(coverage_masks[active], axis=0)
+        unique_contribution = {
+            index: int(np.count_nonzero(
+                coverage_masks[index] & (coverage_count == 1)))
+            for index in active
+        }
+        overlapping = set()
+        for first_position, first_index in enumerate(active):
+            first = active_spheres[first_index]
+            for second_index in active[first_position + 1:]:
+                second = active_spheres[second_index]
+                overlap = sphere_overlap_fraction(
+                    first.center,
+                    first.output_radius,
+                    second.center,
+                    second.output_radius,
+                )
+                if overlap > max_overlap_fraction + 1e-12:
+                    overlapping.add(first_index)
+                    overlapping.add(second_index)
+        if not overlapping:
+            break
+
+        removal_order = sorted(overlapping, key=lambda index: (
+            unique_contribution[index],
+            int(active_spheres[index].track_id in fresh_track_ids) if fresh_track_ids is not None else 0,
+            active_spheres[index].confidence,
+            active_spheres[index].age,
+            -active_spheres[index].output_radius,
+            active_spheres[index].track_id,
+            index,
+        ))
+        removed = False
+        for index in removal_order:
+            trial = [candidate for candidate in active if candidate != index]
+            covered = np.any(coverage_masks[trial], axis=0)
+            if all(
+                float(np.mean(covered[group_slice])) + 1e-12 >= required
+                for group_slice, required in zip(
+                    group_slices, required_coverage)
+            ):
+                active = trial
+                track_id = active_spheres[index].track_id
+                if track_id >= 0:
+                    removed_track_ids.add(track_id)
+                removed_count += 1
+                removed = True
+                break
+        if not removed:
+            break
+
+    return [active_spheres[index] for index in active], removed_track_ids
+
+
 @dataclass
 class _Track:
     track_id: int
@@ -1413,6 +1870,7 @@ class _Track:
     first_seen: float
     last_seen: float
     missed_updates: int = 0
+    object_id: int = -1
 
 
 class DynamicSphereTracker:
@@ -1421,28 +1879,69 @@ class DynamicSphereTracker:
     def __init__(
         self, association_distance_m: float, smoothing_alpha: float,
         ttl_sec: float, max_missed_updates: int,
+        radius_smoothing_alpha: float | None = None,
+        component_tracking_enabled: bool = False,
+        max_radius_ratio: float = 2.0,
+        component_distance_m: float = .30,
+        voxel_size_m: float = .05,
     ) -> None:
         self.association_distance_m = float(association_distance_m)
         self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self.radius_smoothing_alpha = float(np.clip(
+            self.smoothing_alpha
+            if radius_smoothing_alpha is None
+            else radius_smoothing_alpha,
+            0.0,
+            1.0,
+        ))
         self.ttl_sec = float(ttl_sec)
         self.max_missed_updates = int(max_missed_updates)
         self._next_id = 0
         self._tracks: dict[int, _Track] = {}
+        if not np.isfinite(max_radius_ratio) or max_radius_ratio < 1.:
+            raise ValueError("tracking radius ratio must be finite and >= 1")
+        self.component_tracking_enabled = component_tracking_enabled
+        self.max_radius_ratio = max_radius_ratio
+        self.component_associator = ComponentAssociator(
+            distance=component_distance_m, voxel_size=voxel_size_m, ttl=self.ttl_sec)
+        self.last_observation_time = None
 
     def update(
         self,
         detections: Iterable[DynamicSphere],
         timestamp_sec: float,
+        *, components=None,
     ) -> list[DynamicSphere]:
         detections = list(detections)
         now = float(timestamp_sec)
+        if (self.component_tracking_enabled and self.last_observation_time is not None
+                and now < self.last_observation_time):
+            self.clear()
+        self.last_observation_time = now
         self._expire(now)
+        use_components = self.component_tracking_enabled and components is not None
+        object_ids, translations = (self.component_associator.update(components, now)
+                                    if use_components else ({}, {}))
         pairs = []
         for track_id, track in self._tracks.items():
             for detection_index, detection in enumerate(detections):
-                distance = float(np.linalg.norm(track.sphere.center - detection.center))
+                expected = track.sphere.center
+                radius_cost = 0.
+                if use_components:
+                    object_id = object_ids.get(detection.component_id, -1)
+                    if object_id < 0 or track.object_id != object_id:
+                        continue
+                    ratio = max(track.sphere.raw_radius, detection.raw_radius) / max(
+                        1e-6, min(track.sphere.raw_radius, detection.raw_radius))
+                    if ratio > self.max_radius_ratio:
+                        continue
+                    # Use measured object translation for association only;
+                    # published centers still come from current observations.
+                    expected = expected + translations[detection.component_id]
+                    radius_cost = .03 * abs(np.log(ratio))
+                distance = float(np.linalg.norm(expected - detection.center))
                 if distance <= self.association_distance_m:
-                    pairs.append((distance, track_id, detection_index))
+                    pairs.append((distance + radius_cost, track_id, detection_index))
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
         for _, track_id, detection_index in sorted(pairs):
@@ -1450,10 +1949,20 @@ class DynamicSphereTracker:
                 continue
             track = self._tracks[track_id]
             detection = detections[detection_index]
-            alpha = self.smoothing_alpha
-            center = alpha * detection.center + (1.0 - alpha) * track.sphere.center
-            raw = alpha * detection.raw_radius + (1.0 - alpha) * track.sphere.raw_radius
-            output = alpha * detection.output_radius + (1.0 - alpha) * track.sphere.output_radius
+            center_alpha = self.smoothing_alpha
+            radius_alpha = self.radius_smoothing_alpha
+            center = (
+                center_alpha * detection.center
+                + (1.0 - center_alpha) * track.sphere.center
+            )
+            raw = (
+                radius_alpha * detection.raw_radius
+                + (1.0 - radius_alpha) * track.sphere.raw_radius
+            )
+            output = (
+                radius_alpha * detection.output_radius
+                + (1.0 - radius_alpha) * track.sphere.output_radius
+            )
             age = track.sphere.age + 1
             track.sphere = replace(
                 detection, x=float(center[0]), y=float(center[1]), z=float(center[2]),
@@ -1469,7 +1978,8 @@ class DynamicSphereTracker:
             track_id = self._next_id
             self._next_id += 1
             sphere = replace(detection, track_id=track_id, age=1)
-            self._tracks[track_id] = _Track(track_id, sphere, now, now)
+            self._tracks[track_id] = _Track(track_id, sphere, now, now,
+                object_id=object_ids.get(detection.component_id, -1))
             matched_tracks.add(track_id)
         for track_id, track in self._tracks.items():
             if track_id not in matched_tracks:
@@ -1480,6 +1990,30 @@ class DynamicSphereTracker:
     def clear(self) -> None:
         """Drop all retained tracks while preserving monotonically increasing IDs."""
         self._tracks.clear()
+        self.component_associator.clear()
+        self.last_observation_time = None
+
+    def fresh_track_ids(self, timestamp_sec):
+        return {key for key, track in self._tracks.items() if track.last_seen == timestamp_sec}
+
+    def snapshot(self, timestamp_sec: float) -> list[DynamicSphere]:
+        """Return live tracks without counting a missing detection update.
+
+        The sphere node runs from a fixed-rate timer that can be faster than
+        the upstream dynamic PointCloud publisher.  A timer tick with no new
+        PointCloud is therefore not evidence that an obstacle disappeared.
+        TTL expiry still applies so tracks cannot survive indefinitely when
+        the upstream publisher stops.
+        """
+
+        self._expire(float(timestamp_sec))
+        return [self._tracks[key].sphere for key in sorted(self._tracks)]
+
+    def remove_track_ids(self, track_ids: Iterable[int]) -> None:
+        """Drop tracks removed by a downstream geometry post-pass."""
+
+        for track_id in track_ids:
+            self._tracks.pop(int(track_id), None)
 
     def remove_tracks_in_bounds(
         self,

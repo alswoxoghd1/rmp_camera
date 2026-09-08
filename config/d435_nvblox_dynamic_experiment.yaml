@@ -18,28 +18,57 @@
     global_frame: "base_link"             # TF frame used by every sphere output.
     camera_frame: "camera0_link"          # D435 root frame under global_frame.
     camera_serial_number: "117322070340"   # RealSense D435i selected for this experiment.
-    static_tf_x_m: 1.458262715             # 2026-08-11 base->camera X [m].
-    static_tf_y_m: -1.804955216            # 2026-08-11 base->camera Y [m].
-    static_tf_z_m: 0.916527059             # 2026-08-11 base->camera Z [m].
-    static_tf_roll_rad: -0.001618987       # 2026-08-11 roll [rad].
-    static_tf_pitch_rad: 0.257128767       # 2026-08-11 pitch [rad].
-    static_tf_yaw_rad: 2.013029376         # 2026-08-11 yaw [rad].
+    static_tf_x_m: 1.389425672             # 2026-09-02 TCP-click + depth-validated base->camera X [m].
+    static_tf_y_m: -1.680808684            # 2026-09-02 TCP-click + depth-validated base->camera Y [m].
+    static_tf_z_m: 0.916042671             # 2026-09-02 TCP-click + depth-validated base->camera Z [m].
+    static_tf_roll_rad: 0.021871840        # 2026-09-02 TCP-click + depth-validated roll [rad].
+    static_tf_pitch_rad: 0.245771280       # 2026-09-02 TCP-click + depth-validated pitch [rad].
+    static_tf_yaw_rad: 2.059974215         # 2026-09-02 TCP-click + depth-validated yaw [rad].
     robot_depth_surface_sphere_padding_m: 0.0 # Sphere rendering padding [m].
     robot_depth_surface_front_tolerance_m: 0.02 # Front surface band [m].
     robot_depth_surface_back_tolerance_m: 0.03  # Back surface band [m].
     robot_depth_mask_shadow_behind_robot: false # Preserve background behind robot.
     robot_depth_mask_rate_hz: 0.0         # Actual mask-node processing limit [Hz].
-    robot_depth_publish_predicted_depth: true # Publish predicted robot depth for inspection.
-    robot_depth_publish_removed_points: true  # Publish removed 3D points for inspection.
+    robot_depth_publish_predicted_depth: false # Disable heavy self-filter debug image.
+    robot_depth_publish_removed_points: false  # Disable self-filter debug point cloud.
+    run_depth_edge_filter: true                # Independent of robot self-filter; single-frame depth validation.
+    human_low_latency: true                   # Latest compatible masks and scoped single-thread CPU kernels.
+    async_sphere_refinement: true              # Keep fresh seeds; move long Dynamic/Human searches off the ROS callback.
+    latest_sphere_input: true                 # Newest synchronized raw cloud; NumPy decoding, DDS depth 1.
+    component_sphere_tracking: true           # Match object shape first; gate torso-to-hand radius inheritance.
+    fusion_coverage_guard: true               # Keep nonhuman support when cross-source balls only partly overlap.
+    local_width_sphere_cover: true            # Local PCA widths; replace only with fewer support-preserving spheres.
+    integrated_sphere_cover: true             # Share masks and refine only after selecting local-width candidates.
+    sphere_observation_guard: "off"           # off|audit|observed; audit first, no unvalidated default guard relaxation.
+    realsense_depth_profile: "848x480x60"     # Raw depth; emitter splitter yields about 30 Hz.
+    realsense_color_profile: "960x540x30"     # One step below 1280x720; D435i-supported RGB profile.
+    realsense_enable_depth: true               # Keep depth stream enabled.
+    realsense_enable_color: true               # Keep RGB stream enabled.
+    realsense_enable_infra: false              # Disable infrared stream 0.
+    realsense_enable_infra1: false             # Disable infrared stream 1.
+    realsense_enable_infra2: false             # Disable infrared stream 2.
+    realsense_enable_accel: false              # Disable accelerometer stream.
+    realsense_enable_gyro: false               # Disable gyroscope stream.
+    realsense_enable_motion: false             # Disable combined IMU stream.
+    realsense_enable_pointcloud: false         # nvblox consumes depth, not camera pointcloud.
     realsense_decimation_filter_enabled: false  # Downsample depth; faster but loses small objects.
-    realsense_spatial_filter_enabled: true      # Smooth spatial depth noise; may soften edges.
-    realsense_temporal_filter_enabled: true     # Smooth time noise; may trail moving objects.
+    realsense_spatial_filter_enabled: false     # Disabled to reduce depth processing load.
+    realsense_temporal_filter_enabled: false    # Disabled to reduce load and motion trails.
     realsense_hole_filling_filter_enabled: false # Fill gaps; can bridge separate objects.
     rviz_config: "d435_nvblox_dynamic_spheres.rviz" # File in this package's config directory.
     source: "camera"                       # camera or bag.
     bag_path: ""                           # rosbag path when source=bag.
     bag_rate: 1.0                          # Bag playback multiplier [unitless].
     use_sim_time: false                    # Must be true for bag /clock.
+
+/depth_edge_filter_node:
+  ros__parameters:
+    neighborhood_radius_px: 3            # 7x7 current-frame neighborhood, no temporal buffering.
+    min_depth_jump_m: 0.10                # Require nearer AND farther support at least this far away.
+    support_tolerance_m: 0.04             # Neighbors within +/-4cm support the center measurement.
+    min_support_pixels: 12               # Retain candidates with >=12 supporting neighbors (excluding center).
+    min_side_pixels: 2                   # At least 2 nearer AND 2 farther neighbors; invalid depth never counts.
+    statistics_period_s: 2.0             # Log counts and processing mean/max; no per-frame debug clouds.
 
 /nvblox_node:
   ros__parameters:
@@ -81,7 +110,7 @@
     lidar_min_valid_range_m: 0.1           # Inactive while use_lidar is false.
     lidar_max_valid_range_m: 50.0          # Inactive while use_lidar is false.
     use_non_equal_vertical_fov_lidar_params: false
-    maximum_input_queue_length: 10
+    maximum_input_queue_length: 2
     esdf_slice_bounds_visualization_side_length: 10.0
     workspace_height_bounds_visualization_side_length: 10.0
     layer_visualization_min_tsdf_weight: 0.1
@@ -93,7 +122,7 @@
     layer_streamer_bandwidth_limit_mbps: -1.0 # Unlimited.
 
     multi_mapper:
-      connected_mask_component_size_threshold: 1000 # Dynamic image component floor [pixels].
+      connected_mask_component_size_threshold: 300  # Reject small depth-edge dynamics while retaining hand-sized regions [pixels].
       remove_small_connected_components: true     # Reject small segmentation speckle.
 
     static_mapper:
@@ -117,8 +146,8 @@
       unobserved_esdf_policy: "ignore"            # Never treat unobserved as free.
       max_tsdf_distance_for_occupancy_m: 0.18     # TSDF band used by freespace logic [m].
       max_unobserved_to_keep_consecutive_occupancy_ms: 400 # Occupancy continuity window [ms].
-      min_duration_since_occupied_for_freespace_ms: 1250    # Dynamic confidence delay [ms].
-      min_consecutive_occupancy_duration_for_reset_ms: 1200 # Static reset evidence [ms].
+      min_duration_since_occupied_for_freespace_ms: 400     # Reduce dynamic detection latency [ms].
+      min_consecutive_occupancy_duration_for_reset_ms: 1800 # Static reset evidence [ms].
       check_neighborhood: true                    # Use neighboring voxels for freespace evidence.
       initialize_to_high_confidence_freespace: false # Conservative startup; fewer false dynamics.
       tsdf_decay_factor: 0.95                     # Static decay multiplier per decay tick.
@@ -157,6 +186,8 @@
 
 /esdf_medial_sphere_node:
   ros__parameters:
+    result_status_topic: "/rmp_camera/static_sphere_result_status"
+    empty_check_rate_hz: 5.0              # Cheap empty-only checks; full sphere optimization stays at update_rate_hz.
     service_name: "/nvblox_node/get_esdf_and_gradient"
     target_frame: "base_link"
     update_rate_hz: 1.0                    # Dense static service queries [Hz].
@@ -170,13 +201,15 @@
     aabb_size_z_m: 2.0
     unobserved_distance_value: -1000.0     # Nvblox unobserved sentinel [m].
     inside_epsilon_m: 0.005                # Negative-distance noise rejection [m].
-    target_coverage: 0.92                  # Required component voxel coverage [0..1].
+    target_coverage: 0.90                  # Slightly coarser static cover while preserving small-obstacle coverage.
     coverage_tolerance_m: 0.02             # Coverage discretization tolerance [m].
     plateau_epsilon_m: 0.001               # ESDF minimum plateau tolerance [m].
-    minimum_center_spacing_m: 0.10         # Static center separation [m].
+    minimum_center_spacing_m: 0.10         # Preserve small-obstacle coverage; coarse cover handles large components.
     min_component_voxels: 30                # Static connected-component floor [voxels].
-    min_raw_sphere_radius_m: 0.04           # Static raw radius floor [m].
-    safety_margin_m: 0.02                  # Added to static output radius only [m].
+    min_raw_sphere_radius_m: 0.04           # Preserve thin static features; coarse cover simplifies only large components.
+    max_raw_sphere_radius_m: 0.32           # Let thick static objects use fewer, larger adaptive spheres [m].
+    safety_margin_m: 0.005                 # Added to static output radius only [m].
+    marker_lifetime_s: 3.0                 # Expire stale RViz markers after missed updates [s].
     redundancy_tolerance_m: 0.001          # Removal containment slack [m].
     max_spheres_per_component: 128
     max_iterations_per_component: 256
@@ -189,33 +222,50 @@
     target_shell_coverage: 0.94            # Desired surface-shell coverage [0..1].
     shell_coverage_loss_tolerance: 0.02    # Allowed loss from baseline shell coverage.
     max_optimization_matrix_elements: 20000000 # Per-component boolean matrix guard.
+    enable_component_coarse_cover: true    # Add guarded larger candidates only for large static components.
+    local_width_ratio: 1.4                # Visible local half-width to candidate radius ratio.
+    local_width_budget_ms: 15.0           # Shared per-update soft reconstruction budget; preserve old cover on failure.
+    component_coarse_min_voxels: 120       # Stay above the observed 68-85 voxel floor fragments.
+    component_coarse_radius_scale: 0.45    # voxel_size*cuberoot(component voxels) multiplier.
+    component_coarse_max_radius_m: 0.32    # Never exceed the configured static raw-radius cap.
+    component_coarse_max_empty_fraction: 0.75 # Reject large candidates with weak component support.
+    component_coarse_max_free_space_distance_m: 0.15 # Bound coarse over-approximation into observed free space [m].
     enable_agglomerative_merge: true       # Merge only conservatively valid same-component pairs.
-    merge_max_radius_m: 0.35               # Hard raw-radius cap for a merged static sphere [m].
-    merge_max_radius_growth_ratio: 1.45    # Merged radius / larger parent radius cap.
-    merge_max_gap_m: 0.05                  # Maximum parent surface gap [m].
-    merge_enable_esdf_guard: true          # Sample merged surface against static ESDF.
-    merge_max_free_space_distance_m: 0.08  # Maximum positive sampled ESDF distance [m].
+    merge_max_radius_m: 0.32               # Match the adaptive static raw-radius cap [m].
+    merge_max_radius_growth_ratio: 1.80    # Permit broad same-component spheres to merge further.
+    merge_max_gap_m: 0.08                  # Maximum parent surface gap [m].
+    merge_enable_esdf_guard: true           # Reject merged surfaces protruding into known free space.
+    merge_max_free_space_distance_m: 0.10  # Moderate ESDF slack for fewer large static spheres [m].
     merge_surface_sample_count: 64         # Deterministic Fibonacci surface samples.
     merge_min_observed_surface_fraction: 0.70 # Required observed sample fraction [0..1].
-    robot_component_filter_enabled: true   # Reject static components overlapping the robot.
-    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
-    robot_component_overlap_threshold: 0.10 # Reject when intersecting static voxel ratio is >= 10%.
-    robot_sphere_filter_margin_m: 0.03      # Inflate robot spheres for static voxel-AABB tests [m].
+    enable_min_k_search: true              # Explore multiple valid static merge orders.
+    min_k_beam_width: 12                   # Best static merge states retained per depth.
+    min_k_max_states: 512                  # Hard state cap per static component.
+    min_k_processing_budget_ms: 350.0      # Per-component Minimum-K time budget [ms].
+    enable_post_merge_overlap_pruning: true # Remove redundant final spheres while preserving coverage.
+    post_merge_max_overlap_fraction: 0.20  # Candidate threshold relative to the smaller sphere volume.
+    post_merge_pruning_max_spheres: 64     # Skip bounded post-pass above this component size.
+    post_merge_pruning_max_removals: 32    # Hard removal-pass cap per component.
+    max_grid_voxels: 8000000               # Dense response memory guard [voxels].
+    marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
+    query_bounds_marker_topic: "/rmp_camera/esdf_medial_query_bounds"
+    sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
+    inside_voxel_cloud_topic: "/rmp_camera/esdf_medial_inside_voxels"
+    uncovered_voxel_cloud_topic: "/rmp_camera/esdf_medial_uncovered_voxels"
+    robot_component_filter_enabled: true    # Reject static ESDF components overlapping the robot.
+    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    robot_component_overlap_threshold: 0.02 # Reject components with meaningful robot overlap.
+    robot_sphere_filter_margin_m: 0.0         # Radius inflation is already in collision_spheres.yaml.
     robot_marker_expected_sphere_count: 35
     robot_marker_require_expected_count: true
     use_time_synchronized_robot_markers: true
     robot_marker_buffer_duration_s: 1.0
-    robot_marker_max_stamp_delta_s: 0.10    # Static query time-to-marker tolerance [s].
+    robot_marker_max_stamp_delta_s: 0.25
     robot_marker_subscription_depth: 2
     fallback_to_latest_marker_on_time_miss: false
-    robot_component_filter_fail_closed: true # Publish no static spheres without valid robot geometry.
-    max_grid_voxels: 8000000               # Dense response memory guard [voxels].
-    marker_topic: "/rmp_camera/esdf_medial_sphere_markers"
-    sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
-    inside_voxel_cloud_topic: "/rmp_camera/esdf_medial_inside_voxels"
-    uncovered_voxel_cloud_topic: "/rmp_camera/esdf_medial_uncovered_voxels"
+    robot_component_filter_fail_closed: true # Do not publish unfiltered static updates on sync failure.
     robot_rejected_voxel_cloud_topic: "/rmp_camera/static_robot_rejected_voxels"
-    publish_debug_clouds: true
+    publish_debug_clouds: false            # Disable intermediate static voxel PointCloud outputs.
 
 /dynamic_obstacle_sphere_node:
   ros__parameters:
@@ -233,98 +283,272 @@
     max_z_m: 2.5
     max_range_from_base_m: 2.0             # Radial XY crop [m]; <=0 disables.
     dynamic_voxel_size_m: 0.05             # CPU voxel edge [m]; KEEP EQUAL to nvblox voxel_size.
-    dynamic_min_component_voxels: 50       # Noise component floor [voxels].
+    dynamic_min_component_voxels: 20       # Reject small 3D edge-noise components [voxels].
     dynamic_max_component_voxels: 120000   # Above this, use bounded fallback.
     dynamic_max_components: 32             # Component processing cap.
     dynamic_max_input_points: 250000       # Input truncation cap [points].
     dynamic_connectivity: 6                # 6 face, 18 face+edge, or 26 incl. corner.
     dynamic_dilation_voxels: 0             # Positive values expand dynamic objects [voxels].
-    dynamic_closing_iterations: 1          # Fill one-voxel cracks; large values merge objects.
+    dynamic_closing_iterations: 0          # Avoid joining robot-edge fragments across one-voxel gaps.
     dynamic_minimum_center_spacing_m: 0.12 # Adaptive sphere center separation [m].
     dynamic_min_raw_radius_m: 0.025         # Smallest accepted raw radius [m].
-    dynamic_max_raw_radius_m: 0.45          # Prevent one sphere swallowing nearby space [m].
-    dynamic_min_useful_adaptive_radius_m: 0.075 # Below this, prefer fixed fallback [m].
+    dynamic_max_raw_radius_m: 0.28          # Allow thick moving objects to use larger adaptive spheres [m].
+    dynamic_min_useful_adaptive_radius_m: 0.04 # Keep useful small adaptive spheres instead of inflating them [m].
     dynamic_enable_fixed_radius_fallback: true  # Preserve thin shells and sparse surfaces.
-    dynamic_fixed_radius_m: 0.15            # Thin/oversized fallback radius [m].
+    dynamic_fixed_radius_m: 0.06            # Smaller fallback for thin or sparse moving objects [m].
     dynamic_enable_greedy_set_cover: true   # Select a smaller sphere subset while preserving target coverage.
     dynamic_enable_single_sphere_replacement: true # Replace compact components with one sphere.
-    dynamic_single_sphere_max_radius_m: 0.28 # Limit free-space consumed by a replacement sphere [m].
-    dynamic_target_coverage: 0.92            # Voxel-center coverage goal [0..1].
+    dynamic_single_sphere_max_radius_m: 0.25 # Allow compact, bulky components to use one larger sphere [m].
+    dynamic_component_radius_scale: 0.60    # Scale single/merge caps by voxel_size*cuberoot(component voxels); 0 disables.
+    dynamic_component_fixed_radius_scale: 0.45 # Grow broad components more while keeping the 6 cm base floor.
+    dynamic_local_width_ratio: 1.4            # Radius / local visible half-width; not inferred object depth.
+    dynamic_local_width_budget_ms: 5.0        # Shared per-frame soft reconstruction budget; fallback on timeout.
+    dynamic_target_coverage: 0.90            # Slightly coarser dynamic cover for fewer spheres.
     dynamic_coverage_tolerance_m: 0.02      # Coverage distance slack [m].
-    dynamic_safety_margin_m: 0.015          # Added to published radius only [m].
+    dynamic_safety_margin_m: 0.005          # Added to published radius only [m].
     dynamic_redundancy_tolerance_m: 0.01    # Redundancy removal slack [m].
     dynamic_max_spheres_per_component: 96
-    dynamic_max_iterations_per_component: 256
+    dynamic_max_iterations_per_component: 512
     dynamic_max_total_spheres: 384
-    dynamic_processing_budget_ms: 50.0      # Per-update soft CPU budget [ms].
+    dynamic_processing_budget_ms: 300.0      # Original seed guard and background refinement budget [ms].
+    dynamic_foreground_refinement_budget_ms: 5.0  # Shared short merge/Minimum-K budget, not a seed-generation cutoff.
+    dynamic_refinement_rate_hz: 3.0          # At most one outstanding job; submit only unfinished searches.
+    dynamic_refinement_max_age_s: 0.5        # Old templates also need current coverage/support validation.
     dynamic_max_local_grid_voxels: 1200000  # Dense-equivalent volume guard [voxels].
     dynamic_enable_agglomerative_merge: true # Merge only valid same-component pairs.
-    dynamic_merge_max_radius_m: 0.30         # Hard raw-radius cap for a merged dynamic sphere [m].
-    dynamic_merge_max_radius_growth_ratio: 1.50 # Merged radius / larger parent radius cap.
+    dynamic_merge_max_radius_m: 0.28         # Match the adaptive dynamic raw-radius cap [m].
+    dynamic_merge_max_radius_growth_ratio: 1.80 # Permit broader same-component dynamic merges.
     dynamic_merge_max_gap_m: 0.08            # Maximum parent surface gap [m].
-    dynamic_merge_enable_empty_space_guard: false # Optional occupancy guard; off by default.
+    dynamic_merge_enable_empty_space_guard: true # Reject merges that swallow excessive empty space.
     dynamic_merge_max_empty_fraction: 0.70   # Maximum unoccupied fraction when guard is enabled.
     dynamic_merge_max_validation_voxels: 50000 # Bound optional validation work.
     dynamic_enable_min_k_search: true        # Explore multiple valid merge orders to minimize sphere count.
-    dynamic_min_k_beam_width: 8              # Best merge states retained at each search depth.
-    dynamic_min_k_max_states: 128            # Hard cap on explored merge states per component.
+    dynamic_min_k_beam_width: 16              # Best merge states retained at each search depth.
+    dynamic_min_k_max_states: 512            # Hard cap on explored merge states per component.
     dynamic_min_k_enable_overlap_constraint: true # Reject final sets exceeding the overlap limit when possible.
-    dynamic_max_allowed_overlap_fraction: 0.20 # Maximum pair overlap relative to the smaller sphere volume.
+    dynamic_max_allowed_overlap_fraction: 0.10 # Maximum pair overlap relative to the smaller sphere volume.
     dynamic_min_k_use_output_overlap: true   # Measure overlap using safety-inflated output radii.
     dynamic_min_k_prefer_lower_overlap: true # Break equal-count ties in favor of lower overlap.
     dynamic_tracking_enabled: true
-    dynamic_association_distance_m: 0.20    # One-to-one center association gate [m].
-    dynamic_smoothing_alpha: 0.80           # 1=new measurement, 0=old track.
-    dynamic_sphere_ttl_sec: 0.15            # Occlusion retention [s].
-    dynamic_max_missed_updates: 1           # Occlusion update-count cap.
-    dynamic_update_rate_hz: 15.0            # CPU generation/tracking rate [Hz].
+    dynamic_post_tracking_overlap_pruning_enabled: true # Coverage-guarded track de-duplication.
+    dynamic_post_tracking_max_overlap_fraction: 0.10 # Prune candidates above this output overlap.
+    dynamic_post_tracking_max_spheres: 64  # Skip bounded post-pass above this tracked count.
+    dynamic_post_tracking_max_removals: 16 # Hard removals per update.
+    dynamic_post_tracking_max_matrix_elements: 2000000 # Sphere-by-voxel memory cap.
+    dynamic_association_distance_m: 0.12    # Prevent different hand/body spheres being re-associated as one jumping track.
+    dynamic_smoothing_alpha: 0.75           # Favor the latest center for lower tracking latency.
+    dynamic_radius_smoothing_alpha: 0.20    # Let sphere size adapt without excessive frame-wise snapping.
+    dynamic_sphere_ttl_sec: 0.30            # Bridge short valid-frame gaps without allowing long ghosts [s].
+    dynamic_max_missed_updates: 2           # Count only actual input frames; tolerate two weak detections.
+    dynamic_update_rate_hz: 20.0            # Stable obstacle geometry update; fusion remains 30 Hz.
+    dynamic_input_max_age_s: 0.25           # Reject stale cloud before conversion/generation.
+    dynamic_tracking_max_radius_ratio: 2.0 # Larger radius jumps start a new track, without changing TTL.
+    marker_lifetime_s: 0.5                  # Auto-expire stale RViz markers if DELETE is missed [s].
     robot_component_filter_enabled: true    # Reject components substantially overlapping the robot.
-    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
-    robot_component_overlap_threshold: 0.01 # Reject when intersecting voxel ratio is >= this value.
-    robot_sphere_filter_margin_m: 0.03       # Inflate robot spheres for voxel-AABB tests [m].
+    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    robot_component_overlap_threshold: 0.02 # Aggressively reject robot-edge depth artifacts while keeping 3D-separated hands.
+    robot_sphere_filter_margin_m: 0.0         # Radius inflation is already in collision_spheres.yaml.
     robot_marker_expected_sphere_count: 35
     robot_marker_require_expected_count: true
     use_time_synchronized_robot_markers: true
     robot_marker_buffer_duration_s: 1.0
-    robot_marker_max_stamp_delta_s: 0.05     # Accepted point-to-marker timestamp error [s].
+    robot_marker_max_stamp_delta_s: 0.12     # Cover measured 0.10-0.12 s callback jitter before fail-closed drop.
     robot_marker_sync_wait_timeout_s: 0.25   # Wait for delayed marker callbacks before fail-closed drop.
     robot_marker_subscription_depth: 2      # Keep only fresh callbacks; timestamp history is buffered in-node.
     fallback_to_latest_marker_on_time_miss: false
     robot_component_filter_fail_closed: true # Drop frame if valid synchronized spheres are unavailable.
     robot_rejected_voxel_cloud_topic: "/rmp_camera/dynamic_robot_rejected_voxels"
-    publish_debug_clouds: true
+    publish_debug_clouds: false            # Disable intermediate dynamic voxel PointCloud outputs.
 
 /obstacle_sphere_fusion_node:
   ros__parameters:
-    static_sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
+    # Temporarily exclude static spheres from fusion; restore /rmp_camera/esdf_medial_sphere_cloud to enable.
+    static_sphere_cloud_topic: "/rmp_camera/disabled_static_sphere_cloud"
+    static_result_status_topic: "/rmp_camera/static_sphere_result_status"
+    static_require_result_status: true    # Pair exact-generation validity with each static cloud.
+    static_fast_empty_clear: true         # Only successful, spatially observed empty solves bypass debounce.
     dynamic_sphere_cloud_topic: "/rmp_camera/dynamic_obstacle_sphere_cloud"
+    human_sphere_cloud_topic: "/rmp_camera/human_sphere_cloud"
     combined_sphere_cloud_topic: "/rmp_camera/combined_obstacle_sphere_cloud"
     combined_marker_topic: "/rmp_camera/combined_obstacle_sphere_markers"
     target_frame: "base_link"
-    fusion_rate_hz: 15.0                   # Latest-cache fusion output [Hz].
+    fusion_rate_hz: 30.0                   # Latest-cache fusion output [Hz].
     fusion_overlap_tolerance_m: 0.01       # Real 3D sphere overlap slack [m].
+    fusion_coverage_tolerance_m: 0.02      # Match generator voxel coverage tolerance, not visual sphere overlap.
     fusion_dynamic_priority: true          # Fresh dynamic suppresses overlapping static.
     fusion_hysteresis_sec: 0.5             # Static expiry only if explicitly enabled [s].
     fusion_max_total_spheres: 512
     static_cache_expire_enabled: false      # Keep static until confirmed empty/free-space update.
-    static_empty_confirmation_frames: 3    # Consecutive empty messages before static clear.
-    dynamic_handover_grace_sec: 0.5        # Fresh dynamic priority window [s].
-    keep_dynamic_until_static_overlap: true # Prevent stopped-object handover gaps.
-    dynamic_absolute_max_ttl_sec: 3.0      # Hard ghost limit even without static overlap [s].
+    static_empty_confirmation_frames: 2    # Legacy/A-B path; UNKNOWN results never advance this count.
+    dynamic_handover_grace_sec: 0.30       # Bridge short upstream/tracker gaps only [s].
+    keep_dynamic_until_static_overlap: false # Do not retain stale dynamics while waiting for static overlap.
+    dynamic_absolute_max_ttl_sec: 0.30     # Hard upper bound for stale fused dynamics [s].
+    human_priority: true                   # Semantic human geometry replaces only overlapping copies.
+    human_static_refit_enabled: true       # Refit mixed cached balls; keep all residual support, never increase K.
+    human_handover_grace_sec: 0.20         # Briefly bridge one missed semantic/depth update [s].
+    human_absolute_max_ttl_sec: 0.20       # Clear stale semantic-person output promptly [s].
+    human_empty_confirmation_frames: 3     # Debounce <0.1 s inference gaps without another long TTL.
     robot_overlap_filter_enabled: true     # Remove obstacles containing a robot sphere.
-    robot_sphere_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
+    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
     robot_overlap_coverage_threshold: 0.50 # Remove when any robot sphere is >=80% contained.
     robot_overlap_sample_count: 256        # Volume samples per individual robot sphere.
     robot_overlap_robot_margin_m: 0.0      # Optional robot radius expansion; makes containment stricter.
     robot_overlap_marker_timeout_s: 0.25   # Keep obstacles when robot markers are stale [s].
     static_marker_color: [0.15, 0.55, 1.0] # RGB [0..1].
     dynamic_marker_color: [1.0, 0.12, 0.04] # RGB [0..1].
+    human_marker_color: [0.20, 1.0, 0.25]  # Human path is green in the combined marker stream.
     marker_alpha: 0.65                     # Marker opacity [0..1].
-    marker_lifetime_s: 0.0                 # 0 uses explicit DELETE and infinite lifetime [s].
+    marker_lifetime_s: 0.5                 # Auto-expire stale RViz markers if DELETE is missed [s].
+
+/human_static_filter:
+  ros__parameters:
+    # Shared by static generation and Fusion. Enabled only with the human branch.
+    human_static_voxel_size_m: 0.05
+    human_static_match_distance_m: 0.08
+    human_static_surface_back_band_m: 0.15 # Bounded TSDF band behind observed person surface.
+    human_static_active_hold_s: 0.35      # Short semantic dropout allowance.
+    human_static_history_s: 5.0          # Old human location alone never proves empty space.
+    human_static_depth_max_age_s: 0.25
+    human_static_free_clearance_m: 0.03  # Beyond the entire voxel, not just its centre.
+    human_static_max_history_voxels: 20000
+    human_static_occlusion_hold_enabled: true # Temporal human ownership + depth-verified occlusion; does not change ESDF distances.
+    human_static_occlusion_max_depth_m: 0.45 # Beyond the 2 s label hold, require current human occlusion within this depth gap.
+    human_static_occlusion_match_distance_m: 0.05 # Every non-free pixel must match a measured human surface [m].
+    human_static_occlusion_max_sync_delta_s: 0.10 # Depth/human source stamp difference [s].
+    human_static_occlusion_min_valid_fraction: 0.75 # Require at least 75% valid pixels across each historical voxel footprint.
+    human_static_occlusion_min_human_fraction: 0.60 # At least 60% of the WHOLE voxel footprint must be measured human when holes exist.
+    human_static_ownership_hold_s: 2.0 # Keep known human labels briefly; observed nonhuman reoccupation vetoes immediately.
+
+/human_depth_projection_node:
+  ros__parameters:
+    depth_image_topic: "/camera0/realsense_splitter_node/output/depth"
+    depth_camera_info_topic: "/camera0/camera/depth/camera_info"
+    person_mask_topic: "/camera0/segmentation/people_mask"
+    mask_camera_info_topic: "/camera0/segmentation/camera_info_resized"
+    output_human_points_topic: "/rmp_camera/human_points"
+    target_frame: "base_link"
+    max_sync_delta_s: 0.05                 # Reject large RGB/depth motion skew; retains 81% of this bag's RGB frames.
+    sync_queue_size: 12                    # Retain frames while TensorRT inference catches up.
+    prefer_latest_frames: true             # Never publish an older depth/mask pair after a newer one.
+    max_frame_age_s: 0.25                  # Old pairs are unknown, not newly observed empty frames.
+    tf_timeout_s: 0.05
+    max_rate_hz: 0.0                       # Process every segmentation frame; projection costs about 6-18 ms.
+    pixel_stride: 2                        # Project one in four depth pixels before voxelization.
+    mask_threshold: 1                      # PeopleSemSegNet background=0, person>0.
+    mask_min_component_pixels: 800         # Measured empty-scene false masks were 360-641 pixels.
+    mask_dilation_pixels: 0                # Do not expand the semantic silhouette into background depth.
+    foreground_neighborhood_pixels: 8      # RGB-space z-buffer radius across D435 viewpoint disparity.
+    foreground_max_local_depth_jump_m: 0.20 # Reject samples >20 cm behind nearby person depth.
+    foreground_max_component_depth_span_m: 0.90 # Reject a distant wall layer while retaining extended limbs.
+    min_depth_m: 0.15
+    max_depth_m: 3.0
+    min_x_m: -1.5
+    max_x_m: 1.5
+    min_y_m: -1.5
+    max_y_m: 1.5
+    min_z_m: -0.2
+    max_z_m: 2.5
+    max_range_from_base_m: 2.0
+    output_voxel_size_m: 0.025             # Preserve limbs before 5 cm sphere voxelization.
+    max_output_points: 80000
+
+/human_obstacle_sphere_node:
+  ros__parameters:
+    input_dynamic_points_topic: "/rmp_camera/human_points"
+    target_frame: "base_link"
+    marker_topic: "/rmp_camera/human_obstacle_sphere_markers"
+    sphere_cloud_topic: "/rmp_camera/human_sphere_cloud"
+    dynamic_voxel_cloud_topic: "/rmp_camera/human_obstacle_voxels"
+    uncovered_voxel_cloud_topic: "/rmp_camera/human_uncovered_voxels"
+    robot_rejected_voxel_cloud_topic: "/rmp_camera/human_robot_rejected_voxels"
+    min_x_m: -1.5
+    max_x_m: 1.5
+    min_y_m: -1.5
+    max_y_m: 1.5
+    min_z_m: -0.2
+    max_z_m: 2.5
+    max_range_from_base_m: 2.0
+    dynamic_voxel_size_m: 0.05
+    dynamic_min_component_voxels: 12       # Suppress small residual mask/depth leakage components.
+    dynamic_max_component_voxels: 120000
+    dynamic_max_components: 8
+    dynamic_max_input_points: 80000
+    dynamic_connectivity: 6
+    dynamic_dilation_voxels: 0
+    dynamic_closing_iterations: 0
+    dynamic_minimum_center_spacing_m: 0.10
+    dynamic_min_raw_radius_m: 0.025
+    dynamic_max_raw_radius_m: 0.28
+    dynamic_min_useful_adaptive_radius_m: 0.04
+    dynamic_enable_fixed_radius_fallback: true
+    dynamic_fixed_radius_m: 0.055          # Small semantic fallback for hands and thin limbs.
+    dynamic_enable_greedy_set_cover: true
+    dynamic_enable_single_sphere_replacement: true
+    dynamic_single_sphere_max_radius_m: 0.25
+    dynamic_component_radius_scale: 0.60
+    dynamic_local_width_ratio: 1.4
+    dynamic_local_width_budget_ms: 5.0
+    dynamic_component_fixed_radius_scale: 0.45
+    dynamic_target_coverage: 0.92
+    dynamic_coverage_tolerance_m: 0.02
+    dynamic_safety_margin_m: 0.005
+    dynamic_redundancy_tolerance_m: 0.01
+    dynamic_max_spheres_per_component: 96
+    dynamic_max_iterations_per_component: 256
+    dynamic_max_total_spheres: 192
+    dynamic_processing_budget_ms: 80.0     # Original seed guard and background refinement budget [ms].
+    dynamic_foreground_refinement_budget_ms: 5.0
+    dynamic_refinement_rate_hz: 3.0
+    dynamic_refinement_max_age_s: 0.5
+    dynamic_max_local_grid_voxels: 600000
+    dynamic_enable_agglomerative_merge: true
+    dynamic_merge_max_radius_m: 0.28
+    dynamic_merge_max_radius_growth_ratio: 1.70
+    dynamic_merge_max_gap_m: 0.07
+    dynamic_merge_enable_empty_space_guard: true
+    dynamic_merge_max_empty_fraction: 0.60
+    dynamic_merge_max_validation_voxels: 30000
+    dynamic_enable_min_k_search: true
+    dynamic_min_k_beam_width: 8
+    dynamic_min_k_max_states: 128
+    dynamic_min_k_enable_overlap_constraint: true
+    dynamic_max_allowed_overlap_fraction: 0.12
+    dynamic_min_k_use_output_overlap: true
+    dynamic_min_k_prefer_lower_overlap: true
+    dynamic_tracking_enabled: true
+    dynamic_post_tracking_overlap_pruning_enabled: true
+    dynamic_post_tracking_max_overlap_fraction: 0.12
+    dynamic_post_tracking_max_spheres: 48
+    dynamic_post_tracking_max_removals: 12
+    dynamic_post_tracking_max_matrix_elements: 1000000
+    dynamic_association_distance_m: 0.20   # Maintain a human track across normal limb motion.
+    dynamic_smoothing_alpha: 0.80
+    dynamic_radius_smoothing_alpha: 0.25
+    dynamic_sphere_ttl_sec: 0.30            # Bridge measured 0.1-0.24 s semantic dropouts in one place only.
+    dynamic_max_missed_updates: 2           # Keep tracks through two missed masks; the third confirmed miss clears.
+    dynamic_update_rate_hz: 30.0
+    dynamic_input_max_age_s: 0.25
+    dynamic_tracking_max_radius_ratio: 2.0
+    dynamic_input_stale_timeout_s: 0.30     # Steady-time clear even when rosbag /clock stops.
+    marker_lifetime_s: 0.5
+    robot_component_filter_enabled: true
+    robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
+    robot_component_overlap_threshold: 0.02
+    robot_sphere_filter_margin_m: 0.0
+    robot_marker_expected_sphere_count: 35
+    robot_marker_require_expected_count: true
+    use_time_synchronized_robot_markers: true
+    robot_marker_buffer_duration_s: 1.0
+    robot_marker_max_stamp_delta_s: 0.12
+    robot_marker_sync_wait_timeout_s: 0.25
+    robot_marker_subscription_depth: 2
+    fallback_to_latest_marker_on_time_miss: false
+    robot_component_filter_fail_closed: true
+    publish_debug_clouds: false
 
 /robot_collision_sphere_node:
   ros__parameters:
-    publish_rate_hz: 60.0                  # Keep sphere poses close to camera timestamps.
+    publish_rate_hz: 30.0                  # Match the effective camera/Nvblox depth rate.
     stamp_from_joint_state: true           # Preserve the source joint timestamp for matching.
     require_joint_state: true              # Never publish an assumed all-zero robot pose.
     require_complete_joint_state: true     # Require all six movable URDF joints.
@@ -334,9 +558,9 @@
     input_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
     output_marker_topic: "/rmp_camera/calibrated_robot_collision_sphere_markers"
     correction_frame: "camera0_depth_optical_frame" # Camera-view axes: +X right, +Y down, +Z forward.
-    translation_x_m: -0.05                   # Move all recorded sphere centers right/left [m].
+    translation_x_m: 0.0                   # Static camera TF already contains the calibrated correction.
     translation_y_m: 0.0                   # Move all recorded sphere centers down/up [m].
-    translation_z_m: -0.01                   # Negative moves spheres toward the camera [m].
+    translation_z_m: 0.0                   # Do not double-apply the camera calibration.
     rotation_roll_rad: 0.0                 # Rigid correction about camera optical X [rad].
     rotation_pitch_rad: 0.0                # Rigid correction about camera optical Y [rad].
     rotation_yaw_rad: 0.0                  # Rigid correction about camera optical Z [rad].
@@ -350,7 +574,7 @@
     removed_points_topic: "/rmp_camera/robot_depth_mask_removed_points"
     publish_predicted_depth: false            # Heavy debug image; enable only while inspecting masks.
     publish_removed_points: false             # Debug cloud; keep off during rate measurements.
-    robot_margin_m: 0.05                   # Small geometry inflation; do not use the legacy large volume margin.
+    robot_margin_m: 0.0                    # Use only the configured robot sphere radii for the depth mask.
     surface_front_tolerance_m: 0.02        # Preserve measurements clearly in front of the robot [m].
     surface_back_tolerance_m: 0.04         # Allow calibration/depth error behind predicted surface [m].
     mask_shadow_behind_robot: false        # Only remove surface matches; retain nonmatching measurements.

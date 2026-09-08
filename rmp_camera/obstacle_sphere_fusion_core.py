@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
+from time import monotonic
 
 import numpy as np
 
@@ -15,7 +16,7 @@ class FusionSphere:
     z: float
     raw_radius: float
     output_radius: float
-    source_type: int  # 0 static, 1 dynamic
+    source_type: int  # 0 static, 1 dynamic, 2 semantic human
     component_id: int = -1
     component_coverage: float = 0.0
     track_id: int = -1
@@ -39,6 +40,13 @@ class FusionParameters:
     dynamic_handover_grace_sec: float = 0.5
     keep_dynamic_until_static_overlap: bool = True
     dynamic_absolute_max_ttl_sec: float = 3.0
+    human_priority: bool = True
+    human_handover_grace_sec: float = 0.35
+    human_absolute_max_ttl_sec: float = 0.35
+    human_empty_confirmation_frames: int = 3
+    coverage_guard_enabled: bool = False
+    coverage_tolerance_m: float = .02
+    coverage_budget_ms: float = 5.0
 
 
 def field_rows(
@@ -168,26 +176,97 @@ def filter_spheres_containing_robot(
 
 def fuse_spheres(
     static_spheres: Sequence[FusionSphere], dynamic_spheres: Sequence[FusionSphere],
-    params: FusionParameters,
+    params: FusionParameters, human_spheres: Sequence[FusionSphere] = (),
+    *, support=None, stats=None,
 ) -> list[FusionSphere]:
-    """Fuse using real 3D sphere overlap; dynamic wins only when configured."""
+    """Fuse geometry paths; semantic humans suppress only overlapping copies."""
     static_items = [replace(s, source_type=0) for s in static_spheres]
     dynamic_items = [replace(s, source_type=1) for s in dynamic_spheres]
+    human_items = [replace(s, source_type=2) for s in human_spheres]
+    if params.coverage_guard_enabled:
+        ordered = ((dynamic_items + static_items) if params.dynamic_priority
+                   else (static_items + dynamic_items))
+        ordered = human_items + ordered if params.human_priority else ordered + human_items
+        return coverage_preserving_fusion(ordered, params, support or {}, stats)
     if params.dynamic_priority:
         static_items = [
             static for static in static_items
             if not any(spheres_overlap(static, dynamic, params.overlap_tolerance_m)
                        for dynamic in dynamic_items)
         ]
-        combined = dynamic_items + static_items
+        nonhuman = dynamic_items + static_items
     else:
         dynamic_items = [
             dynamic for dynamic in dynamic_items
             if not any(spheres_overlap(dynamic, static, params.overlap_tolerance_m)
                        for static in static_items)
         ]
-        combined = static_items + dynamic_items
+        nonhuman = static_items + dynamic_items
+    if params.human_priority:
+        nonhuman = [
+            item for item in nonhuman
+            if not any(spheres_overlap(item, human, params.overlap_tolerance_m)
+                       for human in human_items)
+        ]
+        combined = human_items + nonhuman
+    else:
+        human_items = [
+            human for human in human_items
+            if not any(spheres_overlap(human, item, params.overlap_tolerance_m)
+                       for item in nonhuman)
+        ]
+        combined = nonhuman + human_items
     return combined[:params.max_total_spheres]
+
+
+def coverage_preserving_fusion(ordered, params, support, stats=None):
+    """Only remove a lower-priority copy if ALL its retained support survives.
+
+    Missing/stale/oversized support falls back to sufficient analytic whole-ball
+    containment, never a sparse sampling estimate or mere surface intersection.
+    Validation budget exhaustion preserves candidates. The configured output cap
+    remains a hard cap, but inability to preserve coverage is explicitly reported.
+    """
+    start = monotonic()
+    deadline = start + params.coverage_budget_ms / 1000.
+    kept, removed, checked, missing, partial = [], 0, 0, 0, 0
+    for sphere in ordered:
+        winners = [s for s in kept if s.source_type != sphere.source_type
+                   and spheres_overlap(sphere, s, params.overlap_tolerance_m)]
+        redundant = False
+        if winners and monotonic() < deadline:
+            points = support.get(sphere)
+            if (points is not None and 0 < len(points) <= 8192
+                    and len(points) * len(winners) <= 200000
+                    and np.isfinite(points).all()):
+                checked += len(points)
+                covered = np.zeros(len(points), dtype=bool)
+                for winner in winners:
+                    covered |= np.sum((points - winner.center) ** 2, axis=1) <= (
+                        winner.raw_radius + params.coverage_tolerance_m + 1e-9) ** 2
+                    if covered.all() or monotonic() >= deadline:
+                        break
+                redundant = bool(covered.all())
+                if not redundant:
+                    partial += 1
+            else:
+                missing += 1
+                redundant = any(
+                    np.linalg.norm(sphere.center - winner.center) + sphere.output_radius
+                    <= winner.output_radius + 1e-9
+                    and np.linalg.norm(sphere.center - winner.center) + sphere.raw_radius
+                    <= winner.raw_radius + 1e-9 for winner in winners)
+        if redundant:
+            removed += 1
+        else:
+            kept.append(sphere)
+    overflow = max(0, len(kept) - params.max_total_spheres)
+    if stats is not None:
+        stats.update(coverage_removed=removed, coverage_checked_voxels=checked,
+            coverage_missing_support=missing, coverage_cap_dropped=overflow,
+            coverage_kept_partial=partial,
+            coverage_valid=overflow == 0, fusion_ms=(monotonic() - start) * 1000.)
+    return kept[:params.max_total_spheres]
 
 
 class SphereFusionCache:
@@ -197,9 +276,12 @@ class SphereFusionCache:
         self.params = params
         self.static_spheres: list[FusionSphere] = []
         self.dynamic_spheres: list[FusionSphere] = []
+        self.human_spheres: list[FusionSphere] = []
         self.static_stamp: float | None = None
         self.dynamic_stamp: float | None = None
+        self.human_stamp: float | None = None
         self.static_empty_count = 0
+        self.human_empty_count = 0
         self.last_rejection_reason = ""
 
     def _accept_frame(self, frame_id: str) -> bool:
@@ -212,6 +294,7 @@ class SphereFusionCache:
 
     def update_static(
         self, spheres: Iterable[FusionSphere], frame_id: str, timestamp_sec: float,
+        *, confirmed_empty: bool = False,
     ) -> bool:
         if not self._accept_frame(frame_id):
             return False
@@ -222,10 +305,14 @@ class SphereFusionCache:
             self.static_empty_count = 0
         else:
             self.static_empty_count += 1
-            if self.static_empty_count >= self.params.static_empty_confirmation_frames:
+            if confirmed_empty or self.static_empty_count >= self.params.static_empty_confirmation_frames:
                 self.static_spheres = []
                 self.static_stamp = float(timestamp_sec)
         return True
+
+    def invalidate_static_observation(self):
+        # Unknown/error frames are not consecutive observations of empty space.
+        self.static_empty_count = 0
 
     def update_dynamic(
         self, spheres: Iterable[FusionSphere], frame_id: str, timestamp_sec: float,
@@ -238,14 +325,35 @@ class SphereFusionCache:
             self.dynamic_stamp = float(timestamp_sec)
         return True
 
-    def combined(self, now_sec: float) -> list[FusionSphere]:
+    def update_human(
+        self, spheres: Iterable[FusionSphere], frame_id: str, timestamp_sec: float,
+    ) -> bool:
+        if not self._accept_frame(frame_id):
+            return False
+        items = [replace(s, source_type=2) for s in spheres]
+        if items:
+            self.human_spheres = items
+            self.human_stamp = float(timestamp_sec)
+            self.human_empty_count = 0
+        else:
+            # Use a small frame-count debounce instead of starting another
+            # time-based TTL. This hides sub-100 ms inference gaps while a
+            # sustained empty stream still clears promptly and deterministically.
+            self.human_empty_count += 1
+            if self.human_empty_count >= self.params.human_empty_confirmation_frames:
+                self.human_spheres = []
+                self.human_stamp = float(timestamp_sec)
+        return True
+
+    def combined(self, now_sec: float, static_override=None, *, support=None, stats=None) -> list[FusionSphere]:
         now = float(now_sec)
-        static = list(self.static_spheres)
+        static = list(self.static_spheres if static_override is None else static_override)
         if self.params.static_cache_expire_enabled and self.static_stamp is not None:
             if now - self.static_stamp > self.params.hysteresis_sec:
                 static = []
         dynamic = self._handover_dynamic(static, now)
-        return fuse_spheres(static, dynamic, self.params)
+        human = self._handover_human(now)
+        return fuse_spheres(static, dynamic, self.params, human, support=support, stats=stats)
 
     def _handover_dynamic(
         self, static: Sequence[FusionSphere], now: float,
@@ -265,3 +373,13 @@ class SphereFusionCache:
             if not any(spheres_overlap(dynamic, stat, self.params.overlap_tolerance_m)
                        for stat in static)
         ]
+
+    def _handover_human(self, now: float) -> list[FusionSphere]:
+        if self.human_stamp is None:
+            return []
+        age = now - self.human_stamp
+        if age > self.params.human_absolute_max_ttl_sec:
+            return []
+        if age <= self.params.human_handover_grace_sec:
+            return list(self.human_spheres)
+        return []

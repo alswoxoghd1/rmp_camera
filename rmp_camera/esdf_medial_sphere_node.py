@@ -28,6 +28,9 @@ Numeric parameter guidance (all distance values are metres):
 * ``max_spheres_per_component``, ``max_iterations_per_component``, and
   ``max_total_spheres`` bound work/output; small limits can prevent coverage,
   while very large limits increase runtime and visualization load.
+* ``min_k_beam_width``, ``min_k_max_states``, and
+  ``min_k_processing_budget_ms`` bound the search over valid merge orders;
+  larger values may find fewer spheres but increase static update latency.
 * ``max_grid_voxels`` is a hard memory guard; too small rejects valid AABBs and
   too large permits allocations unsuitable for Python.
 """
@@ -37,9 +40,11 @@ import time
 
 import numpy as np
 import rclpy
+from diagnostic_msgs.msg import DiagnosticArray, KeyValue
 from geometry_msgs.msg import Point, Vector3
 from nvblox_msgs.srv import EsdfAndGradients
 from rclpy.duration import Duration
+from rclpy.clock import JumpThreshold
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -49,7 +54,12 @@ from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
-from rmp_camera.esdf_medial_sphere_core import generate_medial_spheres
+from rmp_camera.esdf_medial_sphere_core import (
+    generate_medial_spheres, has_static_obstacle_component, previous_support_is_observed,
+)
+from rmp_camera.human_static_filter import HumanStaticFilter
+from rmp_camera.human_static_filter_core import esdf_proves_voxels_free
+from rmp_camera.static_result_status import make_result_status
 from rmp_camera.vision_geometry import (
     marker_spheres,
     quaternion_to_matrix,
@@ -115,8 +125,26 @@ class EsdfMedialSphereNode(Node):
         super().__init__("esdf_medial_sphere_node")
         self._declare_parameters()
         self._read_parameters()
+        self.result_status_pub = self.create_publisher(
+            DiagnosticArray, self.get_parameter("result_status_topic").value, 5)
+        self.human_filter = HumanStaticFilter(self)
+        self.support_pub = self.create_publisher(
+            PointCloud2, self.human_filter.support_topic, 2)
+        self.free_support_pub = self.create_publisher(
+            PointCloud2, self.human_filter.free_support_topic, 2)
+        self.support_history = []
+        self.last_support_evidence_stamp = None
+        self.last_full_solve_stamp = None
+        self.last_output_nonempty = False
+        self.result_clock_jump = self.get_clock().create_jump_callback(
+            JumpThreshold(min_forward=None, min_backward=Duration(nanoseconds=-1),
+                          on_clock_change=True),
+            post_callback=lambda _jump: self._reset_human_static_cache())
         self.pending = False
         self.previous_marker_keys = set()
+        # Clear markers cached by RViz from a previous node instance on the
+        # first result, then rely on finite lifetimes as a missed-DELETE guard.
+        self.clear_markers_on_next_publish = True
         self.last_info_time = 0.0
         self.last_warn_time = 0.0
         self.latest_robot_markers = None
@@ -138,6 +166,9 @@ class EsdfMedialSphereNode(Node):
             marker_qos,
         )
         self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 2)
+        self.query_bounds_marker_pub = self.create_publisher(
+            MarkerArray, self.query_bounds_marker_topic, 2
+        )
         self.sphere_cloud_pub = self.create_publisher(
             PointCloud2, self.sphere_cloud_topic, 2
         )
@@ -150,33 +181,50 @@ class EsdfMedialSphereNode(Node):
         self.robot_rejected_voxel_pub = self.create_publisher(
             PointCloud2, self.robot_rejected_voxel_cloud_topic, 2
         )
-        period = 1.0 if self.update_rate_hz <= 0.0 else max(
-            0.02, 1.0 / self.update_rate_hz
-        )
+        request_rate = max(self.update_rate_hz if self.update_rate_hz > 0 else 1.0,
+                           self.empty_check_rate_hz)
+        period = max(0.02, 1.0 / request_rate)
         self.timer = self.create_timer(period, self.tick)
         self.get_logger().info(
             "Dense ESDF medial sphere node started: "
             f"service={self.service_name}, frame={self.target_frame}, "
             f"rate={self.update_rate_hz:.2f} Hz, "
+            f"empty_check_rate={self.empty_check_rate_hz:.2f} Hz, "
+            f"query_aabb_min={self.aabb_min_m.tolist()} m, "
+            f"query_aabb_size={self.aabb_size_m.tolist()} m, "
             f"target_coverage={self.target_coverage:.3f}, "
+            f"raw_radius=[{self.min_raw_sphere_radius_m:.3f}, "
+            f"{self.max_raw_sphere_radius_m:.3f}] m, "
             f"single={self.enable_single_sphere_replacement}, "
             f"greedy={self.enable_greedy_set_cover}, "
             f"pruning={self.enable_general_coverage_pruning}, "
+            f"coarse_cover={self.enable_component_coarse_cover}, "
+            f"coarse_min_voxels={self.component_coarse_min_voxels}, "
+            f"coarse_scale={self.component_coarse_radius_scale:.3f}, "
             f"merge={self.enable_agglomerative_merge}, "
             f"merge_radius<={self.merge_max_radius_m:.3f} m, "
             f"merge_growth<={self.merge_max_radius_growth_ratio:.3f}, "
             f"merge_gap<={self.merge_max_gap_m:.3f} m, "
             f"merge_esdf_guard={self.merge_enable_esdf_guard}, "
             f"merge_samples={self.merge_surface_sample_count}, "
+            f"min_k={self.enable_min_k_search}, "
+            f"min_k_beam={self.min_k_beam_width}, "
+            f"min_k_states={self.min_k_max_states}, "
+            f"min_k_budget={self.min_k_processing_budget_ms:.1f} ms, "
+            f"post_overlap_pruning={self.enable_post_merge_overlap_pruning}, "
+            f"post_overlap_limit="
+            f"{self.post_merge_max_overlap_fraction:.3f}, "
             f"robot_component_filter={self.robot_component_filter_enabled}, "
             f"robot_overlap_threshold="
             f"{self.robot_component_overlap_threshold:.3f}"
         )
 
     def _declare_parameters(self):
+        self.declare_parameter("result_status_topic", "/rmp_camera/static_sphere_result_status")
         self.declare_parameter("service_name", "/nvblox_node/get_esdf_and_gradient")
         self.declare_parameter("target_frame", "base_link")
         self.declare_parameter("update_rate_hz", 1.0)
+        self.declare_parameter("empty_check_rate_hz", 0.0)
         self.declare_parameter("aabb_min_x_m", -1.5)
         self.declare_parameter("aabb_min_y_m", -1.5)
         self.declare_parameter("aabb_min_z_m", 0.0)
@@ -193,7 +241,9 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("minimum_center_spacing_m", 0.05)
         self.declare_parameter("min_component_voxels", 8)
         self.declare_parameter("min_raw_sphere_radius_m", 0.01)
+        self.declare_parameter("max_raw_sphere_radius_m", 1.0)
         self.declare_parameter("safety_margin_m", 0.02)
+        self.declare_parameter("marker_lifetime_s", 3.0)
         self.declare_parameter("redundancy_tolerance_m", 0.001)
         self.declare_parameter("max_spheres_per_component", 128)
         self.declare_parameter("max_iterations_per_component", 256)
@@ -206,6 +256,16 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("target_shell_coverage", 0.98)
         self.declare_parameter("shell_coverage_loss_tolerance", 0.005)
         self.declare_parameter("max_optimization_matrix_elements", 20000000)
+        self.declare_parameter("enable_component_coarse_cover", False)
+        self.declare_parameter("enable_local_width_cover", False)
+        self.declare_parameter("local_width_ratio", 1.4)
+        self.declare_parameter("local_width_budget_ms", 15.0)
+        self.declare_parameter("component_coarse_min_voxels", 80)
+        self.declare_parameter("component_coarse_radius_scale", 0.45)
+        self.declare_parameter("component_coarse_max_radius_m", 0.32)
+        self.declare_parameter("component_coarse_max_empty_fraction", 0.75)
+        self.declare_parameter(
+            "component_coarse_max_free_space_distance_m", 0.15)
         self.declare_parameter("enable_agglomerative_merge", True)
         self.declare_parameter("merge_max_radius_m", 0.35)
         self.declare_parameter("merge_max_radius_growth_ratio", 1.45)
@@ -214,6 +274,14 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("merge_max_free_space_distance_m", 0.08)
         self.declare_parameter("merge_surface_sample_count", 64)
         self.declare_parameter("merge_min_observed_surface_fraction", 0.70)
+        self.declare_parameter("enable_min_k_search", False)
+        self.declare_parameter("min_k_beam_width", 8)
+        self.declare_parameter("min_k_max_states", 128)
+        self.declare_parameter("min_k_processing_budget_ms", 200.0)
+        self.declare_parameter("enable_post_merge_overlap_pruning", False)
+        self.declare_parameter("post_merge_max_overlap_fraction", 0.20)
+        self.declare_parameter("post_merge_pruning_max_spheres", 64)
+        self.declare_parameter("post_merge_pruning_max_removals", 32)
         self.declare_parameter("robot_component_filter_enabled", False)
         self.declare_parameter(
             "robot_sphere_marker_topic",
@@ -234,6 +302,10 @@ class EsdfMedialSphereNode(Node):
             "marker_topic", "/rmp_camera/esdf_medial_sphere_markers"
         )
         self.declare_parameter(
+            "query_bounds_marker_topic",
+            "/rmp_camera/esdf_medial_query_bounds",
+        )
+        self.declare_parameter(
             "sphere_cloud_topic", "/rmp_camera/esdf_medial_sphere_cloud"
         )
         self.declare_parameter(
@@ -250,10 +322,14 @@ class EsdfMedialSphereNode(Node):
         self.declare_parameter("publish_debug_clouds", True)
 
     def _read_parameters(self):
+        empty_rate = float(self.get_parameter("empty_check_rate_hz").value)
+        if not np.isfinite(empty_rate) or empty_rate < 0.0:
+            raise ValueError("empty_check_rate_hz must be finite and non-negative")
         for name in (
             "service_name",
             "target_frame",
             "marker_topic",
+            "query_bounds_marker_topic",
             "sphere_cloud_topic",
             "inside_voxel_cloud_topic",
             "uncovered_voxel_cloud_topic",
@@ -263,6 +339,7 @@ class EsdfMedialSphereNode(Node):
             setattr(self, name, str(self.get_parameter(name).value))
         for name in (
             "update_rate_hz",
+            "empty_check_rate_hz",
             "unobserved_distance_value",
             "inside_epsilon_m",
             "target_coverage",
@@ -270,16 +347,25 @@ class EsdfMedialSphereNode(Node):
             "plateau_epsilon_m",
             "minimum_center_spacing_m",
             "min_raw_sphere_radius_m",
+            "max_raw_sphere_radius_m",
             "safety_margin_m",
+            "marker_lifetime_s",
             "redundancy_tolerance_m",
             "surface_shell_thickness_m",
             "target_shell_coverage",
             "shell_coverage_loss_tolerance",
+            "component_coarse_radius_scale",
+            "local_width_ratio", "local_width_budget_ms",
+            "component_coarse_max_radius_m",
+            "component_coarse_max_empty_fraction",
+            "component_coarse_max_free_space_distance_m",
             "merge_max_radius_m",
             "merge_max_radius_growth_ratio",
             "merge_max_gap_m",
             "merge_max_free_space_distance_m",
             "merge_min_observed_surface_fraction",
+            "min_k_processing_budget_ms",
+            "post_merge_max_overlap_fraction",
             "robot_component_overlap_threshold",
             "robot_sphere_filter_margin_m",
             "robot_marker_buffer_duration_s",
@@ -292,7 +378,12 @@ class EsdfMedialSphereNode(Node):
             "max_iterations_per_component",
             "max_total_spheres",
             "max_optimization_matrix_elements",
+            "component_coarse_min_voxels",
             "merge_surface_sample_count",
+            "min_k_beam_width",
+            "min_k_max_states",
+            "post_merge_pruning_max_spheres",
+            "post_merge_pruning_max_removals",
             "max_grid_voxels",
             "robot_marker_expected_sphere_count",
             "robot_marker_subscription_depth",
@@ -328,11 +419,22 @@ class EsdfMedialSphereNode(Node):
         self.enable_surface_shell_guard = self._as_bool(
             self.get_parameter("enable_surface_shell_guard").value
         )
+        self.enable_component_coarse_cover = self._as_bool(
+            self.get_parameter("enable_component_coarse_cover").value
+        )
+        self.enable_local_width_cover = self._as_bool(
+            self.get_parameter("enable_local_width_cover").value)
         self.enable_agglomerative_merge = self._as_bool(
             self.get_parameter("enable_agglomerative_merge").value
         )
         self.merge_enable_esdf_guard = self._as_bool(
             self.get_parameter("merge_enable_esdf_guard").value
+        )
+        self.enable_min_k_search = self._as_bool(
+            self.get_parameter("enable_min_k_search").value
+        )
+        self.enable_post_merge_overlap_pruning = self._as_bool(
+            self.get_parameter("enable_post_merge_overlap_pruning").value
         )
         self.robot_component_filter_enabled = self._as_bool(
             self.get_parameter("robot_component_filter_enabled").value
@@ -356,8 +458,15 @@ class EsdfMedialSphereNode(Node):
             raise ValueError("All AABB sizes must be positive")
         if not 0.0 <= self.target_coverage <= 1.0:
             raise ValueError("target_coverage must be in [0, 1]")
+        if (
+            self.min_raw_sphere_radius_m < 0.0
+            or self.max_raw_sphere_radius_m < self.min_raw_sphere_radius_m
+        ):
+            raise ValueError("invalid static raw-radius limits")
         if self.surface_shell_thickness_m < 0.0:
             raise ValueError("surface_shell_thickness_m must be non-negative")
+        if self.marker_lifetime_s < 0.0:
+            raise ValueError("marker_lifetime_s must be non-negative")
         if not 0.0 <= self.target_shell_coverage <= 1.0:
             raise ValueError("target_shell_coverage must be in [0, 1]")
         if not 0.0 <= self.shell_coverage_loss_tolerance <= 1.0:
@@ -366,6 +475,30 @@ class EsdfMedialSphereNode(Node):
             raise ValueError(
                 "max_optimization_matrix_elements must be positive"
             )
+        if self.component_coarse_min_voxels <= 0:
+            raise ValueError(
+                "component_coarse_min_voxels must be positive")
+        if (
+            not np.isfinite(self.component_coarse_radius_scale)
+            or self.component_coarse_radius_scale < 0.0
+        ):
+            raise ValueError(
+                "component_coarse_radius_scale must be finite and non-negative")
+        if (
+            not np.isfinite(self.component_coarse_max_radius_m)
+            or self.component_coarse_max_radius_m <= 0.0
+        ):
+            raise ValueError(
+                "component_coarse_max_radius_m must be finite and positive")
+        if not 0.0 <= self.component_coarse_max_empty_fraction <= 1.0:
+            raise ValueError(
+                "component_coarse_max_empty_fraction must be in [0, 1]")
+        if (
+            not np.isfinite(self.component_coarse_max_free_space_distance_m)
+            or self.component_coarse_max_free_space_distance_m < 0.0
+        ):
+            raise ValueError(
+                "component coarse free-space distance must be non-negative")
         if not np.isfinite((
             self.merge_max_radius_m,
             self.merge_max_radius_growth_ratio,
@@ -387,6 +520,25 @@ class EsdfMedialSphereNode(Node):
         if not 0.0 <= self.merge_min_observed_surface_fraction <= 1.0:
             raise ValueError(
                 "merge_min_observed_surface_fraction must be in [0, 1]")
+        if self.min_k_beam_width <= 0:
+            raise ValueError("min_k_beam_width must be positive")
+        if self.min_k_max_states <= 0:
+            raise ValueError("min_k_max_states must be positive")
+        if (
+            not np.isfinite(self.min_k_processing_budget_ms)
+            or self.min_k_processing_budget_ms <= 0.0
+        ):
+            raise ValueError(
+                "min_k_processing_budget_ms must be finite and positive")
+        if not 0.0 <= self.post_merge_max_overlap_fraction <= 1.0:
+            raise ValueError(
+                "post_merge_max_overlap_fraction must be in [0, 1]")
+        if self.post_merge_pruning_max_spheres <= 0:
+            raise ValueError(
+                "post_merge_pruning_max_spheres must be positive")
+        if self.post_merge_pruning_max_removals < 0:
+            raise ValueError(
+                "post_merge_pruning_max_removals must be non-negative")
         if not 0.0 <= self.robot_component_overlap_threshold <= 1.0:
             raise ValueError(
                 "robot_component_overlap_threshold must be in [0, 1]")
@@ -509,9 +661,23 @@ class EsdfMedialSphereNode(Node):
     def _stamp_to_ns(stamp):
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
+    def _full_solve_due(self, now_sec):
+        solve_period = 1.0 / self.update_rate_hz if self.update_rate_hz > 0 else 1.0
+        return (self.empty_check_rate_hz <= 1.0 / solve_period
+                or self.last_full_solve_stamp is None
+                or now_sec < self.last_full_solve_stamp
+                or now_sec - self.last_full_solve_stamp >= solve_period - 1e-6)
+
     def tick(self):
+        stamp = self.get_clock().now().to_msg()
         if self.pending:
             return
+        now_sec = stamp.sec + stamp.nanosec * 1e-9
+        # Empty output has no geometry to retire. Resume the normal solve
+        # cadence instead of polling the ESDF at 5 Hz in an empty scene.
+        if not self.last_output_nonempty and not self._full_solve_due(now_sec):
+            return
+        self.publish_query_bounds_markers(stamp)
         if not self.client.service_is_ready():
             self._warn_throttled(f"ESDF service unavailable: {self.service_name}")
             return
@@ -541,6 +707,72 @@ class EsdfMedialSphereNode(Node):
             )
         )
 
+    def publish_query_bounds_markers(self, stamp):
+        """Publish the exact dense-ESDF request AABB as fill and wireframe."""
+
+        minimum = self.aabb_min_m
+        maximum = self.aabb_min_m + self.aabb_size_m
+        center = minimum + 0.5 * self.aabb_size_m
+        message = MarkerArray()
+
+        fill = Marker()
+        fill.header = self._header(stamp)
+        fill.ns = "esdf_medial_query_bounds"
+        fill.id = 0
+        fill.type = Marker.CUBE
+        fill.action = Marker.ADD
+        fill.pose.position = Point(
+            x=float(center[0]), y=float(center[1]), z=float(center[2]))
+        fill.pose.orientation.w = 1.0
+        fill.scale = Vector3(
+            x=float(self.aabb_size_m[0]),
+            y=float(self.aabb_size_m[1]),
+            z=float(self.aabb_size_m[2]),
+        )
+        fill.color.r = 0.05
+        fill.color.g = 0.85
+        fill.color.b = 1.0
+        fill.color.a = 0.035
+        message.markers.append(fill)
+
+        corners = [
+            np.array((x, y, z), dtype=np.float64)
+            for x in (minimum[0], maximum[0])
+            for y in (minimum[1], maximum[1])
+            for z in (minimum[2], maximum[2])
+        ]
+        edges = (
+            (0, 1), (0, 2), (0, 4),
+            (1, 3), (1, 5),
+            (2, 3), (2, 6),
+            (3, 7),
+            (4, 5), (4, 6),
+            (5, 7),
+            (6, 7),
+        )
+        wireframe = Marker()
+        wireframe.header = self._header(stamp)
+        wireframe.ns = "esdf_medial_query_bounds"
+        wireframe.id = 1
+        wireframe.type = Marker.LINE_LIST
+        wireframe.action = Marker.ADD
+        wireframe.pose.orientation.w = 1.0
+        wireframe.scale.x = 0.025
+        wireframe.color.r = 0.05
+        wireframe.color.g = 0.85
+        wireframe.color.b = 1.0
+        wireframe.color.a = 0.90
+        for start, end in edges:
+            for corner_index in (start, end):
+                corner = corners[corner_index]
+                wireframe.points.append(Point(
+                    x=float(corner[0]),
+                    y=float(corner[1]),
+                    z=float(corner[2]),
+                ))
+        message.markers.append(wireframe)
+        self.query_bounds_marker_pub.publish(message)
+
     def handle_response(self, future, service_started_at):
         self.pending = False
         service_elapsed_s = time.monotonic() - service_started_at
@@ -549,17 +781,17 @@ class EsdfMedialSphereNode(Node):
             response = future.result()
         except Exception as exc:
             self._warn_throttled(f"ESDF service call failed: {exc}")
-            self.publish_empty(stamp)
+            self.publish_invalid(stamp, "esdf_service_exception")
             return
         if not response.success:
             self._warn_throttled("ESDF service returned success=false")
-            self.publish_empty(stamp)
+            self.publish_invalid(stamp, "esdf_service_failed")
             return
 
         grid = DenseEsdfGrid(response, self.max_grid_voxels)
         if not grid.valid:
             self._warn_throttled(f"Invalid/empty ESDF grid: {grid.error}")
-            self.publish_empty(stamp)
+            self.publish_invalid(stamp, "invalid_esdf_grid")
             return
         robot_centers = None
         robot_radii = None
@@ -576,7 +808,7 @@ class EsdfMedialSphereNode(Node):
                         "dropping static sphere update: synchronized robot "
                         f"spheres unavailable (marker delta={delta_text}, "
                         f"buffer size={len(self.robot_marker_buffer)})")
-                    self.publish_empty(stamp)
+                    self.publish_invalid(stamp, "robot_marker_sync_unavailable")
                     return
             else:
                 robot_centers, robot_radii = geometry
@@ -590,7 +822,66 @@ class EsdfMedialSphereNode(Node):
             > sentinel_tolerance
         )
         observed_count = int(np.count_nonzero(observed_mask))
+        # Check the original observed mask, before human exclusion changes
+        # local distances. An empty result from missing coverage is UNKNOWN.
+        previous_support = (self.support_history[-1][1][:, :3] if self.support_history
+                            else np.empty((0, 3)))
+        empty_observation_valid = previous_support_is_observed(
+            previous_support, observed_mask, grid.origin_m, grid.voxel_size_m)
+        empty_observation_reason = ("unobserved_esdf" if observed_count == 0
+                                    else "unobserved_previous_support")
+        if self.human_filter.enabled:
+            # A responsive ESDF service does not prove the camera is live.
+            depth_age = (None if self.human_filter.depth_stamp is None else
+                stamp.sec + stamp.nanosec * 1e-9 - self.human_filter.depth_stamp)
+            fresh_depth = (depth_age is not None
+                and -0.05 <= depth_age <= self.human_filter.params.depth_max_age_s
+                and time.monotonic() - self.human_filter.depth_received
+                <= self.human_filter.params.depth_max_age_s)
+            if empty_observation_valid and not fresh_depth:
+                empty_observation_reason = "stale_or_missing_depth"
+            empty_observation_valid = empty_observation_valid and fresh_depth
         negative_count = int(np.count_nonzero(observed_mask & (grid.values < 0.0)))
+        human_excluded_count = 0
+        if self.human_filter.enabled:
+            # Use the untouched map, never the human-excluded local copy,
+            # as independent evidence for clearing older fusion geometry.
+            self.publish_esdf_free_support(stamp, grid)
+            indices = np.argwhere(observed_mask & (grid.values < -self.inside_epsilon_m))
+            points = grid.origin_m + (indices + 0.5) * grid.voxel_size_m
+            excluded = self.human_filter.excluded(
+                points, stamp.sec + stamp.nanosec * 1e-9)
+            human_excluded_count = int(excluded.sum())
+            # Unknown/excluded, not invented free distance. Keep all other
+            # signed distances intact for sphere radii and ESDF merge guards.
+            grid.values[tuple(indices[excluded].T)] = self.unobserved_distance_value
+        now_sec = stamp.sec + stamp.nanosec * 1e-9
+        if not self._full_solve_due(now_sec):
+            # Do not run the expensive sphere optimizer on these extra ticks.
+            # This check can only clear; it cannot create substitute geometry.
+            if not empty_observation_valid:
+                self.publish_invalid(stamp, "fast_check_" + empty_observation_reason)
+                return
+            try:
+                occupied = has_static_obstacle_component(grid.values, grid.origin_m,
+                    grid.voxel_size_m, unobserved_distance_value=self.unobserved_distance_value,
+                    inside_epsilon_m=self.inside_epsilon_m,
+                    min_component_voxels=self.min_component_voxels,
+                    robot_sphere_centers=robot_centers, robot_sphere_radii=robot_radii,
+                    robot_component_overlap_threshold=self.robot_component_overlap_threshold,
+                    robot_sphere_margin_m=self.robot_sphere_filter_margin_m)
+            except Exception as exc:
+                self._warn_throttled(f"static empty check failed: {exc}")
+                self.publish_invalid(stamp, "fast_empty_check_failed")
+                return
+            if not occupied:
+                if self.last_output_nonempty:
+                    self.get_logger().info(
+                        "Static fast empty: no admitted obstacle components, "
+                        f"processing={(time.monotonic() - processing_started_at) * 1000:.1f} ms")
+                self.publish_empty(stamp, "fast_component_empty")
+            return
+        self.last_full_solve_stamp = now_sec
         try:
             result = generate_medial_spheres(
                 grid.values,
@@ -604,6 +895,7 @@ class EsdfMedialSphereNode(Node):
                 minimum_center_spacing_m=self.minimum_center_spacing_m,
                 min_component_voxels=self.min_component_voxels,
                 min_raw_sphere_radius_m=self.min_raw_sphere_radius_m,
+                max_raw_sphere_radius_m=self.max_raw_sphere_radius_m,
                 safety_margin_m=self.safety_margin_m,
                 redundancy_tolerance_m=self.redundancy_tolerance_m,
                 max_spheres_per_component=self.max_spheres_per_component,
@@ -617,6 +909,21 @@ class EsdfMedialSphereNode(Node):
                 target_shell_coverage=self.target_shell_coverage,
                 shell_coverage_loss_tolerance=self.shell_coverage_loss_tolerance,
                 max_optimization_matrix_elements=self.max_optimization_matrix_elements,
+                enable_local_width_cover=getattr(self, "enable_local_width_cover", False),
+                local_width_ratio=getattr(self, "local_width_ratio", 1.4),
+                local_width_budget_ms=getattr(self, "local_width_budget_ms", 15.0),
+                enable_component_coarse_cover=(
+                    self.enable_component_coarse_cover),
+                component_coarse_min_voxels=(
+                    self.component_coarse_min_voxels),
+                component_coarse_radius_scale=(
+                    self.component_coarse_radius_scale),
+                component_coarse_max_radius_m=(
+                    self.component_coarse_max_radius_m),
+                component_coarse_max_empty_fraction=(
+                    self.component_coarse_max_empty_fraction),
+                component_coarse_max_free_space_distance_m=(
+                    self.component_coarse_max_free_space_distance_m),
                 enable_agglomerative_merge=self.enable_agglomerative_merge,
                 merge_max_radius_m=self.merge_max_radius_m,
                 merge_max_radius_growth_ratio=self.merge_max_radius_growth_ratio,
@@ -625,6 +932,18 @@ class EsdfMedialSphereNode(Node):
                 merge_max_free_space_distance_m=self.merge_max_free_space_distance_m,
                 merge_surface_sample_count=self.merge_surface_sample_count,
                 merge_min_observed_surface_fraction=self.merge_min_observed_surface_fraction,
+                enable_min_k_search=self.enable_min_k_search,
+                min_k_beam_width=self.min_k_beam_width,
+                min_k_max_states=self.min_k_max_states,
+                min_k_processing_budget_ms=self.min_k_processing_budget_ms,
+                enable_post_merge_overlap_pruning=(
+                    self.enable_post_merge_overlap_pruning),
+                post_merge_max_overlap_fraction=(
+                    self.post_merge_max_overlap_fraction),
+                post_merge_pruning_max_spheres=(
+                    self.post_merge_pruning_max_spheres),
+                post_merge_pruning_max_removals=(
+                    self.post_merge_pruning_max_removals),
                 robot_sphere_centers=robot_centers,
                 robot_sphere_radii=robot_radii,
                 robot_component_overlap_threshold=(
@@ -633,11 +952,26 @@ class EsdfMedialSphereNode(Node):
             )
         except Exception as exc:
             self._warn_throttled(f"ESDF medial sphere processing failed: {exc}")
-            self.publish_empty(stamp)
+            self.publish_invalid(stamp, "sphere_processing_failed")
             return
 
+        if not result.spheres and not empty_observation_valid:
+            self.publish_invalid(stamp, "empty_result_" + empty_observation_reason)
+            return
+        status = make_result_status(stamp, self.target_frame,
+            "valid" if result.spheres else "empty", "successful_observed_solve")
+        status.status[0].values.extend([
+            KeyValue(key="local_width_saved", value=str(sum(c.local_width_saved_spheres for c in result.components))),
+            KeyValue(key="local_width_ms", value=str(sum(c.local_width_elapsed_ms for c in result.components))),
+            KeyValue(key="local_width_reasons", value=','.join(c.local_width_reason for c in result.components)),
+        ])
+        self.result_status_pub.publish(status)
+        # Also retained when the semantic branch is disabled: old occupied
+        # locations must remain observed before accepting a later empty solve.
+        self.publish_support(stamp, grid, result)
         self.publish_markers(stamp, result.spheres)
         self.publish_sphere_cloud(stamp, result)
+        self.last_output_nonempty = bool(result.spheres)
         if self.publish_debug_clouds:
             self.publish_inside_cloud(stamp, grid, result)
             self.publish_uncovered_cloud(stamp, grid, result)
@@ -678,6 +1012,24 @@ class EsdfMedialSphereNode(Node):
         )
         max_robot_component_overlap = max(
             result.robot_component_overlap_fractions, default=0.0)
+        agglomerative_sphere_count = sum(
+            component.agglomerative_sphere_count
+            for component in result.components)
+        min_k_sphere_count = sum(
+            component.min_k_sphere_count for component in result.components)
+        post_overlap_sphere_count = sum(
+            component.post_overlap_sphere_count
+            for component in result.components)
+        post_overlap_removed_count = sum(
+            component.post_overlap_removed_count
+            for component in result.components)
+        min_k_states_explored = sum(
+            component.min_k_states_explored for component in result.components)
+        min_k_termination_text = ",".join(
+            f"{component.component_id}:{component.min_k_search_termination}"
+            for component in result.components
+            if component.min_k_search_applied
+        ) or "n/a"
         self._info_throttled(
             "Dense ESDF medial spheres: "
             f"shape={grid.shape}, voxel={grid.voxel_size_m:.4f} m, "
@@ -686,18 +1038,40 @@ class EsdfMedialSphereNode(Node):
             f"robot_rejected_components="
             f"{result.robot_rejected_component_count}, "
             f"robot_rejected_voxels={result.robot_rejected_voxel_count}, "
+            f"human_excluded_voxels={human_excluded_count}, "
             f"robot_spheres={robot_sphere_count}, "
             f"marker_delta={marker_delta_text}, "
             f"max_robot_component_overlap="
             f"{max_robot_component_overlap:.3f}, "
             f"removed_small={result.removed_small_components}, "
+            f"coarse_candidates="
+            f"{sum(c.coarse_candidate_count for c in result.components)}, "
+            f"coarse_selected="
+            f"{sum(c.coarse_selected_count for c in result.components)}, "
             f"pre_merge_spheres={sum(c.pre_merge_sphere_count for c in result.components)}, "
+            f"agglomerative_spheres={agglomerative_sphere_count}, "
+            f"min_k_spheres={min_k_sphere_count}, "
+            f"min_k_states={min_k_states_explored}, "
+            f"min_k_stop=[{min_k_termination_text}], "
+            f"post_overlap_spheres={post_overlap_sphere_count}, "
+            f"post_overlap_removed={post_overlap_removed_count}, "
             f"post_merge_spheres={len(result.spheres)}, coverage=[{coverage_text}], "
+            f"local_width_saved={sum(c.local_width_saved_spheres for c in result.components)}, "
+            f"local_width_ms={sum(c.local_width_elapsed_ms for c in result.components):.2f}, "
             f"processing={processing_elapsed_s * 1000.0:.1f} ms, "
             f"service={service_elapsed_s * 1000.0:.1f} ms"
         )
 
-    def publish_empty(self, stamp):
+    def publish_invalid(self, stamp, reason):
+        self.result_status_pub.publish(make_result_status(
+            stamp, self.target_frame, "unknown", reason))
+        self._warn_throttled(f"static result UNKNOWN: {reason}; not an empty confirmation")
+
+    def publish_empty(self, stamp, reason="explicit_valid_empty"):
+        """Explicitly publish a valid empty result; never use for failures."""
+        self.result_status_pub.publish(make_result_status(
+            stamp, self.target_frame, "empty", reason))
+        self.last_output_nonempty = False
         self.publish_markers(stamp, [])
         self.sphere_cloud_pub.publish(
             point_cloud2.create_cloud(
@@ -723,6 +1097,12 @@ class EsdfMedialSphereNode(Node):
 
     def publish_markers(self, stamp, spheres):
         message = MarkerArray()
+        if self.clear_markers_on_next_publish:
+            clear_marker = Marker()
+            clear_marker.header = self._header(stamp)
+            clear_marker.action = Marker.DELETEALL
+            message.markers.append(clear_marker)
+            self.clear_markers_on_next_publish = False
         current_keys = set()
         component_local_ids = {}
         for sphere in spheres:
@@ -749,6 +1129,8 @@ class EsdfMedialSphereNode(Node):
             marker.color.g = green
             marker.color.b = blue
             marker.color.a = 0.42
+            if self.marker_lifetime_s > 0.0:
+                marker.lifetime = Duration(seconds=self.marker_lifetime_s).to_msg()
             message.markers.append(marker)
         for namespace, marker_id in sorted(self.previous_marker_keys - current_keys):
             marker = Marker()
@@ -783,6 +1165,56 @@ class EsdfMedialSphereNode(Node):
                 self._header(stamp), self._sphere_fields(), rows
             )
         )
+
+    def publish_support(self, stamp, grid, result):
+        """Publish the actual retained voxel support of each generated sphere.
+
+        The exact generation stamp pairs this with sphere_cloud in Fusion;
+        a missing support message must never cause geometry to be deleted.
+        """
+        components = {c.component_id: grid.origin_m + (c.voxel_indices + 0.5)
+                      * grid.voxel_size_m for c in result.components}
+        rows = []
+        for index, sphere in enumerate(result.spheres):
+            points = components[sphere.component_id]
+            inside = np.linalg.norm(points - sphere.center, axis=1) <= (
+                sphere.raw_radius + self.coverage_tolerance_m)
+            rows.extend((float(x), float(y), float(z), index)
+                        for x, y, z in points[inside])
+        fields = [PointField(name=name, offset=i * 4, count=1,
+                  datatype=PointField.INT32 if name == "sphere_index" else PointField.FLOAT32)
+                  for i, name in enumerate(("x", "y", "z", "sphere_index"))]
+        self.support_pub.publish(point_cloud2.create_cloud(self._header(stamp), fields, rows))
+        if rows:
+            self.support_history.append((stamp, np.asarray(rows, dtype=float)))
+            self.support_history = self.support_history[-3:]
+
+    def _reset_human_static_cache(self):
+        if hasattr(self, "support_history"):
+            self.support_history.clear()
+            self.last_support_evidence_stamp = None
+            self.last_full_solve_stamp = None
+            self.last_output_nonempty = False
+
+    def publish_esdf_free_support(self, stamp, grid):
+        """Recheck cached support against a newly observed, unmodified ESDF."""
+        now = stamp.sec + stamp.nanosec * 1e-9
+        if self.last_support_evidence_stamp is not None and now < self.last_support_evidence_stamp:
+            self.support_history.clear()
+        self.last_support_evidence_stamp = now
+        fields = [PointField(name=name, offset=i * 4, count=1,
+                  datatype=PointField.INT32 if i >= 3 else PointField.FLOAT32)
+                  for i, name in enumerate(("x", "y", "z", "sphere_index", "esdf_free"))]
+        fields.append(PointField(name="evidence_stamp", offset=20,
+                                 count=1, datatype=PointField.FLOAT64))
+        for generation_stamp, support in self.support_history:
+            free = esdf_proves_voxels_free(support[:, :3], grid.values,
+                grid.origin_m, grid.voxel_size_m, self.unobserved_distance_value,
+                self.human_filter.params.free_clearance_m)
+            rows = [(float(x), float(y), float(z), int(index), int(clear), now)
+                    for (x, y, z, index), clear in zip(support, free)]
+            self.free_support_pub.publish(point_cloud2.create_cloud(
+                self._header(generation_stamp), fields, rows))
 
     def publish_inside_cloud(self, stamp, grid, result):
         covered_by_index = {}
