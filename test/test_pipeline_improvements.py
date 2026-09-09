@@ -195,6 +195,44 @@ def test_fusion_requires_every_box_support_voxel_not_just_high_percentage():
     assert box in result
 
 
+def test_human_dominance_removes_static_centered_in_person_envelope():
+    static, human = fusion_ball(0., .3, 0), fusion_ball(.1, .2, 2)
+    support = {static: np.asarray([[-.29, 0., 1.]])}
+    stats = {}
+    result = fuse_spheres([static], [], FusionParameters(
+        coverage_guard_enabled=True,
+        human_static_dominance_enabled=True,
+        human_static_dominance_margin_m=.05,
+    ), [human], support=support, stats=stats)
+    assert result == [human]
+    assert stats['human_static_dominance_removed'] == 1
+
+
+def test_human_dominance_keeps_tangential_static_geometry():
+    static, human = fusion_ball(0., .2, 0), fusion_ball(.34, .15, 2)
+    result = fuse_spheres([static], [], FusionParameters(
+        coverage_guard_enabled=True,
+        human_static_dominance_enabled=True,
+        human_static_dominance_margin_m=.05,
+        human_static_dominance_extent_ratio=.50,
+    ), [human], support={static: np.asarray([[0., 0., 1.]])})
+    assert result == [human, static]
+
+
+def test_human_dominance_suppresses_static_extent_protruding_from_person():
+    static, human = fusion_ball(0., .20, 0), fusion_ball(.24, .10, 2)
+    support = {static: np.asarray([[-.19, 0., 1.]])}
+    stats = {}
+    result = fuse_spheres([static], [], FusionParameters(
+        coverage_guard_enabled=True,
+        human_static_dominance_enabled=True,
+        human_static_dominance_margin_m=.05,
+        human_static_dominance_extent_ratio=.50,
+    ), [human], support=support, stats=stats)
+    assert result == [human]
+    assert stats['human_static_dominance_removed'] == 1
+
+
 def test_actual_duplicate_support_can_be_covered_by_union_of_human_spheres():
     box = fusion_ball(0., .3, 0)
     humans = [fusion_ball(-.2, .1, 2), fusion_ball(.2, .1, 2)]

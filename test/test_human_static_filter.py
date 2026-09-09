@@ -165,6 +165,25 @@ def test_new_esdf_empty_evidence_clears_old_generation_without_reappearance():
     assert ObstacleSphereFusionNode._human_filtered_static(fake, 2.6) == spheres
 
 
+def test_human_majority_exclusion_retires_static_for_the_generation():
+    spheres = [FusionSphere(0, 0, 1, .2, .2, 0)]
+    points = np.asarray([[x, 0, 1] for x in (-.1, -.05, 0, .05, .1)])
+    excluded = np.asarray([True, True, True, True, False])
+    fake = SimpleNamespace(cache=SimpleNamespace(static_spheres=spheres),
+        static_generation_stamp=100, static_support={100: (points, np.zeros(5, dtype=int))},
+        static_free_support={}, static_esdf_cleared={}, static_human_suppressed={},
+        human_filter=SimpleNamespace(enabled=True, excluded=lambda _p, _n: excluded,
+            last_stats=(4, 0)), human_static_exclusion_ratio=.70,
+        human_static_refit_enabled=False, fusion_coverage_guard_enabled=False,
+        last_human_filter_log=float('inf'))
+    assert ObstacleSphereFusionNode._human_filtered_static(fake, 1.0) == []
+    fake.human_filter.excluded = lambda _p, _n: np.zeros(5, dtype=bool)
+    assert ObstacleSphereFusionNode._human_filtered_static(fake, 2.0) == []
+    fake.static_generation_stamp = 200
+    fake.static_support[200] = (points, np.zeros(5, dtype=int))
+    assert ObstacleSphereFusionNode._human_filtered_static(fake, 2.0) == spheres
+
+
 def test_esdf_evidence_wire_format_and_generation_pairing():
     from builtin_interfaces.msg import Time
     from std_msgs.msg import Header

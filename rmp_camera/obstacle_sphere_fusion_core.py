@@ -41,6 +41,9 @@ class FusionParameters:
     keep_dynamic_until_static_overlap: bool = True
     dynamic_absolute_max_ttl_sec: float = 3.0
     human_priority: bool = True
+    human_static_dominance_enabled: bool = False
+    human_static_dominance_margin_m: float = 0.0
+    human_static_dominance_extent_ratio: float = 0.0
     human_handover_grace_sec: float = 0.35
     human_absolute_max_ttl_sec: float = 0.35
     human_empty_confirmation_frames: int = 3
@@ -230,11 +233,31 @@ def coverage_preserving_fusion(ordered, params, support, stats=None):
     start = monotonic()
     deadline = start + params.coverage_budget_ms / 1000.
     kept, removed, checked, missing, partial = [], 0, 0, 0, 0
+    human_dominance = 0
     for sphere in ordered:
         winners = [s for s in kept if s.source_type != sphere.source_type
                    and spheres_overlap(sphere, s, params.overlap_tolerance_m)]
-        redundant = False
-        if winners and monotonic() < deadline:
+        # Semantic-human geometry owns a static sphere whose medial centre lies
+        # inside the observed person envelope or within a configured fraction
+        # of the static ball's extent.  The extent term catches coarse static
+        # balls that protrude from a person while their centres remain outside.
+        # Near-tangential spheres keep using the support-preserving rule below.
+        redundant = bool(
+            params.human_static_dominance_enabled
+            and sphere.source_type == 0
+            and any(
+                winner.source_type == 2
+                and np.linalg.norm(sphere.center - winner.center)
+                <= (winner.output_radius
+                    + params.human_static_dominance_margin_m
+                    + params.human_static_dominance_extent_ratio
+                    * sphere.output_radius)
+                for winner in winners
+            )
+        )
+        if redundant:
+            human_dominance += 1
+        elif winners and monotonic() < deadline:
             points = support.get(sphere)
             if (points is not None and 0 < len(points) <= 8192
                     and len(points) * len(winners) <= 200000
@@ -265,6 +288,7 @@ def coverage_preserving_fusion(ordered, params, support, stats=None):
         stats.update(coverage_removed=removed, coverage_checked_voxels=checked,
             coverage_missing_support=missing, coverage_cap_dropped=overflow,
             coverage_kept_partial=partial,
+            human_static_dominance_removed=human_dominance,
             coverage_valid=overflow == 0, fusion_ms=(monotonic() - start) * 1000.)
     return kept[:params.max_total_spheres]
 

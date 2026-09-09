@@ -43,6 +43,7 @@ class ObstacleSphereFusionNode(Node):
         self.static_support = {}
         self.static_free_support = {}
         self.static_esdf_cleared = {}
+        self.static_human_suppressed = {}
         self.static_generation_stamp = None
         self.source_generation = {}
         self.source_support = {1: {}, 2: {}}
@@ -107,6 +108,7 @@ class ObstacleSphereFusionNode(Node):
             "human_static_refit_enabled": True,
             "human_static_refit_min_radius_m": 0.04,
             "human_static_refit_coverage_tolerance_m": 0.02,
+            "human_static_exclusion_ratio": 1.0,
             "dynamic_sphere_cloud_topic": "/rmp_camera/dynamic_obstacle_sphere_cloud",
             "human_sphere_cloud_topic": "/rmp_camera/human_sphere_cloud",
             "combined_sphere_cloud_topic": "/rmp_camera/combined_obstacle_sphere_cloud",
@@ -126,6 +128,9 @@ class ObstacleSphereFusionNode(Node):
             "keep_dynamic_until_static_overlap": True,
             "dynamic_absolute_max_ttl_sec": 3.0,
             "human_priority": True,
+            "human_static_dominance_enabled": False,
+            "human_static_dominance_margin_m": 0.0,
+            "human_static_dominance_extent_ratio": 0.0,
             "human_handover_grace_sec": 0.35,
             "human_absolute_max_ttl_sec": 0.35,
             "human_empty_confirmation_frames": 3,
@@ -153,9 +158,11 @@ class ObstacleSphereFusionNode(Node):
             setattr(self, name, str(self.get_parameter(name).value))
         floats = (
             "human_static_refit_min_radius_m", "human_static_refit_coverage_tolerance_m",
+            "human_static_exclusion_ratio",
             "fusion_rate_hz", "fusion_overlap_tolerance_m", "fusion_hysteresis_sec",
             "fusion_coverage_tolerance_m",
             "dynamic_handover_grace_sec", "dynamic_absolute_max_ttl_sec",
+            "human_static_dominance_margin_m", "human_static_dominance_extent_ratio",
             "human_handover_grace_sec", "human_absolute_max_ttl_sec",
             "robot_overlap_coverage_threshold", "robot_overlap_robot_margin_m",
             "robot_overlap_marker_timeout_s", "marker_alpha", "marker_lifetime_s")
@@ -168,6 +175,9 @@ class ObstacleSphereFusionNode(Node):
                 or not np.isfinite(self.human_static_refit_coverage_tolerance_m)
                 or self.human_static_refit_coverage_tolerance_m < 0):
             raise ValueError("invalid human static refit radius/tolerance")
+        if (not np.isfinite(self.human_static_exclusion_ratio)
+                or not 0.0 < self.human_static_exclusion_ratio <= 1.0):
+            raise ValueError("human_static_exclusion_ratio must be in (0, 1]")
         integers = (
             "fusion_max_total_spheres", "static_empty_confirmation_frames",
             "human_empty_confirmation_frames", "robot_overlap_sample_count")
@@ -178,6 +188,7 @@ class ObstacleSphereFusionNode(Node):
             "fusion_coverage_guard_enabled",
             "static_require_result_status", "static_fast_empty_clear",
             "keep_dynamic_until_static_overlap", "human_priority",
+            "human_static_dominance_enabled",
             "robot_overlap_filter_enabled")
         for name in booleans:
             setattr(self, name, bool(self.get_parameter(name).value))
@@ -207,6 +218,12 @@ class ObstacleSphereFusionNode(Node):
             raise ValueError("marker_lifetime_s must be non-negative")
         if not np.isfinite(self.fusion_coverage_tolerance_m) or self.fusion_coverage_tolerance_m < 0.:
             raise ValueError("fusion coverage tolerance must be finite and non-negative")
+        if (not np.isfinite(self.human_static_dominance_margin_m)
+                or self.human_static_dominance_margin_m < 0.):
+            raise ValueError("human static dominance margin must be finite and non-negative")
+        if (not np.isfinite(self.human_static_dominance_extent_ratio)
+                or not 0. <= self.human_static_dominance_extent_ratio <= 1.):
+            raise ValueError("human static dominance extent ratio must be in [0, 1]")
 
     def _core_parameters(self):
         return FusionParameters(
@@ -221,6 +238,9 @@ class ObstacleSphereFusionNode(Node):
             keep_dynamic_until_static_overlap=self.keep_dynamic_until_static_overlap,
             dynamic_absolute_max_ttl_sec=self.dynamic_absolute_max_ttl_sec,
             human_priority=self.human_priority,
+            human_static_dominance_enabled=self.human_static_dominance_enabled,
+            human_static_dominance_margin_m=self.human_static_dominance_margin_m,
+            human_static_dominance_extent_ratio=self.human_static_dominance_extent_ratio,
             human_handover_grace_sec=self.human_handover_grace_sec,
             human_absolute_max_ttl_sec=self.human_absolute_max_ttl_sec,
             human_empty_confirmation_frames=self.human_empty_confirmation_frames,
@@ -372,7 +392,19 @@ class ObstacleSphereFusionNode(Node):
                     self.static_generation_stamp, set()).update(cleared.tolist())
                 while len(self.static_esdf_cleared) > 4:
                     del self.static_esdf_cleared[next(iter(self.static_esdf_cleared))]
-        remove = fully_excluded_spheres(indices, excluded, len(spheres))
+        exclusion_ratio = getattr(self, "human_static_exclusion_ratio", 1.0)
+        remove = fully_excluded_spheres(indices, excluded, len(spheres), exclusion_ratio)
+        if not hasattr(self, "static_human_suppressed"):
+            self.static_human_suppressed = {}
+        newly_suppressed = np.flatnonzero(remove)
+        if len(newly_suppressed):
+            self.static_human_suppressed.setdefault(
+                self.static_generation_stamp, set()).update(newly_suppressed.tolist())
+            while len(self.static_human_suppressed) > 4:
+                del self.static_human_suppressed[next(iter(self.static_human_suppressed))]
+        for index in self.static_human_suppressed.get(self.static_generation_stamp, ()):
+            if index < len(remove):
+                remove[index] = True
         for index in self.static_esdf_cleared.get(self.static_generation_stamp, ()):
             if index < len(remove):
                 remove[index] = True
@@ -400,6 +432,7 @@ class ObstacleSphereFusionNode(Node):
                 f"active_voxels={self.human_filter.last_stats[0]}, "
                 f"depth_free_voxels={self.human_filter.last_stats[1]}, "
                 f"esdf_free_support={esdf_free_count}, "
+                f"exclusion_ratio={exclusion_ratio:.2f}, "
                 f"mixed={refit_stats['mixed']}, refitted={refit_stats['refitted']}, "
                 f"excluded_support_avoided={refit_stats['excluded_support_avoided']}, "
                 f"refit_volume_m3={refit_stats.get('refit_volume_before_m3', 0):.5f}"
@@ -420,6 +453,8 @@ class ObstacleSphereFusionNode(Node):
             self.static_support.clear()
             self.static_free_support.clear()
             self.static_esdf_cleared.clear()
+            if hasattr(self, "static_human_suppressed"):
+                self.static_human_suppressed.clear()
             self.static_generation_stamp = None
 
     def _free_support_callback(self, message):

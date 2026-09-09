@@ -187,10 +187,10 @@
 /esdf_medial_sphere_node:
   ros__parameters:
     result_status_topic: "/rmp_camera/static_sphere_result_status"
-    empty_check_rate_hz: 5.0              # Cheap empty-only checks; full sphere optimization stays at update_rate_hz.
+    empty_check_rate_hz: 10.0             # Recheck stale static support about every 100 ms without rerunning full optimization.
     service_name: "/nvblox_node/get_esdf_and_gradient"
     target_frame: "base_link"
-    update_rate_hz: 1.0                    # Dense static service queries [Hz].
+    update_rate_hz: 2.0                    # Faster static response; measured worst-case solve still fits this period.
     update_esdf: true                      # Ask service to update ESDF before response.
     visualize_esdf: false                 # Avoid service debug publication overhead.
     aabb_min_x_m: -1.5
@@ -362,8 +362,7 @@
 
 /obstacle_sphere_fusion_node:
   ros__parameters:
-    # Temporarily exclude static spheres from fusion; restore /rmp_camera/esdf_medial_sphere_cloud to enable.
-    static_sphere_cloud_topic: "/rmp_camera/disabled_static_sphere_cloud"
+    static_sphere_cloud_topic: "/rmp_camera/esdf_medial_sphere_cloud"
     static_result_status_topic: "/rmp_camera/static_sphere_result_status"
     static_require_result_status: true    # Pair exact-generation validity with each static cloud.
     static_fast_empty_clear: true         # Only successful, spatially observed empty solves bypass debounce.
@@ -384,9 +383,13 @@
     keep_dynamic_until_static_overlap: false # Do not retain stale dynamics while waiting for static overlap.
     dynamic_absolute_max_ttl_sec: 0.30     # Hard upper bound for stale fused dynamics [s].
     human_priority: true                   # Semantic human geometry replaces only overlapping copies.
+    human_static_dominance_enabled: true   # Human owns static balls substantially embedded in its sphere envelope.
+    human_static_dominance_margin_m: 0.05  # Cover voxelization and tracking mismatch around the human surface.
+    human_static_dominance_extent_ratio: 0.65 # Suppress a static centre up to 65% of its radius outside the human envelope.
     human_static_refit_enabled: true       # Refit mixed cached balls; keep all residual support, never increase K.
-    human_handover_grace_sec: 0.20         # Briefly bridge one missed semantic/depth update [s].
-    human_absolute_max_ttl_sec: 0.20       # Clear stale semantic-person output promptly [s].
+    human_static_exclusion_ratio: 0.70     # Retire a human-region static ball once 70% of its support is excluded.
+    human_handover_grace_sec: 0.35         # Bridge measured short semantic/depth gaps [s].
+    human_absolute_max_ttl_sec: 0.45       # Cover the observed 0.4 s inference gap, with a bounded stale hold.
     human_empty_confirmation_frames: 3     # Debounce <0.1 s inference gaps without another long TTL.
     robot_overlap_filter_enabled: true     # Remove obstacles containing a robot sphere.
     robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"
@@ -405,8 +408,8 @@
     # Shared by static generation and Fusion. Enabled only with the human branch.
     human_static_voxel_size_m: 0.05
     human_static_match_distance_m: 0.08
-    human_static_surface_back_band_m: 0.15 # Bounded TSDF band behind observed person surface.
-    human_static_active_hold_s: 0.35      # Short semantic dropout allowance.
+    human_static_surface_back_band_m: 0.30 # Cover the visible-to-rear torso volume left in the accumulated ESDF.
+    human_static_active_hold_s: 0.45      # Match the human-sphere gap allowance before depth takes over.
     human_static_history_s: 5.0          # Old human location alone never proves empty space.
     human_static_depth_max_age_s: 0.25
     human_static_free_clearance_m: 0.03  # Beyond the entire voxel, not just its centre.
@@ -489,7 +492,7 @@
     dynamic_local_width_ratio: 1.4
     dynamic_local_width_budget_ms: 5.0
     dynamic_component_fixed_radius_scale: 0.45
-    dynamic_target_coverage: 0.92
+    dynamic_target_coverage: 0.97          # Preserve lower-body/extremity voxels; replay cost was about +2.4 ms.
     dynamic_coverage_tolerance_m: 0.02
     dynamic_safety_margin_m: 0.005
     dynamic_redundancy_tolerance_m: 0.01
@@ -524,12 +527,12 @@
     dynamic_association_distance_m: 0.20   # Maintain a human track across normal limb motion.
     dynamic_smoothing_alpha: 0.80
     dynamic_radius_smoothing_alpha: 0.25
-    dynamic_sphere_ttl_sec: 0.30            # Bridge measured 0.1-0.24 s semantic dropouts in one place only.
-    dynamic_max_missed_updates: 2           # Keep tracks through two missed masks; the third confirmed miss clears.
+    dynamic_sphere_ttl_sec: 0.45            # Bridge the measured 0.4 s semantic inference gap.
+    dynamic_max_missed_updates: 4           # Avoid lower-body track flicker across a few valid weak detections.
     dynamic_update_rate_hz: 30.0
     dynamic_input_max_age_s: 0.25
     dynamic_tracking_max_radius_ratio: 2.0
-    dynamic_input_stale_timeout_s: 0.30     # Steady-time clear even when rosbag /clock stops.
+    dynamic_input_stale_timeout_s: 0.45     # Clear after the measured inference-gap envelope, even if /clock stops.
     marker_lifetime_s: 0.5
     robot_component_filter_enabled: true
     robot_sphere_marker_topic: "/rmp_camera/robot_collision_sphere_markers"

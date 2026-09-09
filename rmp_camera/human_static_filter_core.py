@@ -273,14 +273,16 @@ class HumanVoxelHistory:
         return active, cleared
 
 
-def fully_excluded_spheres(sphere_indices, excluded, sphere_count):
-    """No supporting voxels or a single retained voxel prevents deletion."""
+def fully_excluded_spheres(sphere_indices, excluded, sphere_count, threshold=1.0):
+    """Return spheres whose excluded-support fraction reaches ``threshold``."""
     indices = np.asarray(sphere_indices, dtype=np.int64)
     if np.any(indices < 0) or np.any(indices >= sphere_count):
         raise ValueError("support sphere index out of range")
+    if not np.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        raise ValueError("exclusion threshold must be in (0, 1]")
     total = np.bincount(indices, minlength=sphere_count)
     removed = np.bincount(indices[np.asarray(excluded, dtype=bool)], minlength=sphere_count)
-    return (total > 0) & (total == removed)
+    return (total > 0) & (removed / np.maximum(total, 1) >= threshold - 1e-12)
 
 
 def refit_mixed_static_spheres(spheres, points, sphere_indices, excluded,
