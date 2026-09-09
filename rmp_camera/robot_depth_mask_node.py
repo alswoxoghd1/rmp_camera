@@ -39,6 +39,7 @@ class RobotDepthMaskNode(Node):
         self.declare_parameter("publish_predicted_depth", False)
         self.declare_parameter("filter_mode", "volume")
         self.declare_parameter("robot_margin_m", 0.05)
+        self.declare_parameter("surface_sphere_padding_m", 0.0)
         self.declare_parameter("surface_front_tolerance_m", 0.02)
         self.declare_parameter("surface_back_tolerance_m", 0.03)
         self.declare_parameter("mask_shadow_behind_robot", False)
@@ -67,6 +68,10 @@ class RobotDepthMaskNode(Node):
             raise ValueError(
                 "filter_mode must be either 'volume' or 'surface_depth'")
         self.robot_margin_m = float(self.get_parameter("robot_margin_m").value)
+        self.surface_sphere_padding_m = max(
+            0.0,
+            float(self.get_parameter("surface_sphere_padding_m").value),
+        )
         self.surface_front_tolerance_m = float(
             self.get_parameter("surface_front_tolerance_m").value)
         self.surface_back_tolerance_m = float(
@@ -118,7 +123,15 @@ class RobotDepthMaskNode(Node):
             depth=2,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
-        marker_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=2)
+        # Robot markers are a high-rate pose stream.  Prefer the newest sample
+        # instead of allowing reliable delivery retries to hold up newer poses
+        # under RViz/GPU load; timestamp history is maintained below in the
+        # in-process marker buffer.
+        marker_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
             self.camera_info_topic,
@@ -247,13 +260,12 @@ class RobotDepthMaskNode(Node):
             marker_to_depth
             @ np.c_[centers_base, np.ones(len(centers_base), dtype=np.float64)].T
         ).T[:, :3]
-        expanded_radii = radii + self.robot_margin_m
         predicted_depth = None
         if self.filter_mode == "surface_depth":
             predicted_depth = predict_sphere_surface_depth(
                 depth_array.shape,
                 centers_depth,
-                expanded_radii,
+                radii + self.surface_sphere_padding_m,
                 fx,
                 fy,
                 cx,
@@ -274,6 +286,7 @@ class RobotDepthMaskNode(Node):
             masked_depth = depth_array.copy()
             masked_depth[removed_mask] = invalid_value
         else:
+            expanded_radii = radii + self.robot_margin_m
             masked_depth, removed_mask = self.mask_depth(
                 depth_array,
                 centers_depth,
@@ -403,12 +416,18 @@ class RobotDepthMaskNode(Node):
             self.robot_marker_buffer,
             key=lambda item: abs(item[0] - target_ns),
         )
-        delta_ns = abs(best_stamp_ns - target_ns)
+        signed_delta_ns = best_stamp_ns - target_ns
+        delta_ns = abs(signed_delta_ns)
         if (
             self.robot_marker_max_stamp_delta_ns > 0
             and delta_ns > self.robot_marker_max_stamp_delta_ns
         ):
             delta_s = delta_ns / 1e9
+            marker_stamps = [item[0] for item in self.robot_marker_buffer]
+            relative_span_s = (
+                (min(marker_stamps) - target_ns) / 1e9,
+                (max(marker_stamps) - target_ns) / 1e9,
+            )
             action = (
                 "Using latest marker fallback."
                 if self.fallback_to_latest_marker_on_time_miss
@@ -416,7 +435,11 @@ class RobotDepthMaskNode(Node):
             )
             self.log_throttled(
                 "No close time-synchronized robot markers for depth mask: "
-                f"delta={delta_s:.3f}s. "
+                f"delta={delta_s:.3f}s, nearest signed delta="
+                f"{signed_delta_ns / 1e9:+.3f}s, buffer relative span="
+                f"[{relative_span_s[0]:+.3f}s, "
+                f"{relative_span_s[1]:+.3f}s], "
+                f"buffer size={len(self.robot_marker_buffer)}. "
                 + action,
                 warn=True,
             )

@@ -6,16 +6,21 @@ spacings, tolerances, and radii are expressed in metres.
 
 from collections import deque
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from rmp_camera.sphere_merge_core import (
     PairMergeCandidate,
+    enumerate_pair_merge_candidates,
     select_best_merge_pair,
+    sphere_overlap_fraction,
     validate_merge_limits,
 )
 
+
+from rmp_camera.local_width_sphere_cover import local_width_cover, VoxelSupportGuard
 
 Index3 = Tuple[int, int, int]
 
@@ -45,6 +50,39 @@ class ComponentResult:
         default_factory=lambda: np.empty((0, 3), dtype=np.int64)
     )
     pre_merge_sphere_count: int = 0
+    agglomerative_sphere_count: int = 0
+    min_k_sphere_count: int = 0
+    final_sphere_count: int = 0
+    min_k_search_applied: bool = False
+    min_k_states_explored: int = 0
+    min_k_search_termination: str = "disabled"
+    post_overlap_sphere_count: int = 0
+    post_overlap_removed_count: int = 0
+    coarse_candidate_count: int = 0
+    coarse_selected_count: int = 0
+    local_width_saved_spheres: int = 0
+    local_width_elapsed_ms: float = 0.0
+    local_width_reason: str = "disabled"
+
+
+@dataclass(frozen=True)
+class StaticSphereSearchState:
+    """One order-independent state in the bounded static merge search."""
+
+    spheres: tuple[Sphere, ...]
+    total_raw_volume: float
+    total_raw_radius: float
+    canonical_signature: tuple[tuple[object, ...], ...]
+
+
+@dataclass
+class StaticMinimumKSearchResult:
+    """Best valid static sphere state found within configured search bounds."""
+
+    spheres: List[Sphere]
+    states_explored: int
+    termination_reason: str
+    state: StaticSphereSearchState
 
 
 @dataclass
@@ -58,6 +96,14 @@ class GenerationResult:
     removed_small_components: int
     total_limit_applied: bool
     coverage_lost_component_ids: List[int]
+    input_component_count: int = 0
+    robot_rejected_component_count: int = 0
+    robot_rejected_voxel_count: int = 0
+    robot_rejected_component_ids: List[int] = field(default_factory=list)
+    robot_component_overlap_fractions: List[float] = field(default_factory=list)
+    robot_rejected_voxel_indices: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.int64)
+    )
 
 
 def make_neighbor_offsets_18() -> Tuple[Index3, ...]:
@@ -142,6 +188,118 @@ def connected_components_18(inside_mask: np.ndarray) -> List[np.ndarray]:
                     queue.append(neighbor)
         components.append(np.asarray(indices, dtype=np.int64))
     return components
+
+
+def static_voxel_robot_sphere_overlap_mask(
+    voxel_indices: np.ndarray,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> np.ndarray:
+    """Return which static voxel AABBs intersect a robot sphere."""
+
+    indices = _as_index_array(voxel_indices)
+    if voxel_size_m <= 0.0:
+        raise ValueError("voxel_size_m must be positive")
+    if margin_m < 0.0 or not np.isfinite(margin_m):
+        raise ValueError("robot sphere margin must be finite and non-negative")
+    if len(indices) == 0:
+        return np.zeros(0, dtype=bool)
+
+    centers = np.asarray(robot_sphere_centers, dtype=np.float64)
+    if centers.size == 0:
+        centers = np.empty((0, 3), dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("robot sphere centers must have shape (N, 3)")
+    radii = np.asarray(robot_sphere_radii, dtype=np.float64).reshape(-1)
+    if len(centers) != len(radii):
+        raise ValueError("robot sphere centers and radii must have equal length")
+    if not np.isfinite(centers).all() or not np.isfinite(radii).all():
+        raise ValueError("robot sphere geometry must be finite")
+    if np.any(radii <= 0.0):
+        raise ValueError("robot sphere radii must be positive")
+    if len(centers) == 0:
+        return np.zeros(len(indices), dtype=bool)
+
+    origin = _as_origin(origin_m)
+    voxel_min = origin + indices.astype(np.float64) * voxel_size_m
+    voxel_max = voxel_min + voxel_size_m
+    overlaps = np.zeros(len(indices), dtype=bool)
+    for center, radius in zip(centers, radii):
+        closest = np.clip(center, voxel_min, voxel_max)
+        delta = closest - center
+        squared_distance = np.einsum("ij,ij->i", delta, delta)
+        overlaps |= squared_distance <= (radius + margin_m) ** 2
+        if overlaps.all():
+            break
+    return overlaps
+
+
+def static_component_robot_overlap_fraction(
+    voxel_indices: np.ndarray,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]],
+    robot_sphere_radii: np.ndarray | Sequence[float],
+    margin_m: float = 0.0,
+) -> Tuple[float, np.ndarray]:
+    """Return robot-intersecting static voxel fraction and its mask."""
+
+    mask = static_voxel_robot_sphere_overlap_mask(
+        voxel_indices,
+        origin_m,
+        voxel_size_m,
+        robot_sphere_centers,
+        robot_sphere_radii,
+        margin_m,
+    )
+    return (float(np.mean(mask)) if len(mask) else 0.0), mask
+
+
+def previous_support_is_observed(points, observed_mask, origin_m, voxel_size_m):
+    """Do not turn map loss/out-of-bounds old geometry into a valid empty."""
+    if not np.any(observed_mask):
+        return False
+    points = np.asarray(points).reshape(-1, 3)
+    if not len(points):
+        return True
+    indices = np.floor((points - origin_m) / voxel_size_m).astype(np.int64)
+    in_bounds = np.all((indices >= 0) & (indices < observed_mask.shape), axis=1)
+    return bool(in_bounds.all() and observed_mask[tuple(indices.T)].all())
+
+
+def has_static_obstacle_component(
+    values, origin_m, voxel_size_m, *, unobserved_distance_value=-1000.0,
+    inside_epsilon_m=0.005, min_component_voxels=30,
+    robot_sphere_centers=None, robot_sphere_radii=None,
+    robot_component_overlap_threshold=0.02, robot_sphere_margin_m=0.0,
+):
+    """Conservative empty-only check using the full solver's admission rules.
+
+    False guarantees that there is no component on which the sphere solver
+    would run. True does not guarantee a sphere (e.g. minimum-radius limits).
+    This deliberately does not use coverage, pruning, merging or Minimum-K.
+    Observation validity must be checked separately by the caller.
+    """
+    if min_component_voxels < 1:
+        raise ValueError("min_component_voxels must be positive")
+    use_robot = robot_sphere_centers is not None or robot_sphere_radii is not None
+    if use_robot and (robot_sphere_centers is None or robot_sphere_radii is None):
+        raise ValueError("robot centers and radii must be supplied together")
+    inside = extract_inside_mask(values, unobserved_distance_value, inside_epsilon_m)
+    for indices in connected_components_18(inside):
+        if len(indices) < min_component_voxels:
+            continue
+        if use_robot:
+            fraction, _ = static_component_robot_overlap_fraction(
+                indices, origin_m, voxel_size_m, robot_sphere_centers,
+                robot_sphere_radii, robot_sphere_margin_m)
+            if fraction + 1e-12 >= robot_component_overlap_threshold:
+                continue
+        return True
+    return False
 
 
 def find_local_minimum_candidates(
@@ -264,24 +422,31 @@ def create_initial_spheres(
     min_raw_sphere_radius_m: float,
     safety_margin_m: float,
     component_id: int,
+    max_raw_sphere_radius_m: float = float("inf"),
 ) -> List[Sphere]:
-    """Create spheres at voxel centres with ``raw_radius == -ESDF``.
+    """Create bounded spheres at voxel centres from the negative ESDF.
 
     Coordinates and all scalar distances are metres. Candidates below the
     configurable minimum raw radius are discarded; a high minimum can remove
-    thin obstacle parts. ``output_radius`` alone receives the safety margin.
+    thin obstacle parts. Deep candidates are clipped to the maximum raw
+    radius, and ``output_radius`` alone receives the safety margin.
     """
 
     if voxel_size_m <= 0.0:
         raise ValueError("voxel_size_m must be positive")
-    if min_raw_sphere_radius_m < 0.0 or safety_margin_m < 0.0:
+    if (
+        min_raw_sphere_radius_m < 0.0
+        or max_raw_sphere_radius_m < min_raw_sphere_radius_m
+        or safety_margin_m < 0.0
+    ):
         raise ValueError("sphere radius threshold and safety margin must be non-negative")
     values = np.asarray(esdf_grid)
     origin = _as_origin(origin_m)
     spheres = []
     for index_array in _as_index_array(candidate_indices):
         source_index = tuple(int(v) for v in index_array)
-        raw_radius = -float(values[source_index])
+        raw_radius = min(
+            -float(values[source_index]), float(max_raw_sphere_radius_m))
         if not np.isfinite(raw_radius) or raw_radius < min_raw_sphere_radius_m:
             continue
         center = origin + (index_array.astype(np.float64) + 0.5) * voxel_size_m
@@ -369,6 +534,7 @@ def add_spheres_until_coverage(
     max_spheres_per_component: int,
     max_iterations_per_component: int,
     component_id: int,
+    max_raw_sphere_radius_m: float = float("inf"),
 ) -> Tuple[List[Sphere], float, str, np.ndarray]:
     """Add deepest uncovered valid voxels until coverage or a hard limit.
 
@@ -381,6 +547,8 @@ def add_spheres_until_coverage(
         raise ValueError("target_coverage must be in [0, 1]")
     if max_spheres_per_component < 0 or max_iterations_per_component < 0:
         raise ValueError("sphere and iteration limits must be non-negative")
+    if max_raw_sphere_radius_m < min_raw_sphere_radius_m:
+        raise ValueError("maximum raw radius must be at least the minimum")
     values = np.asarray(esdf_grid)
     indices = _as_index_array(component_indices)
     origin = _as_origin(origin_m)
@@ -407,7 +575,8 @@ def add_spheres_until_coverage(
         )
         selected = None
         for candidate in ordered:
-            raw_radius = -float(values[candidate])
+            raw_radius = min(
+                -float(values[candidate]), float(max_raw_sphere_radius_m))
             if not np.isfinite(raw_radius) or raw_radius < min_raw_sphere_radius_m:
                 continue
             center = origin + (np.asarray(candidate, dtype=np.float64) + 0.5) * voxel_size_m
@@ -458,7 +627,7 @@ def remove_redundant_spheres(
         if not active[container_index]:
             continue
         container = spheres[container_index]
-        for candidate_index in order[order_position + 1 :]:
+        for candidate_index in order[order_position + 1:]:
             if not active[candidate_index]:
                 continue
             candidate = spheres[candidate_index]
@@ -710,6 +879,139 @@ def general_coverage_pruning(
     return active
 
 
+def prune_overlapping_static_spheres(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    inside_epsilon_m: float,
+    target_coverage: float,
+    coverage_tolerance_m: float,
+    enable_surface_shell_guard: bool,
+    surface_shell_thickness_m: float,
+    target_shell_coverage: float,
+    shell_coverage_loss_tolerance: float,
+    max_optimization_matrix_elements: int,
+    max_overlap_fraction: float,
+    max_spheres: int,
+    max_removals: int,
+) -> tuple[List[Sphere], int]:
+    """Remove highly overlapping final spheres without losing coverage.
+
+    This bounded pass runs after merging.  It reuses one sphere-by-voxel
+    matrix, preserves both volume and surface-shell coverage, and only
+    considers spheres participating in a pair above ``max_overlap_fraction``.
+    The pass is skipped for unexpectedly large sets instead of adding an
+    unbounded quadratic workload.
+    """
+
+    if not 0.0 <= max_overlap_fraction <= 1.0:
+        raise ValueError("post-merge overlap fraction must be in [0, 1]")
+    if max_spheres <= 0 or max_removals < 0:
+        raise ValueError(
+            "post-merge sphere cap must be positive and removal cap non-negative")
+    active_spheres = list(spheres)
+    if (
+        len(active_spheres) < 2
+        or len(active_spheres) > max_spheres
+        or max_removals == 0
+    ):
+        return active_spheres, 0
+
+    indices = _as_index_array(component_indices)
+    coverage_masks = sphere_coverage_masks(
+        indices,
+        active_spheres,
+        origin_m,
+        voxel_size_m,
+        coverage_tolerance_m,
+        max_optimization_matrix_elements,
+    )
+    if coverage_masks is None:
+        return active_spheres, 0
+
+    shell_mask = make_surface_shell_mask(
+        esdf_grid,
+        indices,
+        inside_epsilon_m,
+        surface_shell_thickness_m,
+    )
+    shell_guard_enabled = (
+        enable_surface_shell_guard
+        and surface_shell_thickness_m > 0.0
+        and bool(np.any(shell_mask))
+    )
+    baseline_covered = np.any(coverage_masks, axis=0)
+    baseline_volume = calculate_mask_coverage(baseline_covered)
+    baseline_shell = calculate_mask_coverage(baseline_covered, shell_mask)
+    required_volume = min(float(target_coverage), baseline_volume)
+    required_shell = max(
+        0.0,
+        min(float(target_shell_coverage), baseline_shell)
+        - float(shell_coverage_loss_tolerance),
+    )
+
+    active = list(range(len(active_spheres)))
+    removed_count = 0
+    while len(active) > 1 and removed_count < max_removals:
+        coverage_count = np.count_nonzero(coverage_masks[active], axis=0)
+        unique_volume = {
+            index: int(np.count_nonzero(
+                coverage_masks[index] & (coverage_count == 1)))
+            for index in active
+        }
+        unique_shell = {
+            index: int(np.count_nonzero(
+                coverage_masks[index] & shell_mask & (coverage_count == 1)))
+            for index in active
+        }
+        overlapping = set()
+        for first_position, first_index in enumerate(active):
+            first = active_spheres[first_index]
+            for second_index in active[first_position + 1:]:
+                second = active_spheres[second_index]
+                overlap = sphere_overlap_fraction(
+                    first.center,
+                    first.output_radius,
+                    second.center,
+                    second.output_radius,
+                )
+                if overlap > max_overlap_fraction + 1e-12:
+                    overlapping.add(first_index)
+                    overlapping.add(second_index)
+        if not overlapping:
+            break
+
+        removal_order = sorted(overlapping, key=lambda index: (
+            unique_shell[index],
+            unique_volume[index],
+            -active_spheres[index].output_radius,
+            active_spheres[index].source_index,
+            index,
+        ))
+        removed = False
+        for index in removal_order:
+            trial = [candidate for candidate in active if candidate != index]
+            covered = np.any(coverage_masks[trial], axis=0)
+            if (
+                calculate_mask_coverage(covered) + 1e-12 >= required_volume
+                and (
+                    not shell_guard_enabled
+                    or calculate_mask_coverage(covered, shell_mask) + 1e-12
+                    >= required_shell
+                )
+            ):
+                active = trial
+                removed_count += 1
+                removed = True
+                break
+        if not removed:
+            break
+
+    return [active_spheres[index] for index in active], removed_count
+
+
 def _sphere_is_esdf_valid(
     sphere: Sphere,
     esdf_grid: np.ndarray,
@@ -729,7 +1031,7 @@ def _sphere_is_esdf_valid(
     return (
         np.isfinite(distance)
         and distance < -inside_epsilon_m
-        and sphere.raw_radius == -distance
+        and sphere.raw_radius <= -distance + 1e-12
         and np.array_equal(np.asarray(sphere.center), expected_center)
     )
 
@@ -752,6 +1054,7 @@ def optimize_component_spheres(
     shell_coverage_loss_tolerance: float = 0.005,
     max_optimization_matrix_elements: int = 20000000,
     component_id: int = 0,
+    externally_valid_candidate_mask: np.ndarray | Sequence[bool] | None = None,
 ) -> Tuple[List[Sphere], float, float, np.ndarray, bool]:
     """Optimize one ESDF-valid pool and report volume/shell coverage."""
 
@@ -814,6 +1117,13 @@ def optimize_component_spheres(
         )
         for sphere in candidates
     ], dtype=bool)
+    if externally_valid_candidate_mask is not None:
+        externally_valid = np.asarray(
+            externally_valid_candidate_mask, dtype=bool).reshape(-1)
+        if len(externally_valid) != len(candidates):
+            raise ValueError(
+                "external candidate validity must match the candidate count")
+        valid_candidates |= externally_valid
     if baseline_volume + 1e-12 < target_coverage or not np.all(valid_candidates):
         return (
             candidates,
@@ -997,6 +1307,110 @@ def merged_sphere_passes_esdf_guard(
     )
 
 
+def create_component_coarse_sphere_candidates(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    seed_spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    safety_margin_m: float,
+    unobserved_distance_value: float,
+    component_id: int,
+    min_component_voxels: int,
+    radius_scale: float,
+    max_radius_m: float,
+    max_empty_fraction: float,
+    max_free_space_distance_m: float,
+    surface_sample_count: int,
+    min_observed_surface_fraction: float,
+) -> List[Sphere]:
+    """Generate guarded, size-aware candidates for large static components.
+
+    A camera often observes a wide object's surface as a thin negative-ESDF
+    shell.  Its medial radii therefore remain close to one voxel even when the
+    object's visible extent is large.  This pass enlarges existing valid seed
+    centres according to component size, then rejects candidates that contain
+    too little component support or extend too far into observed free space.
+    The returned candidates are intended for the existing shell-aware greedy
+    cover, not for unconditional publication.
+    """
+
+    indices = _as_index_array(component_indices)
+    if (
+        len(indices) < int(min_component_voxels)
+        or not seed_spheres
+        or radius_scale <= 0.0
+    ):
+        return []
+    if voxel_size_m <= 0.0 or safety_margin_m < 0.0:
+        raise ValueError("voxel size must be positive and margin non-negative")
+    if min_component_voxels <= 0:
+        raise ValueError("coarse component voxel threshold must be positive")
+    if max_radius_m <= 0.0 or max_free_space_distance_m < 0.0:
+        raise ValueError("coarse radius must be positive and free-space limit non-negative")
+    if not 0.0 <= max_empty_fraction <= 1.0:
+        raise ValueError("coarse empty fraction must be in [0, 1]")
+
+    radius = min(
+        float(max_radius_m),
+        float(radius_scale)
+        * float(voxel_size_m)
+        * float(np.cbrt(len(indices))),
+    )
+    largest_seed_radius = max(float(sphere.raw_radius) for sphere in seed_spheres)
+    if radius <= largest_seed_radius + 1e-12:
+        return []
+
+    origin = _as_origin(origin_m)
+    points = origin + (indices.astype(np.float64) + 0.5) * voxel_size_m
+    # Approximate how many voxel centres a solid sphere of this radius can
+    # contain.  This deliberately conservative density check prevents a large
+    # candidate from spanning unrelated sparse fragments.
+    sphere_voxel_capacity = max(
+        1.0,
+        (4.0 / 3.0) * np.pi * (radius / voxel_size_m) ** 3,
+    )
+    candidates: List[Sphere] = []
+    for seed in sorted(
+        seed_spheres,
+        key=lambda sphere: (
+            sphere.source_index,
+            -sphere.raw_radius,
+        ),
+    ):
+        delta = points - np.asarray(seed.center, dtype=np.float64)
+        supported_voxels = int(np.count_nonzero(
+            np.einsum("ij,ij->i", delta, delta) <= radius ** 2 + 1e-15))
+        empty_fraction = max(
+            0.0,
+            1.0 - float(supported_voxels) / sphere_voxel_capacity,
+        )
+        if empty_fraction > max_empty_fraction + 1e-12:
+            continue
+        candidate = Sphere(
+            center=np.asarray(seed.center, dtype=np.float64).copy(),
+            raw_radius=radius,
+            output_radius=radius + safety_margin_m,
+            component_id=int(component_id),
+            source_index=seed.source_index,
+            is_merged=True,
+        )
+        if not merged_sphere_passes_esdf_guard(
+            esdf_grid,
+            candidate.center,
+            candidate.raw_radius,
+            origin,
+            voxel_size_m,
+            unobserved_distance_value,
+            max_free_space_distance_m,
+            surface_sample_count,
+            min_observed_surface_fraction,
+        ):
+            continue
+        candidates.append(candidate)
+    return candidates
+
+
 def agglomerative_merge_static_spheres(
     esdf_grid: np.ndarray,
     component_indices: np.ndarray,
@@ -1098,6 +1512,259 @@ def agglomerative_merge_static_spheres(
     return active
 
 
+def _static_sphere_sort_key(
+    sphere: Sphere,
+) -> tuple[object, ...]:
+    return (
+        sphere.component_id,
+        float(sphere.center[0]),
+        float(sphere.center[1]),
+        float(sphere.center[2]),
+        sphere.raw_radius,
+        sphere.source_index,
+    )
+
+
+def build_static_sphere_search_state(
+    spheres: Sequence[Sphere],
+) -> StaticSphereSearchState:
+    """Build a deterministic, order-independent static merge state."""
+
+    ordered = tuple(sorted(spheres, key=_static_sphere_sort_key))
+    radii = np.asarray(
+        [sphere.raw_radius for sphere in ordered], dtype=np.float64)
+    signature = tuple(
+        (
+            sphere.component_id,
+            round(float(sphere.center[0]), 9),
+            round(float(sphere.center[1]), 9),
+            round(float(sphere.center[2]), 9),
+            round(float(sphere.raw_radius), 9),
+            tuple(int(value) for value in sphere.source_index),
+        )
+        for sphere in ordered
+    )
+    return StaticSphereSearchState(
+        spheres=ordered,
+        total_raw_volume=float(
+            (4.0 / 3.0) * np.pi * np.sum(radii ** 3)),
+        total_raw_radius=float(np.sum(radii)),
+        canonical_signature=signature,
+    )
+
+
+def static_sphere_search_state_rank_key(
+    state: StaticSphereSearchState,
+) -> tuple[object, ...]:
+    """Prefer less over-approximation when two valid states have equal K."""
+
+    return (
+        state.total_raw_volume,
+        state.total_raw_radius,
+        state.canonical_signature,
+    )
+
+
+def _merge_static_candidate(
+    spheres: Sequence[Sphere],
+    candidate: PairMergeCandidate,
+    safety_margin_m: float,
+) -> List[Sphere]:
+    first = spheres[candidate.first_index]
+    second = spheres[candidate.second_index]
+    merged = Sphere(
+        center=np.asarray(candidate.center, dtype=np.float64),
+        raw_radius=float(candidate.radius),
+        output_radius=float(candidate.radius + safety_margin_m),
+        component_id=first.component_id,
+        source_index=min(first.source_index, second.source_index),
+        is_merged=True,
+    )
+    active = [
+        sphere for index, sphere in enumerate(spheres)
+        if index not in (candidate.first_index, candidate.second_index)
+    ] + [merged]
+    active.sort(key=_static_sphere_sort_key)
+    return active
+
+
+def _enumerate_valid_static_merge_candidates(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    state: StaticSphereSearchState,
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    coverage_tolerance_m: float,
+    safety_margin_m: float,
+    unobserved_distance_value: float,
+    merge_max_radius_m: float,
+    merge_max_radius_growth_ratio: float,
+    merge_max_gap_m: float,
+    merge_enable_esdf_guard: bool,
+    merge_max_free_space_distance_m: float,
+    merge_surface_sample_count: int,
+    merge_min_observed_surface_fraction: float,
+    deadline: float,
+) -> List[PairMergeCandidate]:
+    active = list(state.spheres)
+    _, baseline_covered = calculate_component_coverage(
+        component_indices,
+        active,
+        origin_m,
+        voxel_size_m,
+        coverage_tolerance_m,
+    )
+    baseline_count = int(np.count_nonzero(baseline_covered))
+
+    def validator(candidate: PairMergeCandidate) -> bool:
+        if monotonic() >= deadline:
+            return False
+        trial = _merge_static_candidate(active, candidate, safety_margin_m)
+        _, covered = calculate_component_coverage(
+            component_indices,
+            trial,
+            origin_m,
+            voxel_size_m,
+            coverage_tolerance_m,
+        )
+        if int(np.count_nonzero(covered)) < baseline_count:
+            return False
+        if not merge_enable_esdf_guard:
+            return True
+        merged = next(sphere for sphere in trial if sphere.is_merged and (
+            np.array_equal(sphere.center, candidate.center)
+            and abs(sphere.raw_radius - candidate.radius) <= 1e-12
+        ))
+        return merged_sphere_passes_esdf_guard(
+            esdf_grid,
+            merged.center,
+            merged.raw_radius,
+            origin_m,
+            voxel_size_m,
+            unobserved_distance_value,
+            merge_max_free_space_distance_m,
+            merge_surface_sample_count,
+            merge_min_observed_surface_fraction,
+        )
+
+    return enumerate_pair_merge_candidates(
+        np.asarray([sphere.center for sphere in active], dtype=np.float64),
+        np.asarray([sphere.raw_radius for sphere in active], dtype=np.float64),
+        np.asarray([sphere.component_id for sphere in active], dtype=np.int64),
+        merge_max_radius_m,
+        merge_max_radius_growth_ratio,
+        merge_max_gap_m,
+        validator,
+        deadline,
+    )
+
+
+def minimum_k_static_sphere_search(
+    esdf_grid: np.ndarray,
+    component_indices: np.ndarray,
+    pre_merge_spheres: Sequence[Sphere],
+    origin_m: Sequence[float],
+    voxel_size_m: float,
+    coverage_tolerance_m: float,
+    safety_margin_m: float,
+    unobserved_distance_value: float,
+    merge_max_radius_m: float,
+    merge_max_radius_growth_ratio: float,
+    merge_max_gap_m: float,
+    merge_enable_esdf_guard: bool,
+    merge_max_free_space_distance_m: float,
+    merge_surface_sample_count: int,
+    merge_min_observed_surface_fraction: float,
+    beam_width: int,
+    max_states: int,
+    deadline: float,
+) -> StaticMinimumKSearchResult:
+    """Explore valid merge orders and return the minimum K found in bounds."""
+
+    initial = build_static_sphere_search_state(pre_merge_spheres)
+    if len(initial.spheres) < 2:
+        return StaticMinimumKSearchResult(
+            list(initial.spheres), 0, "not_needed", initial)
+
+    best = initial
+    seen = {initial.canonical_signature}
+    beam = [initial]
+    states_explored = 0
+    termination = "no_more_valid_merges"
+
+    while beam:
+        if monotonic() >= deadline:
+            termination = "deadline"
+            break
+        child_states: dict[
+            tuple[tuple[object, ...], ...], StaticSphereSearchState
+        ] = {}
+        stop_reason = None
+        for parent in beam:
+            candidates = _enumerate_valid_static_merge_candidates(
+                esdf_grid,
+                component_indices,
+                parent,
+                origin_m,
+                voxel_size_m,
+                coverage_tolerance_m,
+                safety_margin_m,
+                unobserved_distance_value,
+                merge_max_radius_m,
+                merge_max_radius_growth_ratio,
+                merge_max_gap_m,
+                merge_enable_esdf_guard,
+                merge_max_free_space_distance_m,
+                merge_surface_sample_count,
+                merge_min_observed_surface_fraction,
+                deadline,
+            )
+            if monotonic() >= deadline:
+                stop_reason = "deadline"
+                break
+            for candidate in candidates:
+                if states_explored >= max_states:
+                    stop_reason = "max_states"
+                    break
+                child = build_static_sphere_search_state(
+                    _merge_static_candidate(
+                        parent.spheres, candidate, safety_margin_m))
+                if child.canonical_signature in seen:
+                    continue
+                seen.add(child.canonical_signature)
+                child_states[child.canonical_signature] = child
+                states_explored += 1
+                if (
+                    len(child.spheres),
+                    static_sphere_search_state_rank_key(child),
+                ) < (
+                    len(best.spheres),
+                    static_sphere_search_state_rank_key(best),
+                ):
+                    best = child
+            if stop_reason is not None:
+                break
+        if stop_reason is not None:
+            termination = stop_reason
+            break
+        if not child_states:
+            termination = "no_more_valid_merges"
+            break
+        beam = sorted(
+            child_states.values(),
+            key=lambda state: (
+                len(state.spheres),
+                static_sphere_search_state_rank_key(state),
+            ),
+        )[:beam_width]
+        if len(best.spheres) == 1:
+            termination = "minimum_k_reached"
+            break
+
+    return StaticMinimumKSearchResult(
+        list(best.spheres), states_explored, termination, best)
+
+
 def _validate_static_merge_parameters(
     merge_max_radius_m: float,
     merge_max_radius_growth_ratio: float,
@@ -1137,6 +1804,21 @@ def _validate_optimization_parameters(
         raise ValueError("max_optimization_matrix_elements must be positive")
 
 
+def _validate_static_min_k_parameters(
+    min_k_beam_width: int,
+    min_k_max_states: int,
+    min_k_processing_budget_ms: float,
+) -> None:
+    if min_k_beam_width <= 0:
+        raise ValueError("minimum-K beam width must be positive")
+    if min_k_max_states <= 0:
+        raise ValueError("minimum-K state cap must be positive")
+    if (
+        not np.isfinite(min_k_processing_budget_ms)
+        or min_k_processing_budget_ms <= 0.0
+    ):
+        raise ValueError("minimum-K processing budget must be finite and positive")
+
 
 def generate_medial_spheres(
     esdf_grid: np.ndarray,
@@ -1150,6 +1832,7 @@ def generate_medial_spheres(
     minimum_center_spacing_m: float = 0.05,
     min_component_voxels: int = 8,
     min_raw_sphere_radius_m: float = 0.01,
+    max_raw_sphere_radius_m: float = float("inf"),
     safety_margin_m: float = 0.02,
     redundancy_tolerance_m: float = 0.001,
     max_spheres_per_component: int = 128,
@@ -1163,6 +1846,12 @@ def generate_medial_spheres(
     target_shell_coverage: float = 0.98,
     shell_coverage_loss_tolerance: float = 0.005,
     max_optimization_matrix_elements: int = 20000000,
+    enable_component_coarse_cover: bool = False,
+    component_coarse_min_voxels: int = 80,
+    component_coarse_radius_scale: float = 0.45,
+    component_coarse_max_radius_m: float = 0.32,
+    component_coarse_max_empty_fraction: float = 0.75,
+    component_coarse_max_free_space_distance_m: float = 0.15,
     enable_agglomerative_merge: bool = True,
     merge_max_radius_m: float = 0.35,
     merge_max_radius_growth_ratio: float = 1.45,
@@ -1171,6 +1860,21 @@ def generate_medial_spheres(
     merge_max_free_space_distance_m: float = 0.08,
     merge_surface_sample_count: int = 64,
     merge_min_observed_surface_fraction: float = 0.70,
+    enable_min_k_search: bool = False,
+    min_k_beam_width: int = 8,
+    min_k_max_states: int = 128,
+    min_k_processing_budget_ms: float = 200.0,
+    enable_post_merge_overlap_pruning: bool = False,
+    post_merge_max_overlap_fraction: float = 0.20,
+    post_merge_pruning_max_spheres: int = 64,
+    post_merge_pruning_max_removals: int = 32,
+    robot_sphere_centers: np.ndarray | Sequence[Sequence[float]] | None = None,
+    robot_sphere_radii: np.ndarray | Sequence[float] | None = None,
+    robot_component_overlap_threshold: float = 1.0,
+    robot_sphere_margin_m: float = 0.0,
+    enable_local_width_cover: bool = False,
+    local_width_ratio: float = 1.4,
+    local_width_budget_ms: float = 15.0,
 ) -> GenerationResult:
     """Run the complete component-wise signed-ESDF sphere algorithm.
 
@@ -1182,11 +1886,48 @@ def generate_medial_spheres(
     """
 
     values = np.asarray(esdf_grid, dtype=np.float64)
+    if (not np.isfinite(local_width_ratio) or local_width_ratio < 1.
+            or not np.isfinite(local_width_budget_ms) or local_width_budget_ms < 0.):
+        raise ValueError("invalid static local-width ratio/budget")
+    remaining_local_width_ms = local_width_budget_ms
     origin = _as_origin(origin_m)
     if values.ndim != 3 or voxel_size_m <= 0.0:
         raise ValueError("esdf_grid must be 3D and voxel_size_m must be positive")
     if min_component_voxels < 1 or max_total_spheres < 0:
         raise ValueError("min_component_voxels must be positive and total cap non-negative")
+    if (
+        min_raw_sphere_radius_m < 0.0
+        or max_raw_sphere_radius_m < min_raw_sphere_radius_m
+    ):
+        raise ValueError("invalid static raw-radius limits")
+    if not 0.0 <= robot_component_overlap_threshold <= 1.0:
+        raise ValueError("robot component overlap threshold must be in [0, 1]")
+    if component_coarse_min_voxels <= 0:
+        raise ValueError("coarse component voxel threshold must be positive")
+    if (
+        not np.isfinite(component_coarse_radius_scale)
+        or component_coarse_radius_scale < 0.0
+    ):
+        raise ValueError("coarse radius scale must be finite and non-negative")
+    if (
+        not np.isfinite(component_coarse_max_radius_m)
+        or component_coarse_max_radius_m <= 0.0
+    ):
+        raise ValueError("coarse maximum radius must be finite and positive")
+    if not 0.0 <= component_coarse_max_empty_fraction <= 1.0:
+        raise ValueError("coarse empty fraction must be in [0, 1]")
+    if (
+        not np.isfinite(component_coarse_max_free_space_distance_m)
+        or component_coarse_max_free_space_distance_m < 0.0
+    ):
+        raise ValueError(
+            "coarse free-space distance must be finite and non-negative")
+    use_robot_filter = (
+        robot_sphere_centers is not None or robot_sphere_radii is not None)
+    if use_robot_filter and (
+        robot_sphere_centers is None or robot_sphere_radii is None
+    ):
+        raise ValueError("robot sphere centers and radii must be supplied together")
     _validate_optimization_parameters(
         surface_shell_thickness_m,
         target_shell_coverage,
@@ -1201,6 +1942,20 @@ def generate_medial_spheres(
         merge_surface_sample_count,
         merge_min_observed_surface_fraction,
     )
+    if merge_max_radius_m > max_raw_sphere_radius_m:
+        raise ValueError(
+            "merge_max_radius_m cannot exceed max_raw_sphere_radius_m")
+    _validate_static_min_k_parameters(
+        min_k_beam_width,
+        min_k_max_states,
+        min_k_processing_budget_ms,
+    )
+    if not 0.0 <= post_merge_max_overlap_fraction <= 1.0:
+        raise ValueError("post-merge overlap fraction must be in [0, 1]")
+    if post_merge_pruning_max_spheres <= 0:
+        raise ValueError("post-merge pruning sphere cap must be positive")
+    if post_merge_pruning_max_removals < 0:
+        raise ValueError("post-merge pruning removal cap must be non-negative")
 
     inside_mask = extract_inside_mask(
         values, unobserved_distance_value, inside_epsilon_m
@@ -1211,10 +1966,29 @@ def generate_medial_spheres(
     ]
     removed_small_components = len(raw_components) - len(kept_components)
     component_labels = np.full(values.shape, -1, dtype=np.int32)
+    filtered_inside_mask = inside_mask.copy()
     results: List[ComponentResult] = []
+    robot_rejected_component_ids: List[int] = []
+    robot_component_overlap_fractions: List[float] = []
+    robot_rejected_voxel_indices: List[np.ndarray] = []
 
     for component_id, component_indices in enumerate(kept_components):
         component_labels[tuple(component_indices.T)] = component_id
+        if use_robot_filter:
+            overlap_fraction, _ = static_component_robot_overlap_fraction(
+                component_indices,
+                origin,
+                voxel_size_m,
+                robot_sphere_centers,
+                robot_sphere_radii,
+                robot_sphere_margin_m,
+            )
+            robot_component_overlap_fractions.append(overlap_fraction)
+            if overlap_fraction + 1e-12 >= robot_component_overlap_threshold:
+                robot_rejected_component_ids.append(component_id)
+                robot_rejected_voxel_indices.append(component_indices)
+                filtered_inside_mask[tuple(component_indices.T)] = False
+                continue
         minima = find_local_minimum_candidates(values, component_indices)
         representatives = group_or_reduce_plateaus(
             values,
@@ -1231,6 +2005,7 @@ def generate_medial_spheres(
             min_raw_sphere_radius_m,
             safety_margin_m,
             component_id,
+            max_raw_sphere_radius_m,
         )
         spheres, coverage, reason, uncovered = add_spheres_until_coverage(
             values,
@@ -1246,13 +2021,44 @@ def generate_medial_spheres(
             max_spheres_per_component,
             max_iterations_per_component,
             component_id,
+            max_raw_sphere_radius_m,
         )
-        candidate_pool = list(spheres)
+        base_candidate_pool = list(spheres)
         optimization_enabled = (
             enable_single_sphere_replacement
             or enable_greedy_set_cover
             or enable_general_coverage_pruning
         )
+        coarse_candidates: List[Sphere] = []
+        if (
+            enable_component_coarse_cover
+            and enable_greedy_set_cover
+            and optimization_enabled
+        ):
+            coarse_candidates = create_component_coarse_sphere_candidates(
+                values,
+                component_indices,
+                base_candidate_pool,
+                origin,
+                voxel_size_m,
+                safety_margin_m,
+                unobserved_distance_value,
+                component_id,
+                component_coarse_min_voxels,
+                component_coarse_radius_scale,
+                min(component_coarse_max_radius_m, max_raw_sphere_radius_m),
+                component_coarse_max_empty_fraction,
+                component_coarse_max_free_space_distance_m,
+                merge_surface_sample_count,
+                merge_min_observed_surface_fraction,
+            )
+        candidate_pool = base_candidate_pool + coarse_candidates
+        if (
+            len(candidate_pool) * len(component_indices)
+            > max_optimization_matrix_elements
+        ):
+            coarse_candidates = []
+            candidate_pool = base_candidate_pool
         matrix_too_large = (
             len(candidate_pool) * len(component_indices)
             > max_optimization_matrix_elements
@@ -1275,7 +2081,8 @@ def generate_medial_spheres(
                 coverage_tolerance_m,
             )
         else:
-            spheres, coverage, _, covered, _ = optimize_component_spheres(
+            optimized_spheres, coverage, _, covered, optimization_applied = (
+                optimize_component_spheres(
                 values,
                 component_indices,
                 candidate_pool,
@@ -1293,14 +2100,40 @@ def generate_medial_spheres(
                 shell_coverage_loss_tolerance,
                 max_optimization_matrix_elements,
                 component_id,
-            )
-            uncovered = component_indices[~covered]
-        pre_merge_sphere_count = len(spheres)
-        if enable_agglomerative_merge and len(spheres) >= 2:
-            spheres = agglomerative_merge_static_spheres(
+                externally_valid_candidate_mask=(
+                    [False] * len(base_candidate_pool)
+                    + [True] * len(coarse_candidates)
+                ),
+            ))
+            if coarse_candidates and not optimization_applied:
+                spheres, coverage = remove_redundant_spheres(
+                    component_indices,
+                    base_candidate_pool,
+                    origin,
+                    voxel_size_m,
+                    target_coverage,
+                    coverage_tolerance_m,
+                    redundancy_tolerance_m,
+                )
+                uncovered = find_uncovered_voxels(
+                    component_indices,
+                    spheres,
+                    origin,
+                    voxel_size_m,
+                    coverage_tolerance_m,
+                )
+            else:
+                spheres = optimized_spheres
+                uncovered = component_indices[~covered]
+        coarse_selected_count = int(sum(sphere.is_merged for sphere in spheres))
+        pre_merge_spheres = list(spheres)
+        pre_merge_sphere_count = len(pre_merge_spheres)
+        agglomerative_spheres = list(pre_merge_spheres)
+        if enable_agglomerative_merge and len(pre_merge_spheres) >= 2:
+            agglomerative_spheres = agglomerative_merge_static_spheres(
                 values,
                 component_indices,
-                spheres,
+                pre_merge_spheres,
                 origin,
                 voxel_size_m,
                 coverage_tolerance_m,
@@ -1314,14 +2147,137 @@ def generate_medial_spheres(
                 merge_surface_sample_count,
                 merge_min_observed_surface_fraction,
             )
-            coverage, covered = calculate_component_coverage(
+        spheres = agglomerative_spheres
+        agglomerative_sphere_count = len(agglomerative_spheres)
+        min_k_search_applied = enable_min_k_search and len(pre_merge_spheres) >= 2
+        min_k_states_explored = 0
+        min_k_search_termination = (
+            "not_needed" if enable_min_k_search else "disabled")
+        min_k_sphere_count = pre_merge_sphere_count
+        if min_k_search_applied:
+            search_result = minimum_k_static_sphere_search(
+                values,
                 component_indices,
-                spheres,
+                pre_merge_spheres,
                 origin,
                 voxel_size_m,
                 coverage_tolerance_m,
+                safety_margin_m,
+                unobserved_distance_value,
+                merge_max_radius_m,
+                merge_max_radius_growth_ratio,
+                merge_max_gap_m,
+                merge_enable_esdf_guard,
+                merge_max_free_space_distance_m,
+                merge_surface_sample_count,
+                merge_min_observed_surface_fraction,
+                min_k_beam_width,
+                min_k_max_states,
+                monotonic() + min_k_processing_budget_ms / 1000.0,
             )
-            uncovered = component_indices[~covered]
+            min_k_states_explored = search_result.states_explored
+            min_k_search_termination = search_result.termination_reason
+            min_k_sphere_count = len(search_result.spheres)
+            baseline_state = build_static_sphere_search_state(
+                agglomerative_spheres)
+            selected_state = min(
+                (baseline_state, search_result.state),
+                key=lambda state: (
+                    len(state.spheres),
+                    static_sphere_search_state_rank_key(state),
+                ),
+            )
+            spheres = list(selected_state.spheres)
+            if (
+                selected_state.canonical_signature
+                == baseline_state.canonical_signature
+                and selected_state.canonical_signature
+                != search_result.state.canonical_signature
+                and min_k_search_termination not in ("deadline", "max_states")
+            ):
+                min_k_search_termination = "fallback_agglomerative"
+        post_overlap_removed_count = 0
+        if enable_post_merge_overlap_pruning:
+            spheres, post_overlap_removed_count = (
+                prune_overlapping_static_spheres(
+                    values,
+                    component_indices,
+                    spheres,
+                    origin,
+                    voxel_size_m,
+                    inside_epsilon_m,
+                    target_coverage,
+                    coverage_tolerance_m,
+                    enable_surface_shell_guard,
+                    surface_shell_thickness_m,
+                    target_shell_coverage,
+                    shell_coverage_loss_tolerance,
+                    max_optimization_matrix_elements,
+                    post_merge_max_overlap_fraction,
+                    post_merge_pruning_max_spheres,
+                    post_merge_pruning_max_removals,
+                )
+            )
+        local_saved, local_elapsed = 0, 0.
+        local_reason = "not_needed_or_limit" if enable_local_width_cover else "disabled"
+        local_radius_cap = min(max_raw_sphere_radius_m, component_coarse_max_radius_m, merge_max_radius_m)
+        if (enable_local_width_cover and 2 <= len(spheres) <= 64
+                and len(component_indices) <= 8192 and remaining_local_width_ms > 0.
+                and local_radius_cap >= min_raw_sphere_radius_m):
+            local_start = monotonic()
+            points = origin + (component_indices.astype(float) + .5) * voxel_size_m
+            density = VoxelSupportGuard(points, origin, voxel_size_m,
+                component_coarse_max_empty_fraction)
+
+            def valid_local(center, radius, deadline):
+                if not density(center, radius, deadline):
+                    return False
+                return merged_sphere_passes_esdf_guard(values, center, radius,
+                    origin, voxel_size_m, unobserved_distance_value,
+                    min(component_coarse_max_free_space_distance_m, merge_max_free_space_distance_m),
+                    merge_surface_sample_count, merge_min_observed_surface_fraction)
+
+            local = local_width_cover(points, [s.center for s in spheres],
+                [s.raw_radius for s in spheres], voxel_size=voxel_size_m,
+                min_radius=min_raw_sphere_radius_m,
+                max_radius=local_radius_cap,
+                tolerance=coverage_tolerance_m, target_coverage=target_coverage,
+                width_ratio=local_width_ratio,
+                budget_ms=max(0., remaining_local_width_ms - (monotonic() - local_start) * 1000.),
+                validator=valid_local)
+            local_reason = local.reason
+            if local.applied:
+                trial = [spheres[index] if index < len(spheres) else Sphere(
+                    center.copy(), float(radius), float(radius) + safety_margin_m,
+                    component_id, tuple(component_indices[np.argmin(np.sum((points - center)**2, axis=1))]),
+                    is_merged=True) for index, center, radius in zip(local.selected, local.centers, local.radii)]
+                # Compare actual pairwise output-volume overlap, not just K.
+                def total_overlap(items):
+                    return sum(sphere_overlap_fraction(a.center, a.output_radius, b.center, b.output_radius)
+                               for i, a in enumerate(items) for b in items[i + 1:])
+                # Recheck with the source's precise coverage convention
+                # (including its 1e-15 squared-distance roundoff allowance).
+                _, old_support = calculate_component_coverage(component_indices, spheres,
+                    origin, voxel_size_m, coverage_tolerance_m)
+                _, new_support = calculate_component_coverage(component_indices, trial,
+                    origin, voxel_size_m, coverage_tolerance_m)
+                if not np.all(new_support[old_support]):
+                    local_reason = "coverage_rejected"
+                elif total_overlap(trial) <= total_overlap(spheres) + 1e-12:
+                    local_saved = len(spheres) - len(trial)
+                    spheres = trial
+                else:
+                    local_reason = "overlap_rejected"
+            local_elapsed = (monotonic() - local_start) * 1000.
+            remaining_local_width_ms = max(0., remaining_local_width_ms - local_elapsed)
+        coverage, covered = calculate_component_coverage(
+            component_indices,
+            spheres,
+            origin,
+            voxel_size_m,
+            coverage_tolerance_m,
+        )
+        uncovered = component_indices[~covered]
         results.append(
             ComponentResult(
                 component_id=component_id,
@@ -1331,6 +2287,19 @@ def generate_medial_spheres(
                 termination_reason=reason,
                 uncovered_indices=uncovered,
                 pre_merge_sphere_count=pre_merge_sphere_count,
+                agglomerative_sphere_count=agglomerative_sphere_count,
+                min_k_sphere_count=min_k_sphere_count,
+                final_sphere_count=len(spheres),
+                min_k_search_applied=min_k_search_applied,
+                min_k_states_explored=min_k_states_explored,
+                min_k_search_termination=min_k_search_termination,
+                post_overlap_sphere_count=len(spheres),
+                post_overlap_removed_count=post_overlap_removed_count,
+                coarse_candidate_count=len(coarse_candidates),
+                coarse_selected_count=coarse_selected_count,
+                local_width_saved_spheres=local_saved,
+                local_width_elapsed_ms=local_elapsed,
+                local_width_reason=local_reason,
             )
         )
 
@@ -1351,14 +2320,25 @@ def generate_medial_spheres(
             if result.coverage + 1e-12 < target_coverage
         ]
     spheres = [sphere for result in results for sphere in result.spheres]
+    rejected_indices = (
+        np.vstack(robot_rejected_voxel_indices)
+        if robot_rejected_voxel_indices
+        else np.empty((0, 3), dtype=np.int64)
+    )
     return GenerationResult(
-        inside_mask=inside_mask,
+        inside_mask=filtered_inside_mask,
         component_labels=component_labels,
         components=results,
         spheres=spheres,
         removed_small_components=removed_small_components,
         total_limit_applied=total_limit_applied,
         coverage_lost_component_ids=coverage_lost_component_ids,
+        input_component_count=len(kept_components),
+        robot_rejected_component_count=len(robot_rejected_component_ids),
+        robot_rejected_voxel_count=len(rejected_indices),
+        robot_rejected_component_ids=robot_rejected_component_ids,
+        robot_component_overlap_fractions=robot_component_overlap_fractions,
+        robot_rejected_voxel_indices=rejected_indices,
     )
 
 
@@ -1445,6 +2425,7 @@ def _apply_total_sphere_limit(
             coverage_tolerance_m,
         )
         result.uncovered_indices = result.voxel_indices[~covered]
+        result.final_sphere_count = len(result.spheres)
         if result.coverage + 1e-12 < target_coverage:
             result.termination_reason = "max_total_spheres"
 

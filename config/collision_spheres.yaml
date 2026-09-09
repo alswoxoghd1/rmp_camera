@@ -4,40 +4,41 @@ sphere_topic: /rmp_camera/robot_collision_spheres
 marker_topic: /rmp_camera/robot_collision_sphere_markers
 
 # Generated from urdf/params.yaml rmpflow_controller.body_obstacles.
-# Offsets are expressed in each link frame, meters.
+# Offsets are expressed in each link frame, meters. Every radius includes the
+# requested total 0.050 m collision inflation; downstream robot margins stay zero.
 collision_spheres:
-  - {name: link1_guard_1, link: link1, offset: [0, -0.012, 0.085], radius: 0.07}
-  - {name: link1_guard_2, link: link1, offset: [0, -0.02, 0.11], radius: 0.085}
-  - {name: link1_guard_3, link: link1, offset: [0, -0.025, 0.17], radius: 0.08}
-  - {name: link2_guard_1, link: link2, offset: [0, -0.05, 0], radius: 0.075}
-  - {name: link2_guard_2, link: link2, offset: [0, -0.12, 0], radius: 0.08}
-  - {name: link2_guard_3, link: link2, offset: [0, -0.1875, 0], radius: 0.085}
-  - {name: link2_guard_4, link: link2, offset: [0, -0.1875, 0.11], radius: 0.08}
-  - {name: link2_guard_5, link: link2, offset: [0, -0.1875, 0.22], radius: 0.085}
-  - {name: link2_guard_6, link: link2, offset: [0, -0.1875, 0.33], radius: 0.085}
-  - {name: link2_guard_7, link: link2, offset: [0, -0.1875, 0.44], radius: 0.08}
-  - {name: link2_guard_8, link: link2, offset: [0, -0.1875, 0.55], radius: 0.07}
-  - {name: link3_guard_1, link: link3, offset: [0, 0.03, 0], radius: 0.07}
-  - {name: link3_guard_2, link: link3, offset: [0, 0.06, 0], radius: 0.07}
-  - {name: link3_guard_3, link: link3, offset: [0, 0.09, 0], radius: 0.07}
-  - {name: link3_guard_4, link: link3, offset: [0, 0.119, 0], radius: 0.065}
-  - {name: link3_guard_5, link: link3, offset: [0, 0.141, 0], radius: 0.06}
-  - {name: link3_5_guard_1, link: link3_5, offset: [0, 0, 0.1], radius: 0.065}
-  - {name: link3_5_guard_2, link: link3_5, offset: [0, 0, 0.21], radius: 0.065}
-  - {name: link3_5_guard_3, link: link3_5, offset: [0, 0, 0.32], radius: 0.06}
-  - {name: link3_5_guard_4, link: link3_5, offset: [0, 0, 0.44], radius: 0.055}
-  - {name: link4_guard_1, link: link4, offset: [0, -0.02, 0], radius: 0.06}
-  - {name: link4_guard_2, link: link4, offset: [0, -0.045, 0], radius: 0.06}
-  - {name: link4_guard_3, link: link4, offset: [0, -0.07, 0], radius: 0.05}
-  - {name: link4_guard_4, link: link4, offset: [0, -0.095, 0], radius: 0.05}
-  - {name: link4_guard_5, link: link4, offset: [0, -0.117, 0], radius: 0.045}
-  - {name: link5_guard_1, link: link5, offset: [0, 0, 0.02], radius: 0.06}
-  - {name: link5_guard_2, link: link5, offset: [0, 0, 0.05], radius: 0.06}
-  - {name: link5_guard_3, link: link5, offset: [0, 0, 0.08], radius: 0.055}
-  - {name: link5_guard_4, link: link5, offset: [0, 0, 0.11], radius: 0.05}
-  - {name: link6_guard_1, link: link6, offset: [0, -0.025, 0], radius: 0.05}
-  - {name: link6_guard_2, link: link6, offset: [0, -0.055, 0], radius: 0.045}
-  - {name: link6_guard_3, link: link6, offset: [0, -0.085, 0], radius: 0.045}
-  - {name: link6_guard_4, link: link6, offset: [0, -0.11, 0], radius: 0.04}
-  - {name: tcp_rmp_guard_1, link: tcp_rmp, offset: [0, 0.04, 0], radius: 0.02}
-  - {name: tcp_rmp_guard_2, link: tcp_rmp, offset: [0, -0.04, 0], radius: 0.02}
+  - {name: link1_guard_1, link: link1, offset: [0, -0.012, 0.085], radius: 0.12}
+  - {name: link1_guard_2, link: link1, offset: [0, -0.02, 0.11], radius: 0.135}
+  - {name: link1_guard_3, link: link1, offset: [0, -0.025, 0.17], radius: 0.13}
+  - {name: link2_guard_1, link: link2, offset: [0, -0.05, 0], radius: 0.125}
+  - {name: link2_guard_2, link: link2, offset: [0, -0.12, 0], radius: 0.13}
+  - {name: link2_guard_3, link: link2, offset: [0, -0.1875, 0], radius: 0.135}
+  - {name: link2_guard_4, link: link2, offset: [0, -0.1875, 0.11], radius: 0.13}
+  - {name: link2_guard_5, link: link2, offset: [0, -0.1875, 0.22], radius: 0.135}
+  - {name: link2_guard_6, link: link2, offset: [0, -0.1875, 0.33], radius: 0.135}
+  - {name: link2_guard_7, link: link2, offset: [0, -0.1875, 0.44], radius: 0.13}
+  - {name: link2_guard_8, link: link2, offset: [0, -0.1875, 0.55], radius: 0.12}
+  - {name: link3_guard_1, link: link3, offset: [0, 0.03, 0], radius: 0.12}
+  - {name: link3_guard_2, link: link3, offset: [0, 0.06, 0], radius: 0.12}
+  - {name: link3_guard_3, link: link3, offset: [0, 0.09, 0], radius: 0.12}
+  - {name: link3_guard_4, link: link3, offset: [0, 0.119, 0], radius: 0.115}
+  - {name: link3_guard_5, link: link3, offset: [0, 0.141, 0], radius: 0.11}
+  - {name: link3_5_guard_1, link: link3_5, offset: [0, 0, 0.1], radius: 0.115}
+  - {name: link3_5_guard_2, link: link3_5, offset: [0, 0, 0.21], radius: 0.115}
+  - {name: link3_5_guard_3, link: link3_5, offset: [0, 0, 0.32], radius: 0.11}
+  - {name: link3_5_guard_4, link: link3_5, offset: [0, 0, 0.44], radius: 0.105}
+  - {name: link4_guard_1, link: link4, offset: [0, -0.02, 0], radius: 0.11}
+  - {name: link4_guard_2, link: link4, offset: [0, -0.045, 0], radius: 0.11}
+  - {name: link4_guard_3, link: link4, offset: [0, -0.07, 0], radius: 0.10}
+  - {name: link4_guard_4, link: link4, offset: [0, -0.095, 0], radius: 0.10}
+  - {name: link4_guard_5, link: link4, offset: [0, -0.117, 0], radius: 0.095}
+  - {name: link5_guard_1, link: link5, offset: [0, 0, 0.02], radius: 0.11}
+  - {name: link5_guard_2, link: link5, offset: [0, 0, 0.05], radius: 0.11}
+  - {name: link5_guard_3, link: link5, offset: [0, 0, 0.08], radius: 0.105}
+  - {name: link5_guard_4, link: link5, offset: [0, 0, 0.11], radius: 0.10}
+  - {name: link6_guard_1, link: link6, offset: [0, -0.025, 0], radius: 0.10}
+  - {name: link6_guard_2, link: link6, offset: [0, -0.055, 0], radius: 0.095}
+  - {name: link6_guard_3, link: link6, offset: [0, -0.085, 0], radius: 0.095}
+  - {name: link6_guard_4, link: link6, offset: [0, -0.11, 0], radius: 0.09}
+  - {name: tcp_rmp_guard_1, link: tcp_rmp, offset: [0, 0.04, 0], radius: 0.07}
+  - {name: tcp_rmp_guard_2, link: tcp_rmp, offset: [0, -0.04, 0], radius: 0.07}
