@@ -29,6 +29,11 @@ flowchart TD
 
 **실선**은 구현을 마친 두 단독 회피 경로입니다. **점선**은 진행 중인 센서 융합과 이후 회피 성능 검증을 나타냅니다.
 
+### nvblox 라이브러리와 ROS 2 연동
+
+- **nvblox**는 NVIDIA의 GPU 가속 3차원 지도 라이브러리입니다. 깊이 영상으로 복셀 지도를 구성하고 거리장(TSDF·ESDF)을 갱신합니다. [공식 라이브러리 저장소](https://github.com/nvidia-isaac/nvblox)
+- **Isaac ROS nvblox**는 nvblox를 ROS 2에서 사용하는 패키지입니다. `rmp_camera`는 여기서 얻은 정적 ESDF와 이동 물체 점군을 장애물 구로 변환합니다. [공식 ROS 2 패키지 저장소](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nvblox)
+
 ## 수행한 점
 
 | 작업 | 적용한 방법 |
